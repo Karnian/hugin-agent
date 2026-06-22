@@ -28,6 +28,11 @@
  *   + strict objects, safe-integer bounds, semver fields, string/array caps
  *   + core event.kind enum + vendor.<engine>.* namespace
  *
+ * rev 1.4 — third cross-review:
+ *   + lease_id on ResumeDirective (resend_result needs a generation)
+ *   + fixed-size crypto fields: Ed25519 signature, SHA-256 digest
+ *   + bounded (signed) exit_code
+ *
  * Canonical signing bytes, pairing, key rotation/revocation: see
  * ../../docs/auth-pairing-spec.md (separate security surface).
  *
@@ -36,7 +41,7 @@
 
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = "1.3.0-draft" as const;
+export const PROTOCOL_VERSION = "1.4.0-draft" as const;
 
 // ---------------------------------------------------------------------------
 // Operational limits (part of the contract — both sides enforce these)
@@ -92,6 +97,11 @@ const SafeInt = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const PosInt = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const SemVer = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
 const Base64Url = z.string().regex(/^[A-Za-z0-9_-]+$/);
+/** Fixed-size crypto material, base64url unpadded. */
+const Ed25519Sig = Base64Url.min(86).max(88); // 64 bytes
+const Sha256Digest = Base64Url.min(43).max(44); // 32 bytes
+/** Signed JSON-safe integer (exit codes may be negative). */
+const Int = z.number().int().min(-Number.MAX_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER);
 
 const JobId = Id.describe("Stable id for a logical job (survives retries).");
 const AttemptId = Id.describe("Unique id for ONE execution attempt of a job.");
@@ -201,7 +211,7 @@ const PendingResult = z.strictObject({
   job_id: JobId,
   attempt_id: AttemptId,
   final_status: FinalStatus,
-  result_digest: Base64Url.max(128).describe("SHA-256 of the canonical job.result payload."),
+  result_digest: Sha256Digest.describe("base64url(SHA-256(canonical job.result bytes)); see auth-pairing-spec."),
   result_size: SafeInt,
   last_emitted_seq: SafeInt,
 });
@@ -235,7 +245,7 @@ export const Hello = z.strictObject({
   auth: z.strictObject({
     challenge_id: Id,
     key_id: Id,
-    signature: Base64Url.max(SIG_MAX),
+    signature: Ed25519Sig,
     alg: z.literal("ed25519"),
   }),
   os: z.strictObject({
@@ -257,6 +267,9 @@ const ResumeDirective = z.strictObject({
   // abandon: drop the attempt.
   action: z.enum(["resume_from", "resend_result", "ack_pending", "abandon"]),
   resume_after_seq: SafeInt.optional(),
+  /** The current lease the agent must stamp on resumed/resent attempt messages
+   *  (required for resume_from / resend_result; omitted for ack_pending/abandon). */
+  lease_id: LeaseId.optional(),
 });
 
 export const HelloAccepted = z.strictObject({
@@ -429,7 +442,7 @@ export const JobResult = z.strictObject({
   attempt_id: AttemptId,
   lease_id: LeaseId,
   final_status: FinalStatus,
-  exit_code: z.number().int().optional(),
+  exit_code: Int.optional(),
   signal: Id.optional(),
   error_kind: Id.optional(),
   duration_ms: SafeInt,
@@ -445,7 +458,7 @@ export const JobResultAck = z.strictObject({
   job_id: JobId,
   attempt_id: AttemptId,
   lease_id: LeaseId,
-  result_digest: Base64Url.max(128),
+  result_digest: Sha256Digest,
 });
 
 // ---- Cancellation ----------------------------------------------------------

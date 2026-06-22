@@ -21,7 +21,8 @@ import {
 const now = "2026-06-23T00:00:00.000Z";
 const env = { mode: "whitelist" as const, allow: ["PATH", "HOME"] };
 const nonce = "A".repeat(43); // 32-byte base64url placeholder
-const digest = "ZGlnZXN0AAAA"; // base64url placeholder
+const digest = "A".repeat(43); // SHA-256 base64url placeholder
+const sig = "A".repeat(86); // Ed25519 signature base64url placeholder
 const lease = "l1";
 
 const samples: Record<MessageType, unknown> = {
@@ -32,7 +33,7 @@ const samples: Record<MessageType, unknown> = {
   hello: {
     id: "m1", ts: now, type: "hello",
     protocol_version: PROTOCOL_VERSION, agent_id: "agent-abc", agent_version: "0.0.0",
-    auth: { challenge_id: "ch-1", key_id: "key-1", signature: "c2lnbmF0dXJl", alg: "ed25519" },
+    auth: { challenge_id: "ch-1", key_id: "key-1", signature: sig, alg: "ed25519" },
     os: { platform: "darwin", arch: "arm64", release: "25.5.0" },
     capabilities: {
       engines: {
@@ -50,7 +51,7 @@ const samples: Record<MessageType, unknown> = {
     id: "m2", ts: now, type: "hello.accepted",
     negotiated_version: PROTOCOL_VERSION, connection_epoch: 7, heartbeat_interval_ms: 15000,
     resume: [
-      { job_id: "j1", attempt_id: "a1", action: "resume_from", resume_after_seq: 42 },
+      { job_id: "j1", attempt_id: "a1", action: "resume_from", resume_after_seq: 42, lease_id: lease },
       { job_id: "j0", attempt_id: "a0", action: "ack_pending" },
     ],
   },

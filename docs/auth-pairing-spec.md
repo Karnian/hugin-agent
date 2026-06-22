@@ -86,6 +86,7 @@ transcript := LP("hugin-agent/auth/v1")               # domain separation
             || LP(challenge_id)
             || nonce_raw                               # the 32 RAW bytes (decode base64url), NOT the text
             || LP(agent_id)
+            || LP(key_id)                              # which device key — defeats key substitution
             || LP(protocol_version)
             || LP("ed25519")
             || LP(tenant_id)
@@ -100,7 +101,34 @@ Rules:
   decode before hashing.
 - `server_origin` is the exact WSS origin the agent dialed; binding it defeats a
   relay that forwards a challenge it didn't issue.
+- The server resolves `(tenant_id, agent_id, key_id)` → public key; the `key_id`
+  in the transcript MUST equal the one in `hello.auth`.
+- `server_time` / `challenge_ttl_ms` are **not signed** (advisory display/TTL
+  hints). The authoritative nonce lifetime is enforced server-side via
+  `challenge_id` lookup; the agent trusts only the signed nonce + its own
+  monotonic clock.
 - Any field mismatch ⇒ signature fails ⇒ `bad_signature`. No partial trust.
+
+### Ed25519 verification (normative)
+- Public key exactly 32 bytes; signature exactly 64 bytes (86 base64url chars,
+  unpadded). Reject padding or non-alphabet characters.
+- Verify per RFC 8032 with canonical-S enforcement (ZIP-215 style); reject
+  non-canonical signatures, low-order / small-subgroup keys, and the identity.
+- No batch verification (per-connection single verify).
+
+## 5b. Canonical result digest (normative)
+
+`result_digest` (in `PendingResult` and `job.result.ack`) is:
+
+```
+result_digest := base64url( SHA-256( JCS(job.result minus id, ts) ) )
+```
+
+i.e. RFC 8785 (JSON Canonicalization Scheme) over the `job.result` message with
+the per-send envelope fields `id` and `ts` removed (they differ each send and
+must not affect identity). Both sides compute the same canonical bytes, so a
+resent result yields an identical digest and `job.result.ack` confirms the
+**payload**, not merely the id.
 
 ## 6. Nonce & replay
 
@@ -108,8 +136,11 @@ Rules:
 - `challenge_ttl_ms` default **60_000** ⚙️.
 - **Globally single-use** across the relay deployment: the server records spent
   nonces until TTL expiry and rejects reuse.
-- ⚙️ Cross-POP nonce consistency for a multi-region relay (cloud-side; an
-  eventually-consistent store would permit cross-region replay within the TTL).
+- **MVP assumes a single logical POP** (or a linearizable nonce/epoch/lease
+  store). Single-use nonce, `connection_epoch` issuance, and lease ownership all
+  require linearizability; an eventually-consistent multi-region store would
+  permit cross-region replay or double-ownership within the TTL. Cross-POP
+  consistency is an enterprise concern, **out of MVP scope** ⚙️.
 
 ## 7. Key rotation
 
@@ -132,7 +163,15 @@ Rules:
 Anthropic/OpenAI tokens authenticate the **local CLI** to its provider. They are
 **never** part of this protocol, never sent to the cloud, never stored by the
 relay. The daemon does not read or forward them; it only spawns the CLI, which
-manages its own auth. This keeps the cloud blast-radius free of provider creds.
+manages its own auth.
+
+But "out of band" is necessary, not sufficient — the spawned CLI runs with local
+authority, and a server-controlled prompt could try to exfiltrate creds. So the
+isolation model is **normative**, not advisory: scrub the child environment to
+an allowlist, deny `~/.ssh` and cloud-credential paths, run under the isolated
+permission config (per the [approval spike](../spikes/approval-prompt-tool/README.md)),
+and enforce the assignment's network policy. This keeps the cloud blast-radius
+free of provider creds even under a hostile prompt.
 
 ## 10. Security properties (summary)
 

@@ -107,9 +107,12 @@ terminal results travel through `pending_results`.
 ## Lease & reliability
 
 - `lease.granted` rotates `lease_id`; the agent uses the new token on all
-  subsequent attempt-scoped messages, and the server nacks the old one
-  (`stale_lease`). The agent stops the engine locally when its lease is
-  lost/revoked (**local fencing** — the wire can't stop a partitioned process).
+  subsequent attempt-scoped messages. To avoid false-nacking messages already in
+  flight during rotation, the server accepts **both** old and new `lease_id` for
+  a short overlap window (≥ one RTT), retiring the old one once a message bearing
+  the new token arrives or the window elapses (`stale_lease` thereafter). The
+  agent stops the engine locally when its lease is lost/revoked (**local
+  fencing** — the wire can't stop a partitioned process).
 - `seq=1,2,3…` per attempt, persisted to local SQLite before send; cumulative
   `stream.ack` (server guarantees per-`(job,attempt)` in-order durable storage).
 - Backpressure: pause reading the engine's stdout when unacked bytes hit the cap.

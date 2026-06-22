@@ -3,6 +3,29 @@
 All notable changes to the `hugind ↔ orchestrator` wire contract. The protocol
 is a draft strawman; nothing here is frozen until the `-draft` suffix is dropped.
 
+## [1.4.0-draft] — 2026-06-23
+
+Folds in a third cross-review (pre-freeze). Closes the auth/crypto + lease
+precision gaps that blocked the freeze.
+
+### Protocol (messages.ts)
+- `ResumeDirective.lease_id` — `resume_from`/`resend_result` now carry the lease
+  generation to stamp on resent attempt messages.
+- Fixed-size crypto fields: Ed25519 `signature` (64B), SHA-256 `result_digest`
+  (32B) — were loosely `max`-bounded.
+- `exit_code` is a bounded signed integer (was unbounded).
+
+### Auth/pairing spec
+- `key_id` added to the signed transcript (defeats key substitution).
+- Canonical `result_digest` defined — RFC 8785 JCS over job.result minus id/ts.
+- Ed25519 verification made normative (key/sig sizes, canonical-S, low-order
+  rejection, no batch). `server_time`/`challenge_ttl_ms` documented as unsigned.
+- Single-POP / linearizable-store assumption stated; multi-region out of scope.
+- Provider-token isolation model made normative (env scrub, path deny, network).
+
+### Protocol spec (README)
+- `lease.granted` rotation overlap window — no false-nack of in-flight messages.
+
 ## [1.3.0-draft] — 2026-06-23
 
 Folds in two cloud-side reviews (cloud team + Codex). Largest revision so far:
