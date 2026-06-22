@@ -41,21 +41,23 @@ in the spec. The ones on the critical path for correctness/security:
 3. **Auth specifics** — signature alg(s), nonce lifetime/replay, key rotation.
 4. **Multiplexing flow-control** — per-job window vs the coarse `capacity` hint.
 
-### Still unspecified — must be nailed down before freeze
+### Status after v1.3 (both reviews folded in)
 
-The cross-review flagged these as present-in-spirit but under-specified:
+Most of the prior gaps are now in the schema (see [CHANGELOG 1.3](../CHANGELOG.md)):
+lease fencing + rotation on all attempt messages, `connection_epoch`, removed
+`session_id`, relative-duration authority (`*_ms`), result digests +
+`resend_result`, remote-only `decided_by`, `policy_violation` rejection (no
+silent clamp), and strict/safe-integer/direction-phase hardening.
 
-- **Pairing/registration** — how `agent_id` binds to a device public key.
-- **Auth details** — signature alg(s), nonce entropy/TTL, the signed transcript
-  (now `challenge_id|nonce|agent_id|version|alg`, not the bare nonce), key
-  rotation/revocation.
-- **TLS** — mandatory transport; not expressible in the JSON schema.
-- **Terminal-result persistence** — the agent must durably store the full
-  `job.result` payload (not just its id) to honor replay.
-- **Approval bridge** — the daemon caches the original tool input to reconstruct
-  Claude Code's `updatedInput`; define restart-mid-approval behavior (fails closed).
-- **Lease id semantics** — does `lease.granted` reissue `lease_id`, and should
-  work messages carry it for token validation?
+**Remaining work is carved into a standalone
+[auth/pairing security spec](auth-pairing-spec.md):**
+
+- Canonical signing bytes (encoding, domain separation, tenant/server binding).
+- Pairing/registration, `agent_id` minting, `key_id`, rotation, revocation,
+  lost-device flow.
+
+These gate the **production auth path** — not mock-relay development. After the
+spec + v1.3 get one more cloud review, drop `-draft` → `v1.0.0`.
 
 ## How we keep the two sides in sync
 

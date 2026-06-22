@@ -5,6 +5,8 @@
  * contract never drifts between the two codebases.
  */
 
+import { DIRECTION, HANDSHAKE_TYPES, type Message } from "./messages";
+
 export * from "./messages";
 export { PROTOCOL_VERSION } from "./messages";
 
@@ -45,4 +47,20 @@ export function negotiateVersion(
   return match
     ? { ok: true, version: match }
     : { ok: false, reason: `stable major v${want} not in server-supported {${serverSupported.join(", ")}}` };
+}
+
+/**
+ * Enforce DIRECTION + handshake phase on an inbound, already-parsed message.
+ * The `DIRECTION` constant alone is documentation; this is the enforcement
+ * (Codex C3). Call after `parseMessage` on every received frame.
+ */
+export function validateInbound(
+  msg: Message,
+  opts: { receiver: "agent" | "server"; authed: boolean },
+): { ok: true } | { ok: false; code: "bad_direction" | "bad_state" } {
+  const dir = DIRECTION[msg.type];
+  const allowed = opts.receiver === "agent" ? ["s2a", "both"] : ["a2s", "both"];
+  if (!allowed.includes(dir)) return { ok: false, code: "bad_direction" };
+  if (!opts.authed && !HANDSHAKE_TYPES.has(msg.type)) return { ok: false, code: "bad_state" };
+  return { ok: true };
 }

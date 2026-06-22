@@ -1,65 +1,103 @@
 /**
- * Hugin Agent — Wire protocol v1 (STRAWMAN / DRAFT, rev 1.1)
+ * Hugin Agent — Wire protocol v1 (STRAWMAN / DRAFT, rev 1.3)
  * =========================================================
  *
  * Single source of truth for the WSS JSON contract shared between:
  *   - the local daemon  (`hugind`, "agent")          — runs behind NAT, dials out
  *   - the cloud relay   ("server" / orchestrator)    — assigns jobs, collects events
  *
- * Transport: one JSON object per WebSocket text frame.
+ * Transport: one JSON object per WebSocket text frame. TLS is mandatory.
  *
- * Design principles (see ../README.md for rationale):
+ * Design principles (see ../README.md):
  *   1. Outbound-only. The agent always initiates the connection.
  *   2. At-least-once delivery + idempotent consumers. NOT exactly-once.
- *   3. Lease-based job ownership; reconnect/reassign mint a NEW attempt.
- *   4. Explicit completion. `job.result` is authoritative; it is acked.
- *   5. Versioned + authenticated handshake. The server challenges; the agent
- *      proves possession of its paired device key before any job flows.
+ *   3. Lease-based ownership. `lease_id` is the current-generation fencing
+ *      token and rides on EVERY attempt-scoped message, both directions.
+ *   4. Explicit, digest-acked completion.
+ *   5. Versioned + authenticated handshake (auth.challenge → signed hello).
+ *   6. Relative durations (`*_ms`) are authoritative; ISO times are audit only.
  *
- * rev 1.1 — folds in cloud-team review:
- *   + auth.challenge / signed hello (was: agent_id with no proof)
- *   + lease.renew / lease.granted / lease.revoke (explicit fencing)
- *   + job.result.ack + hello.pending_results (terminal-result durability)
- *   + approval.request.expires_at, structured redaction, decided_by enum,
- *     removed server-rewritten updated_input (injection surface)
- *   + bounded prompt, heartbeat.capacity (backpressure)
+ * rev 1.3 — folds in two cloud-side reviews (cloud team + Codex):
+ *   + lease_id fencing on all attempt-scoped messages (both directions)
+ *   + connection_epoch (fence older WSS sessions for the same agent_id)
+ *   + REMOVED job.assign.session_id (engine resume is out of MVP scope)
+ *   + result digest/size + resend_result resume directive
+ *   + decided_by -> remote-only provenance (server can't assert local_user)
+ *   + JobReject.policy_violation (agent rejects unsafe assignments, no clamp)
+ *   + Ed25519-only + key_id; nonce = 32-byte base64url; *_ms expiries
+ *   + strict objects, safe-integer bounds, semver fields, string/array caps
+ *   + core event.kind enum + vendor.<engine>.* namespace
  *
- * rev 1.2 — folds in cross-review:
- *   + JobStatus.cancelled (state machine ↔ FinalStatus were inconsistent)
- *   + auth.challenge nonce entropy/TTL + signed transcript (challenge_id)
- *   + PendingResult.final_status + ResumeDirective.ack_pending (reconnect)
- *   + FinalStatus drops `rejected` (job.reject already covers refusal)
+ * Canonical signing bytes, pairing, key rotation/revocation: see
+ * ../../docs/auth-pairing-spec.md (separate security surface).
  *
- * NOTE: proposal for review, not a frozen contract. See ../README.md.
+ * NOTE: proposal for review, not a frozen contract.
  */
 
 import { z } from "zod";
 
-/** Semantic version of this protocol revision. */
-export const PROTOCOL_VERSION = "1.2.0-draft" as const;
+export const PROTOCOL_VERSION = "1.3.0-draft" as const;
 
 // ---------------------------------------------------------------------------
-// Shared scalars
+// Operational limits (part of the contract — both sides enforce these)
+// ---------------------------------------------------------------------------
+
+export const LIMITS = {
+  // Flow control (A4)
+  MAX_FRAME_BYTES: 1 << 20, //                      1 MiB per WSS frame
+  MAX_UNACKED_BYTES_PER_ATTEMPT: 8 << 20, //        8 MiB
+  MAX_UNACKED_EVENTS_PER_ATTEMPT: 1024,
+  MAX_UNACKED_BYTES_PER_CONN: 32 << 20, //          32 MiB
+  // Stream ack flush, first to trip (A2)
+  ACK_FLUSH_MS: 1000,
+  ACK_FLUSH_EVENTS: 64,
+  ACK_FLUSH_BYTES: 256 << 10, //                    256 KiB
+  // Lease (A1)
+  LEASE_TTL_MS_DEFAULT: 120_000,
+  LEASE_TTL_MS_MIN: 30_000,
+  LEASE_TTL_MS_MAX: 300_000,
+  LEASE_REASSIGN_GRACE_MS: 30_000,
+  // Heartbeat (A8)
+  HEARTBEAT_INTERVAL_MS: 15_000,
+  HEARTBEAT_SUSPECT_MISSES: 3,
+  HEARTBEAT_DEAD_MISSES: 4,
+  HEARTBEAT_DEAD_MS: 60_000,
+  // Approval (A3)
+  APPROVAL_TIMEOUT_MS_DEFAULT: 300_000,
+  APPROVAL_TIMEOUT_MS_MAX: 900_000,
+  // Auth (A7)
+  CHALLENGE_TTL_MS: 60_000,
+  // Payload caps
+  MAX_PROMPT_CHARS: 100_000,
+} as const;
+
+const ID_MAX = 256;
+const TEXT_MAX = 8_192;
+const PATH_MAX = 4_096;
+const SIG_MAX = 512;
+const ARRAY_MAX = 256;
+const TIMEOUT_MS_MAX = 3_600_000; //                1 hour
+const OUTPUT_BYTES_MAX = 100 << 20; //              100 MiB
+
+// ---------------------------------------------------------------------------
+// Reusable scalars (all bounded — no unbounded strings or unsafe integers)
 // ---------------------------------------------------------------------------
 
 const Iso = z.string().datetime({ offset: true });
-const NonEmpty = z.string().min(1);
+const Id = z.string().min(1).max(ID_MAX);
+const Text = z.string().max(TEXT_MAX);
+const Path = z.string().min(1).max(PATH_MAX);
+/** JSON-safe non-negative integer (guards against 2^53 precision loss). */
+const SafeInt = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const PosInt = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const SemVer = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
+const Base64Url = z.string().regex(/^[A-Za-z0-9_-]+$/);
 
-const JobId = NonEmpty.describe("Stable id for a logical job (survives retries).");
-const AttemptId = NonEmpty.describe("Unique id for ONE execution attempt of a job.");
-const LeaseId = NonEmpty.describe("Ownership token for an attempt; renewed explicitly.");
-const RequestId = NonEmpty.describe("Correlates an approval.request with its response.");
-const MessageId = NonEmpty.describe("Per-message id, used as the `ref_id` in nack/error.");
-
-const MAX_PROMPT_CHARS = 100_000;
-const MAX_SUMMARY_CHARS = 2_000;
-
-const NormalizedEvent = z
-  .object({
-    kind: NonEmpty.describe("Normalized event kind, e.g. assistant_text, tool_use, tool_result, usage."),
-  })
-  .passthrough()
-  .describe("Engine-agnostic NDJSON event. Adapters map claude/codex output into this shape.");
+const JobId = Id.describe("Stable id for a logical job (survives retries).");
+const AttemptId = Id.describe("Unique id for ONE execution attempt of a job.");
+const LeaseId = Id.describe("Current-generation fencing token; rotates on lease.granted.");
+const RequestId = Id;
+const MessageId = Id;
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -69,167 +107,179 @@ export const Engine = z.enum(["claude", "codex"]);
 export const Sandbox = z.enum(["read_only", "workspace_write", "full"]);
 export const ApprovalPolicy = z.enum(["never", "on_request", "on_write", "always"]);
 
+/** All job states. */
 export const JobStatus = z.enum([
-  "accepted",
-  "starting",
-  "running",
-  "cancelling",
-  "cancelled",
-  "completed",
-  "failed",
+  "accepted", "starting", "running", "cancelling", "cancelled", "completed", "failed",
 ]);
 
-// `rejected` is intentionally absent: a refused *assignment* ends via
-// `job.reject` (a2s) and never produces a job.result. `timeout` is a terminal
-// reason carried by job.result; the job's last JobStatus for it is `failed`.
+/** Only NON-terminal states are legal inside hello.active_jobs (C4). Terminal
+ *  results travel through pending_results, never active_jobs. */
+export const ActiveJobStatus = z.enum(["accepted", "starting", "running", "cancelling"]);
+
+/** `rejected` absent: a refused assignment ends at job.reject. `timeout` is a
+ *  terminal reason carried by job.result; its last JobStatus is `failed`. */
 export const FinalStatus = z.enum(["success", "error", "cancelled", "timeout"]);
+
 export const Risk = z.enum(["low", "medium", "high"]);
 
-/** Who made an approval decision. Closed set so `local_user` can't be spoofed. */
-export const DecidedBy = z.enum(["remote_user", "local_user", "policy", "system"]);
+/** Approval provenance is REMOTE-only — a server message must not assert a
+ *  local decision (B7). The local gate/audit state is owned by the daemon. */
+export const RemoteDecisionBy = z.enum(["remote_user", "remote_policy", "remote_system"]);
 
 export const NackCode = z.enum([
-  "unsupported_version",
-  "invalid_message",
-  "stale_lease",
-  "unknown_job",
-  "duplicate_attempt",
-  "rate_limited",
+  "unsupported_version", "invalid_message", "stale_lease", "unknown_job",
+  "unknown_attempt", "duplicate_attempt", "rate_limited",
+  "bad_direction", "bad_state", "payload_too_large", "lease_expired", "policy_violation",
 ]);
 
 export const ErrorCode = z.enum([
-  "internal",
-  "engine_unavailable",
-  "workspace_error",
-  "approval_timeout",
-  "policy_violation",
+  "internal", "engine_unavailable", "workspace_error", "approval_timeout", "policy_violation",
+]);
+
+/** Core, frozen event kinds + a vendor namespace for engine-specific extras.
+ *  Unknown vendor events MAY be stored but not trusted/rendered (A5). */
+export const EventKind = z.union([
+  z.enum([
+    "assistant_text", "tool_use", "tool_result", "usage",
+    "stdout_chunk", "stderr_chunk", "system_status", "engine_error",
+  ]),
+  z.string().regex(/^vendor\.(claude|codex)\.[a-z0-9_.]+$/),
 ]);
 
 // ---------------------------------------------------------------------------
 // Composite value objects
 // ---------------------------------------------------------------------------
 
-const EnvPolicy = z.object({
+const EnvPolicy = z.strictObject({
   mode: z.literal("whitelist"),
-  allow: z.array(NonEmpty).default([]),
+  allow: z.array(Id).max(ARRAY_MAX).default([]),
 });
 
-const NetworkPolicy = z.object({
+// v1: mode only. restricted/on host grammar (CIDR/wildcard/DNS-rebind guard)
+// is deferred; MVP coding tasks run with network off unless a repo opts in.
+const NetworkPolicy = z.strictObject({
   mode: z.enum(["off", "restricted", "on"]),
-  allow_hosts: z.array(NonEmpty).optional(),
 });
 
-const Limits = z.object({
-  timeout_ms: z.number().int().positive(),
-  max_output_bytes: z.number().int().positive(),
+const Limits = z.strictObject({
+  timeout_ms: PosInt.max(TIMEOUT_MS_MAX),
+  max_output_bytes: PosInt.max(OUTPUT_BYTES_MAX),
 });
 
-const Workspace = z.object({
-  repo_root: NonEmpty.describe("Allowlisted, realpath-canonicalized repo root."),
-  base_sha: NonEmpty.optional(),
-  cwd: z.string().optional().describe("Subdir within repo_root; MUST resolve inside it."),
+// repo_root/cwd canonicalization is NORMATIVE (not advisory): the daemon MUST
+// realpath them, reject symlink escapes, and reject a cwd outside repo_root,
+// which itself must be on the local allowlist.
+const Workspace = z.strictObject({
+  repo_root: Path,
+  base_sha: Id.optional(),
+  cwd: Path.optional(),
 });
 
-const EngineStatus = z.object({
+const EngineStatus = z.strictObject({
   installed: z.boolean(),
-  version: z.string().optional(),
+  version: Id.optional(),
   logged_in: z.boolean().optional(),
 });
 
-const Capabilities = z.object({
-  engines: z.object({ claude: EngineStatus, codex: EngineStatus }),
-  project_roots: z.array(NonEmpty),
+const Capabilities = z.strictObject({
+  engines: z.strictObject({ claude: EngineStatus, codex: EngineStatus }),
+  project_roots: z.array(Path).max(ARRAY_MAX),
 });
 
-const ActiveJob = z.object({
+const ActiveJob = z.strictObject({
   job_id: JobId,
   attempt_id: AttemptId,
   lease_id: LeaseId,
-  status: JobStatus,
-  last_emitted_seq: z.number().int().nonnegative(),
+  status: ActiveJobStatus,
+  last_emitted_seq: SafeInt,
 });
 
-/**
- * A terminal result the agent produced but hasn't seen acked — replayed on
- * reconnect. The agent MUST durably store the full job.result payload locally
- * (SQLite); this is only the index into it, not the payload.
- */
-const PendingResult = z.object({ job_id: JobId, attempt_id: AttemptId, final_status: FinalStatus });
+/** A terminal result produced but not yet acked. The agent MUST durably store
+ *  the full job.result payload locally; this is the index + verification info
+ *  so the server can distinguish "payload acked" from "id acked" (B5). */
+const PendingResult = z.strictObject({
+  job_id: JobId,
+  attempt_id: AttemptId,
+  final_status: FinalStatus,
+  result_digest: Base64Url.max(128).describe("SHA-256 of the canonical job.result payload."),
+  result_size: SafeInt,
+  last_emitted_seq: SafeInt,
+});
 
 // ---------------------------------------------------------------------------
-// Envelope: every message shares { id, ts }. `type` is the discriminant.
+// Envelope: every message is a strict object sharing { id, ts }.
 // ---------------------------------------------------------------------------
 
 const base = { id: MessageId, ts: Iso };
 
 // ---- Handshake (authenticated) --------------------------------------------
 
-/** Server's FIRST frame: a nonce the agent must sign with its device key. */
-export const AuthChallenge = z.object({
+export const AuthChallenge = z.strictObject({
   ...base,
   type: z.literal("auth.challenge"),
-  challenge_id: NonEmpty.describe("Echoed in hello.auth so the response binds to this challenge."),
-  /** >=256-bit random, base64url. Single-use; the server tracks spent nonces. */
-  nonce: z.string().min(43),
+  challenge_id: Id,
+  /** 32 random bytes, base64url (43 chars unpadded). Single-use, server-tracked. */
+  nonce: Base64Url.min(43).max(44),
   server_time: Iso,
-  expires_at: Iso.describe("Nonce TTL; a hello arriving after this is rejected."),
+  challenge_ttl_ms: PosInt,
 });
 
-export const Hello = z.object({
+export const Hello = z.strictObject({
   ...base,
   type: z.literal("hello"),
-  protocol_version: z.string(),
-  agent_id: NonEmpty,
-  agent_version: NonEmpty,
-  /**
-   * Proof of possession of the paired device key. `signature` signs the
-   * canonical transcript `challenge_id | nonce | agent_id | protocol_version |
-   * alg` — NOT the bare nonce, which would be replayable. The server resolves
-   * the device public key by `agent_id` (registered at pairing).
-   */
-  auth: z.object({
-    challenge_id: NonEmpty,
-    signature: NonEmpty,
-    alg: z.enum(["ed25519", "ecdsa-p256"]),
+  protocol_version: SemVer,
+  agent_id: Id,
+  agent_version: SemVer,
+  /** Ed25519 signature over the canonical transcript defined in the
+   *  auth/pairing spec — NOT the bare nonce. `key_id` selects the device key. */
+  auth: z.strictObject({
+    challenge_id: Id,
+    key_id: Id,
+    signature: Base64Url.max(SIG_MAX),
+    alg: z.literal("ed25519"),
   }),
-  os: z.object({
+  os: z.strictObject({
     platform: z.enum(["darwin", "linux", "win32"]),
-    arch: z.string(),
-    release: z.string().optional(),
+    arch: Id,
+    release: Id.optional(),
   }),
   capabilities: Capabilities,
-  active_jobs: z.array(ActiveJob).default([]),
-  /** Terminal results awaiting ack from a previous connection. */
-  pending_results: z.array(PendingResult).default([]),
+  active_jobs: z.array(ActiveJob).max(ARRAY_MAX).default([]),
+  pending_results: z.array(PendingResult).max(ARRAY_MAX).default([]),
 });
 
-const ResumeDirective = z.object({
+const ResumeDirective = z.strictObject({
   job_id: JobId,
   attempt_id: AttemptId,
-  // ack_pending: the server already holds this terminal result; the agent may
-  // GC it (a job.result.ack delivered inside the handshake).
-  action: z.enum(["resume_from", "abandon", "ack_pending"]),
-  resume_after_seq: z.number().int().nonnegative().optional(),
+  // resume_from: re-send stream events after resume_after_seq.
+  // resend_result: server lacks the terminal result — re-send job.result.
+  // ack_pending: server already has it — GC locally.
+  // abandon: drop the attempt.
+  action: z.enum(["resume_from", "resend_result", "ack_pending", "abandon"]),
+  resume_after_seq: SafeInt.optional(),
 });
 
-export const HelloAccepted = z.object({
+export const HelloAccepted = z.strictObject({
   ...base,
   type: z.literal("hello.accepted"),
-  negotiated_version: z.string(),
-  heartbeat_interval_ms: z.number().int().positive(),
-  resume: z.array(ResumeDirective).default([]),
+  negotiated_version: SemVer,
+  /** Server-assigned; monotonically increasing per agent_id. The agent must
+   *  abandon any older connection_epoch — older WSS sessions are fenced (B2). */
+  connection_epoch: SafeInt,
+  heartbeat_interval_ms: PosInt,
+  resume: z.array(ResumeDirective).max(ARRAY_MAX).default([]),
 });
 
-export const HelloRejected = z.object({
+export const HelloRejected = z.strictObject({
   ...base,
   type: z.literal("hello.rejected"),
-  code: z.enum(["unsupported_version", "unauthorized", "agent_unknown", "bad_signature"]),
-  message: z.string(),
+  code: z.enum(["unsupported_version", "unauthorized", "agent_unknown", "bad_signature", "expired_challenge"]),
+  message: Text,
 });
 
 // ---- Lease fencing ---------------------------------------------------------
 
-export const LeaseRenew = z.object({
+export const LeaseRenew = z.strictObject({
   ...base,
   type: z.literal("lease.renew"),
   job_id: JobId,
@@ -237,180 +287,196 @@ export const LeaseRenew = z.object({
   lease_id: LeaseId,
 });
 
-export const LeaseGranted = z.object({
+export const LeaseGranted = z.strictObject({
   ...base,
   type: z.literal("lease.granted"),
   job_id: JobId,
   attempt_id: AttemptId,
+  /** The NEW current-generation token. The agent must use it on all subsequent
+   *  attempt-scoped messages; the server nacks the old one. */
   lease_id: LeaseId,
-  lease_expires_at: Iso,
+  lease_ttl_ms: PosInt.min(LIMITS.LEASE_TTL_MS_MIN).max(LIMITS.LEASE_TTL_MS_MAX),
 });
 
-export const LeaseRevoke = z.object({
+export const LeaseRevoke = z.strictObject({
   ...base,
   type: z.literal("lease.revoke"),
   job_id: JobId,
   attempt_id: AttemptId,
   lease_id: LeaseId,
-  reason: z.string(),
+  reason: Text,
 });
 
 // ---- Job assignment & acceptance ------------------------------------------
 
-export const JobAssign = z.object({
+export const JobAssign = z.strictObject({
   ...base,
   type: z.literal("job.assign"),
   job_id: JobId,
   attempt_id: AttemptId,
   lease_id: LeaseId,
-  lease_expires_at: Iso,
+  lease_ttl_ms: PosInt.min(LIMITS.LEASE_TTL_MS_MIN).max(LIMITS.LEASE_TTL_MS_MAX),
   engine: Engine,
   workspace: Workspace,
-  prompt: z.string().max(MAX_PROMPT_CHARS),
-  session_id: z.string().optional().describe("Resume an existing engine session."),
+  prompt: z.string().max(LIMITS.MAX_PROMPT_CHARS),
+  // NOTE: no `session_id`. Engine session resume/fork is out of MVP scope and
+  // was a cross-job leak surface; reintroduce later as an agent-owned mapping.
   sandbox: Sandbox,
   approval_policy: ApprovalPolicy,
   env_policy: EnvPolicy,
   network_policy: NetworkPolicy,
   limits: Limits,
-  priority: z.number().int().optional(),
+  priority: SafeInt.optional(),
   created_at: Iso,
-  expires_at: Iso.describe("Drop the assignment if not started by this time."),
+  assignment_start_timeout_ms: PosInt,
 });
 
-export const JobAccept = z.object({
+export const JobAccept = z.strictObject({
   ...base,
   type: z.literal("job.accept"),
   job_id: JobId,
   attempt_id: AttemptId,
-  agent_run_id: NonEmpty,
+  lease_id: LeaseId,
+  agent_run_id: Id,
 });
 
-export const JobReject = z.object({
+export const JobReject = z.strictObject({
   ...base,
   type: z.literal("job.reject"),
   job_id: JobId,
   attempt_id: AttemptId,
-  code: z.enum(["root_not_allowlisted", "engine_unavailable", "busy", "stale_lease", "bad_request"]),
-  message: z.string(),
+  lease_id: LeaseId,
+  // policy_violation: requested sandbox/approval_policy exceeds the daemon's
+  // local maximum. The agent REJECTS (no silent clamp) so cloud + daemon never
+  // disagree on the effective execution mode (B8).
+  code: z.enum(["root_not_allowlisted", "engine_unavailable", "busy", "stale_lease", "bad_request", "policy_violation"]),
+  message: Text,
 });
 
 // ---- Streaming + acknowledgement ------------------------------------------
 
-export const StreamEvent = z.object({
+export const StreamEvent = z.strictObject({
   ...base,
   type: z.literal("stream.event"),
   job_id: JobId,
   attempt_id: AttemptId,
-  seq: z.number().int().positive().describe("Monotonic per-attempt, starting at 1."),
-  event_id: NonEmpty,
-  event: NormalizedEvent,
+  lease_id: LeaseId,
+  seq: PosInt.describe("Monotonic per-attempt, starting at 1."),
+  event_id: Id,
+  // Event payloads are adapter data → bounded by the frame cap, not by strict
+  // keys. `kind` is locked to the core enum or a vendor namespace.
+  event: z.object({ kind: EventKind }).catchall(z.unknown()),
 });
 
-export const StreamAck = z.object({
+export const StreamAck = z.strictObject({
   ...base,
   type: z.literal("stream.ack"),
   job_id: JobId,
   attempt_id: AttemptId,
-  ack_seq: z.number().int().nonnegative().describe("Cumulative: every seq <= ack_seq is durably stored, in order."),
+  lease_id: LeaseId,
+  ack_seq: SafeInt.describe("Cumulative: every seq <= ack_seq is durably stored, in order."),
 });
 
 // ---- Approval gate ---------------------------------------------------------
 
-export const ApprovalRequest = z.object({
+export const ApprovalRequest = z.strictObject({
   ...base,
   type: z.literal("approval.request"),
   job_id: JobId,
   attempt_id: AttemptId,
+  lease_id: LeaseId,
   request_id: RequestId,
-  tool_name: NonEmpty,
-  /** Redacted, length-capped summary. Raw secrets never leave the host. */
-  input_summary: z.string().max(MAX_SUMMARY_CHARS),
-  redacted: z.boolean().describe("True if the daemon stripped sensitive content from input_summary."),
+  tool_name: Id,
+  input_summary: Text,
+  redaction: z.strictObject({
+    applied: z.boolean(),
+    truncated: z.boolean(),
+    byte_count: SafeInt,
+  }),
   risk: Risk,
-  /** Hard deadline; on expiry the agent auto-denies and emits `error{approval_timeout}`. */
-  expires_at: Iso,
+  approval_timeout_ms: PosInt.max(LIMITS.APPROVAL_TIMEOUT_MS_MAX),
 });
 
-export const ApprovalResponse = z.object({
+export const ApprovalResponse = z.strictObject({
   ...base,
   type: z.literal("approval.response"),
   job_id: JobId,
   attempt_id: AttemptId,
+  lease_id: LeaseId,
   request_id: RequestId,
   decision: z.enum(["allow", "deny"]),
-  reason: z.string().optional(),
-  decided_by: DecidedBy,
-  // NOTE: no server-supplied `updated_input`. The server cannot rewrite tool
-  // input — allow/deny only — to remove a remote command-injection surface.
+  reason: Text.optional(),
+  decided_by: RemoteDecisionBy,
+  // No `updated_input`: the server cannot rewrite tool input. The daemon caches
+  // the original input and reconstructs `updatedInput` for the engine locally.
 });
 
 // ---- Status + terminal result ---------------------------------------------
 
-export const JobStatusMsg = z.object({
+export const JobStatusMsg = z.strictObject({
   ...base,
   type: z.literal("job.status"),
   job_id: JobId,
   attempt_id: AttemptId,
+  lease_id: LeaseId,
   status: JobStatus,
 });
 
-export const JobResult = z.object({
+export const JobResult = z.strictObject({
   ...base,
   type: z.literal("job.result"),
   job_id: JobId,
   attempt_id: AttemptId,
+  lease_id: LeaseId,
   final_status: FinalStatus,
   exit_code: z.number().int().optional(),
-  signal: z.string().optional(),
-  error_kind: z.string().optional(),
-  duration_ms: z.number().int().nonnegative(),
-  stats: z.object({
-    event_count: z.number().int().nonnegative(),
-    bytes: z.number().int().nonnegative(),
-  }),
-  head_sha: z.string().optional(),
+  signal: Id.optional(),
+  error_kind: Id.optional(),
+  duration_ms: SafeInt,
+  stats: z.strictObject({ event_count: SafeInt, bytes: SafeInt }),
+  head_sha: Id.optional(),
 });
 
-/** Server confirms durable storage of a terminal result; agent may GC it. */
-export const JobResultAck = z.object({
+/** Confirms DURABLE storage of a specific terminal payload (digest-matched),
+ *  not merely its id — so the agent can GC with confidence (B5). */
+export const JobResultAck = z.strictObject({
   ...base,
   type: z.literal("job.result.ack"),
   job_id: JobId,
   attempt_id: AttemptId,
+  lease_id: LeaseId,
+  result_digest: Base64Url.max(128),
 });
 
 // ---- Cancellation ----------------------------------------------------------
 
-export const JobCancel = z.object({
+export const JobCancel = z.strictObject({
   ...base,
   type: z.literal("job.cancel"),
   job_id: JobId,
   attempt_id: AttemptId,
-  reason: z.string(),
-  grace_ms: z.number().int().nonnegative().default(5000),
+  lease_id: LeaseId, // C5: without this a stale server message could cancel the wrong live attempt
+  reason: Text,
+  grace_ms: SafeInt.max(60_000).default(5000),
 });
 
 // ---- Liveness + lifecycle --------------------------------------------------
 
-export const Heartbeat = z.object({
+export const Heartbeat = z.strictObject({
   ...base,
   type: z.literal("heartbeat"),
-  active_attempts: z.array(AttemptId).optional(),
-  /** Backpressure hint (a2s): concurrency headroom for the scheduler. */
-  capacity: z
-    .object({ max_concurrent: z.number().int().nonnegative(), running: z.number().int().nonnegative() })
-    .optional(),
+  active_attempts: z.array(AttemptId).max(ARRAY_MAX).optional(),
+  capacity: z.strictObject({ max_concurrent: SafeInt, running: SafeInt }).optional(),
 });
 
-export const AgentDraining = z.object({
+export const AgentDraining = z.strictObject({
   ...base,
   type: z.literal("agent.draining"),
   reason: z.enum(["shutdown", "update", "idle_timeout"]),
-  eta_ms: z.number().int().nonnegative().optional(),
+  eta_ms: SafeInt.optional(),
 });
 
-export const CapabilitiesUpdate = z.object({
+export const CapabilitiesUpdate = z.strictObject({
   ...base,
   type: z.literal("capabilities.update"),
   capabilities: Capabilities,
@@ -418,21 +484,22 @@ export const CapabilitiesUpdate = z.object({
 
 // ---- Errors ----------------------------------------------------------------
 
-export const Nack = z.object({
+export const Nack = z.strictObject({
   ...base,
   type: z.literal("nack"),
   ref_id: MessageId.optional(),
   code: NackCode,
-  message: z.string(),
+  message: Text,
 });
 
-export const ErrorMsg = z.object({
+export const ErrorMsg = z.strictObject({
   ...base,
   type: z.literal("error"),
   code: ErrorCode,
-  message: z.string(),
+  message: Text,
   job_id: JobId.optional(),
   attempt_id: AttemptId.optional(),
+  lease_id: LeaseId.optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -468,7 +535,7 @@ export const Message = z.discriminatedUnion("type", [
 export type Message = z.infer<typeof Message>;
 export type MessageType = Message["type"];
 
-/** Direction of each message: a2s = agent→server, s2a = server→agent. */
+/** a2s = agent→server, s2a = server→agent. */
 export const DIRECTION = {
   "auth.challenge": "s2a",
   hello: "a2s",
@@ -494,6 +561,11 @@ export const DIRECTION = {
   nack: "both",
   error: "both",
 } as const satisfies Record<MessageType, "a2s" | "s2a" | "both">;
+
+/** Messages permitted before the handshake completes (pre-auth phase). */
+export const HANDSHAKE_TYPES = new Set<MessageType>([
+  "auth.challenge", "hello", "hello.accepted", "hello.rejected", "nack", "error",
+]);
 
 export function parseMessage(raw: unknown): Message {
   return Message.parse(raw);

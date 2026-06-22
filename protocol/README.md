@@ -1,49 +1,62 @@
-# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.2)
+# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.3)
 
 WSS JSON contract between the local daemon (`hugind`, **agent**) and the cloud
-relay (**server**). This is a **proposal for review**, not a frozen contract —
-see [Open questions](#open-questions). rev 1.1 folds in the first cloud-side
-review (see [CHANGELOG](../CHANGELOG.md)).
+relay (**server**). A **proposal for review**, not a frozen contract. rev 1.3
+folds in two cloud-side reviews (cloud team + Codex) — see [CHANGELOG](../CHANGELOG.md).
 
-- **SSOT:** [`v1/messages.ts`](v1/messages.ts) (zod). Both codebases import it;
-  the cloud side can `z.toJSONSchema(Message)` or codegen from it.
-- **Runnable spec:** `npm run protocol:check` validates one sample of every
-  message type (23/23) + version negotiation.
+- **SSOT:** [`v1/messages.ts`](v1/messages.ts) (zod). Both codebases import it.
+- **Runnable spec:** `npm run protocol:check` — 23/23 messages + negotiation,
+  strict-field, safe-integer, and direction/phase checks.
+- **TLS is mandatory.** The transport protects `server_time` and frames in flight.
 
 ## Design principles
 
-| # | Principle | Why |
-|---|-----------|-----|
-| 1 | **Outbound-only** | Agent dials out; no inbound ports. NAT/firewall friendly. |
-| 2 | **At-least-once + idempotent**, not exactly-once | `seq`+`event_id` let the server dedupe. |
-| 3 | **Lease-based ownership** | Reconnect/reassign mint a new `attempt_id`; stale attempts are nacked, so a job never runs twice silently. |
-| 4 | **Explicit, acked completion** | `job.result` is authoritative and is confirmed by `job.result.ack` so the agent can GC. |
-| 5 | **Versioned + authenticated handshake** | Server `auth.challenge` → signed `hello`. No job flows until the device key is proven. |
+| # | Principle |
+|---|-----------|
+| 1 | **Outbound-only** — agent dials out; no inbound ports. |
+| 2 | **At-least-once + idempotent** — `seq`+`event_id` dedupe; never exactly-once. |
+| 3 | **Lease fencing** — `lease_id` is the current-generation token on **every** attempt-scoped message, **both directions**. Rotates on `lease.granted`. |
+| 4 | **Digest-acked completion** — `job.result` → `job.result.ack{result_digest}`. |
+| 5 | **Authenticated handshake** — `auth.challenge` → Ed25519-signed `hello`. |
+| 6 | **Relative durations are authoritative** — `*_ms`; ISO times are audit/display only. |
+
+## Agreed operational values
+
+Both sides enforce these (exported as `LIMITS` in the SSOT):
+
+| Concern | Value |
+|---------|-------|
+| Lease TTL | 120s default (30–300s); reassign only after expiry **+30s grace** |
+| Heartbeat | 15s interval; suspect @3 misses; dead @4 misses or 60s. **Dead ≠ reassign** — reassignment needs lease expiry + grace, never heartbeat alone. |
+| Approval | 300s default, 900s hard max; late responses ignored + audited |
+| Stream ack flush | first of 1s / 64 events / 256 KiB; ack only after durable commit |
+| Flow caps | frame ≤1 MiB; per-attempt unacked ≤8 MiB or 1024 events; per-conn ≤32 MiB |
+| Nonce | 32 random bytes base64url, TTL 60s, globally single-use |
 
 ## Message catalog
 
+Every attempt-scoped message (both directions) carries `lease_id`.
+
 | Message | Dir | Purpose |
 |---------|-----|---------|
-| `auth.challenge` | s2a | Server's first frame: a nonce to sign. |
-| `hello` | a2s | Identity + **signature over the nonce** + capabilities + `active_jobs` + `pending_results`. |
-| `hello.accepted` / `hello.rejected` | s2a | Negotiated version + resume directives, or version/auth refusal. |
-| `lease.renew` | a2s | Ask to extend the current attempt's lease. |
-| `lease.granted` | s2a | New `lease_expires_at`. |
-| `lease.revoke` | s2a | Server pulls ownership (agent must stop the attempt locally). |
-| `job.assign` | s2a | Assign an attempt under a lease (engine, workspace, **bounded** prompt, policies, limits). |
-| `job.accept` / `job.reject` | a2s | Agent takes or refuses the attempt. |
-| `stream.event` | a2s | Normalized NDJSON event with monotonic `seq` + `event_id`. |
-| `stream.ack` | s2a | Cumulative ack: server durably stored everything ≤ `ack_seq`. |
-| `approval.request` | a2s | Ask before a gated tool runs (redacted summary, **`expires_at`**). |
-| `approval.response` | s2a | allow/deny + `decided_by` (enum). **No server-rewritten input.** |
+| `auth.challenge` | s2a | Nonce + `challenge_ttl_ms` to sign. |
+| `hello` | a2s | `agent_id` + Ed25519 `auth{key_id, signature}` + capabilities + `active_jobs` + `pending_results`. |
+| `hello.accepted` | s2a | `negotiated_version`, **`connection_epoch`**, resume directives. |
+| `hello.rejected` | s2a | version/auth/`expired_challenge` refusal. |
+| `lease.renew` / `lease.granted` / `lease.revoke` | a2s / s2a / s2a | Fencing: renew before expiry; `lease.granted` issues the **next** `lease_id` + `lease_ttl_ms`. |
+| `job.assign` | s2a | Assign attempt (engine, workspace, bounded prompt, policies, limits). **No `session_id`.** |
+| `job.accept` / `job.reject` | a2s | Take, or refuse (`policy_violation` when policy exceeds local max). |
+| `stream.event` | a2s | Normalized event (`seq`, `event_id`, core `kind` enum). |
+| `stream.ack` | s2a | Cumulative durable ack. |
+| `approval.request` | a2s | Gated tool ask (`redaction{…}`, `approval_timeout_ms`). |
+| `approval.response` | s2a | allow/deny + `decided_by` (**remote-only**). |
 | `job.status` | a2s | Lifecycle transition. |
-| `job.result` | a2s | Terminal result (`final_status`, `exit_code`, `head_sha`, stats). |
-| `job.result.ack` | s2a | Server stored the result; agent may GC the attempt. |
-| `job.cancel` | s2a | Cancel an attempt; `grace_ms` before process-group SIGKILL. |
-| `heartbeat` | both | Liveness; a2s beats carry `capacity` (backpressure hint). |
-| `agent.draining` | a2s | Graceful shutdown/update notice. |
-| `capabilities.update` | a2s | Engines/roots changed mid-connection. |
-| `nack` / `error` | both | Protocol-level reject / runtime error. |
+| `job.result` | a2s | Terminal result. |
+| `job.result.ack` | s2a | Confirms the **payload** is durable (`result_digest`). |
+| `job.cancel` | s2a | Cancel an attempt (carries `lease_id`). |
+| `heartbeat` | both | Liveness + `capacity`. |
+| `agent.draining` / `capabilities.update` | a2s | Lifecycle. |
+| `nack` / `error` | both | Protocol reject / runtime error. |
 
 ## Handshake
 
@@ -51,28 +64,25 @@ review (see [CHANGELOG](../CHANGELOG.md)).
 sequenceDiagram
     participant A as hugind (agent)
     participant S as relay (server)
-    Note over A,S: agent dials out (WSS)
-    S->>A: auth.challenge (nonce)
-    A->>S: hello (agent_id, signature=sign(nonce), capabilities, active_jobs, pending_results)
-    S->>A: hello.accepted (negotiated_version, resume[])
+    Note over A,S: agent dials out (WSS/TLS)
+    S->>A: auth.challenge (challenge_id, nonce, challenge_ttl_ms)
+    A->>S: hello (agent_id, auth{key_id, signature=sign(transcript)})
+    S->>A: hello.accepted (negotiated_version, connection_epoch, resume[])
 ```
 
-The server resolves `agent_id` → the device public key registered at pairing,
-verifies the signature, and only then accepts. A bad/absent signature →
-`hello.rejected{bad_signature|unauthorized}`.
-
-**Signed transcript, not the bare nonce:** `signature` covers
-`challenge_id | nonce | agent_id | protocol_version | alg`, so a captured
-`(nonce, sig)` pair can't be replayed against a different identity or version.
-`nonce` is ≥256-bit single-use with a TTL (`auth.challenge.expires_at`); the
-server tracks spent nonces. **TLS is mandatory** — the transport (not the JSON
-schema) protects `server_time` and the frames in flight.
+`signature` covers the **canonical transcript** (`challenge_id | nonce |
+agent_id | protocol_version | alg` + domain separation + tenant binding), **not
+the bare nonce** — defined byte-for-byte in
+[`docs/auth-pairing-spec.md`](../docs/auth-pairing-spec.md). The server resolves
+`agent_id` + `key_id` → device public key (registered at pairing), checks the
+single-use nonce within its TTL, and assigns a `connection_epoch`. A newer
+`hello` fences any older connection for the same `agent_id`.
 
 ## Job lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> assigned: job.assign (attempt_id, lease)
+    [*] --> assigned: job.assign
     assigned --> accepted: job.accept
     assigned --> [*]: job.reject
     accepted --> starting: spawn engine
@@ -80,67 +90,34 @@ stateDiagram-v2
     starting --> failed: spawn failed
     running --> running: stream.event (seq++)
     running --> cancelling: job.cancel
-    cancelling --> cancelled: process group reaped
+    cancelling --> cancelled
     running --> completed: success
     running --> failed: error / timeout
     completed --> acked: job.result + job.result.ack
-    failed --> acked: job.result + job.result.ack
-    cancelled --> acked: job.result + job.result.ack
+    failed --> acked
+    cancelled --> acked
     acked --> [*]
 ```
 
-Every terminal state emits a `job.result` and is GC'd only after
-`job.result.ack`. `final_status` ∈ {success, error, cancelled, timeout}:
-`completed→success`, `cancelled→cancelled`, `failed→error|timeout`. A refused
-*assignment* never reaches here — it ends at `job.reject`. (`JobStatus` carries
-`cancelled`; `timeout` is a `failed`-state result reason, not a status.)
+`final_status` ∈ {success, error, cancelled, timeout}: `completed→success`,
+`cancelled→cancelled`, `failed→error|timeout`. A refused *assignment* ends at
+`job.reject`, never here. `active_jobs` may only carry **non-terminal** status;
+terminal results travel through `pending_results`.
 
-## Lease lifecycle
+## Lease & reliability
 
-A lease binds **one attempt** to the agent that owns it.
+- `lease.granted` rotates `lease_id`; the agent uses the new token on all
+  subsequent attempt-scoped messages, and the server nacks the old one
+  (`stale_lease`). The agent stops the engine locally when its lease is
+  lost/revoked (**local fencing** — the wire can't stop a partitioned process).
+- `seq=1,2,3…` per attempt, persisted to local SQLite before send; cumulative
+  `stream.ack` (server guarantees per-`(job,attempt)` in-order durable storage).
+- Backpressure: pause reading the engine's stdout when unacked bytes hit the cap.
+- On reconnect, `active_jobs` + `pending_results` (with `result_digest`,
+  `result_size`, `last_emitted_seq`) drive `resume[]`:
+  `resume_from` / `resend_result` / `ack_pending` / `abandon`.
 
-- `job.assign` carries `lease_id` + `lease_expires_at`.
-- The agent extends it with `lease.renew` → `lease.granted` before expiry.
-- The server can pull it with `lease.revoke`; the agent MUST then stop the
-  attempt locally.
-- If the agent disconnects past expiry, the server MAY mint a **new
-  `attempt_id`** and reassign. A resurfacing old attempt is rejected with
-  `nack{stale_lease}`.
-- **Invariant:** at most one *live* attempt per `job_id`.
-
-> ⚠️ The wire can reject a stale attempt's *messages*, but it cannot stop a
-> partitioned old agent **process** from running locally. The daemon needs
-> **local lease fencing** (stop the engine when its lease is lost). This is a
-> daemon responsibility, called out here so it isn't forgotten.
-
-## Reliability: seq / ack / replay
-
-1. Agent assigns `seq = 1,2,3…` per attempt and **persists each event to local
-   SQLite before sending**.
-2. Server sends `stream.ack{ack_seq}` cumulatively (assumes **in-order durable
-   storage** — see Open #2).
-3. Backpressure: if unacked bytes exceed a cap, the agent pauses reading the
-   engine's stdout; `heartbeat.capacity` advertises headroom.
-4. On reconnect, `hello.active_jobs[].last_emitted_seq` + `pending_results[]`
-   (each carrying `final_status`) tell the server where the agent is; it replies
-   in `hello.accepted.resume[]` with `resume_from(resume_after_seq)`, `abandon`,
-   or `ack_pending` (server already stored that terminal result → GC it). The
-   agent durably stores the full `job.result` payload locally so it can re-send
-   on `resume_from` — `pending_results` is only the index into that store.
-
-```mermaid
-sequenceDiagram
-    participant A as hugind
-    participant S as relay
-    A->>S: hello (active_jobs:[{j1,a1,last_emitted_seq:42}], pending_results:[])
-    S->>A: hello.accepted (resume:[{j1,a1,resume_from,after:40}])
-    A->>S: stream.event j1/a1 seq=41,42
-    S->>A: stream.ack j1/a1 ack_seq=42
-    A->>S: job.result j1/a1 success
-    S->>A: job.result.ack j1/a1
-```
-
-## Approval flow
+## Approval
 
 ```mermaid
 sequenceDiagram
@@ -148,64 +125,62 @@ sequenceDiagram
     participant A as hugind
     participant S as relay
     E-->>A: wants Bash(rm -rf build/)
-    A->>S: approval.request (r1, risk:high, redacted summary, expires_at)
-    S->>A: approval.response (r1, deny, decided_by:remote_user)
+    A->>S: approval.request (redaction{…}, approval_timeout_ms)
+    S->>A: approval.response (deny, decided_by: remote_user)
     A-->>E: deny
-    Note over A: on expires_at with no response → auto-deny + error{approval_timeout}
+    Note over A: on timeout → auto-deny + error{approval_timeout}
 ```
 
-> **Local gate (security invariant):** a remote `allow` is **necessary, not
-> sufficient** for high-risk tools. Write/network/shell escalation also requires
-> local user presence — otherwise a compromised orchestrator self-approves. The
-> server cannot rewrite tool input (no `updated_input`); allow/deny only.
+> **Local gate:** a remote `allow` is necessary, not sufficient, for high-risk
+> tools — escalation also needs local user presence. `decided_by` is
+> remote-only; the server can't assert `local_user`.
 >
-> **Bridge contract (claude `--permission-prompt-tool`):** the prompt tool
-> expects `{behavior:"allow", updatedInput}` / `{behavior:"deny"}`. Since the
-> wire has no `updated_input`, the daemon caches the *original* tool input when
-> it sends `approval.request`, and on a remote `allow` replays
-> `updatedInput = originalInput` to the engine. If the daemon restarts between
-> request and response the cached input is lost and the attempt **fails closed**.
+> **Local maximum policy:** if `job.assign` requests `sandbox`/`approval_policy`
+> beyond the daemon's configured ceiling, the agent **rejects** with
+> `job.reject{policy_violation}` — never a silent clamp (cloud and daemon must
+> agree on the effective mode).
 >
-> **Spike finding:** the daemon must run the engine with an *isolated*
+> **Bridge contract:** Claude Code's prompt tool expects `{behavior, updatedInput}`.
+> The wire has no `updated_input`; the daemon caches the original input and
+> replays `updatedInput = originalInput` on a remote `allow`. Restart between
+> request and response → **fail closed**.
+>
+> **Isolation (spike finding):** the daemon must run the engine with an isolated
 > permission config (don't inherit the user's `~/.claude` allow-list/`dontAsk`,
-> which silently disables the gate) **while preserving auth**. See
+> which disables the gate) while preserving auth. See
 > [`spikes/approval-prompt-tool`](../spikes/approval-prompt-tool/README.md).
+
+## Hardening (enforced in the schema)
+
+- **Strict objects** — unknown top-level fields rejected.
+- **Safe integers** — counters bounded to `2^53-1` (cross-language JSON safety).
+- **Bounded strings/arrays** — every id/text/path/array capped.
+- **Direction + phase** — `validateInbound()` enforces `DIRECTION` + pre-auth
+  handshake gating (the constant alone is not enforcement).
+- **Workspace canonicalization is normative** — `repo_root`/`cwd` must be
+  realpath'd, symlink-escapes and out-of-root `cwd` rejected, root allowlisted.
 
 ## Versioning
 
-- **Prerelease/draft** (e.g. `1.1.0-draft`) → **exact match** required.
-- **Stable** → identical MAJOR is compatible (additive minor/patch only).
-- Mismatch ⇒ `hello.rejected{unsupported_version}`. See `negotiateVersion()`.
+Prerelease/draft → exact match; stable → identical MAJOR. Strict-semver fields;
+malformed/empty rejected. See `negotiateVersion()`.
 
 ## Open questions
 
-### Resolved in rev 1.1–1.2
-- ✅ **Auth proof** — `auth.challenge` + signed `hello` over a transcript
-  (challenge_id|nonce|agent_id|version|alg), ≥256-bit single-use nonce + TTL.
-- ✅ **`updated_input` injection** — removed; allow/deny only (bridge contract
-  for reconstructing `updatedInput` is documented above).
-- ✅ **Result durability** — `job.result.ack` + `hello.pending_results`
-  (`final_status`) + `ack_pending` reconnect directive.
-- ✅ **Lease fencing (wire side)** — `lease.renew`/`granted`/`revoke`; local
-  fencing remains a daemon duty (noted above).
-- ✅ **Version negotiation** — prerelease-exact + strict-semver input validation
-  (empty/malformed rejected).
-- ✅ **State-machine consistency** — `JobStatus.cancelled` added; `FinalStatus`
-  trimmed to {success, error, cancelled, timeout}.
+### Resolved in rev 1.1–1.3
+- ✅ Auth proof, Ed25519-only, `key_id`, 32-byte single-use nonce, `*_ms` TTLs.
+- ✅ Lease fencing on all attempt messages (both directions) + rotation + `connection_epoch`.
+- ✅ Terminal-result durability — `result_digest`/`result_size` + `resend_result`.
+- ✅ `session_id` cross-job leak — field removed (engine resume out of scope).
+- ✅ `decided_by` spoofing — remote-only enum.
+- ✅ Safety downgrade — local-max policy → reject (`policy_violation`).
+- ✅ Strict fields, safe integers, direction/phase enforcement, semver validation.
 
-### Still open (need cloud-team agreement before freeze)
-1. **Lease renewal cadence** — how often must `lease.renew` fire; what grace
-   does the server give before reassigning?
-2. **Ack granularity** — cumulative `ack_seq` assumes in-order durable storage.
-   Confirm, or do we need selective ack?
-3. **Approval deadline ownership** — `expires_at` is set agent-side; should the
-   server also be able to extend/cancel it?
-4. **Multiplexing flow-control** — `heartbeat.capacity` is a coarse hint. Do we
-   need a per-job window for concurrent jobs?
-5. **Normalized event schema** — lock a closed enum of `event.kind` now, or keep
-   it open while the claude/codex adapters settle?
-6. **Clock skew** — `*_expires_at` are absolute ISO times. Prefer relative
-   `*_ms` durations to dodge agent/server drift?
-7. **Auth specifics** — signature alg(s) to support, nonce lifetime, replay
-   protection, key rotation/revocation flow.
-8. **Heartbeat liveness** — server-side timeout rule for declaring an agent dead.
+### Deferred to the auth/pairing security spec
+- Canonical signing bytes (encoding, domain separation, tenant/server binding).
+- Pairing/registration, `agent_id` minting, key rotation/revocation, lost-device.
+
+### Still open (cloud-team agreement before freeze)
+1. Per-job credit-window flow control (Phase 2; static caps + `capacity` for now).
+2. Event `kind` core enum final membership before adapters lock.
+3. `connection_epoch` semantics on multi-region relays (cross-POP).

@@ -3,6 +3,39 @@
 All notable changes to the `hugind ↔ orchestrator` wire contract. The protocol
 is a draft strawman; nothing here is frozen until the `-draft` suffix is dropped.
 
+## [1.3.0-draft] — 2026-06-23
+
+Folds in two cloud-side reviews (cloud team + Codex). Largest revision so far:
+lease fencing, removed `session_id`, relative-duration authority, broad hardening.
+
+### Added
+- `lease_id` on **every attempt-scoped message, both directions** (fencing
+  token); `lease.granted` rotates it. `connection_epoch` fences older WSS sessions.
+- `PendingResult.result_digest`/`result_size`/`last_emitted_seq`,
+  `JobResultAck.result_digest`, `resend_result` resume directive — replay now
+  distinguishes "payload acked" from "id acked".
+- `key_id` on `hello.auth`; 32-byte base64url nonce; `LIMITS` constants (flow
+  caps, ack flush, lease/heartbeat/approval/nonce values).
+- `validateInbound()` enforcing DIRECTION + pre-auth handshake phase.
+- `NackCode`: bad_direction, bad_state, payload_too_large, unknown_attempt,
+  lease_expired, policy_violation. `JobReject.policy_violation`.
+- Strict objects (unknown fields rejected), safe-integer bounds, semver-typed
+  version fields, bounded strings/arrays, core `event.kind` enum + vendor namespace.
+
+### Changed
+- Authoritative expiries → relative `*_ms` (`challenge_ttl_ms`, `lease_ttl_ms`,
+  `assignment_start_timeout_ms`, `approval_timeout_ms`); ISO kept for audit only.
+- `auth.alg` Ed25519-only (ECDSA dropped). `decided_by` → remote-only enum.
+- `approval.request.redacted` (bool) → structured `redaction{applied, truncated, byte_count}`.
+- `active_jobs` restricted to non-terminal status.
+
+### Removed
+- `job.assign.session_id` — engine resume/fork is out of MVP scope and was a
+  cross-job leak surface.
+
+### Deferred to a standalone auth/pairing security spec
+- Canonical signing bytes, pairing/registration, key rotation/revocation.
+
 ## [1.2.0-draft] — 2026-06-23
 
 Folds in a second-pass cross-review. Hardens the handshake and fixes
