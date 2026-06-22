@@ -3,6 +3,34 @@
 All notable changes to the `hugind ↔ orchestrator` wire contract. The protocol
 is a draft strawman; nothing here is frozen until the `-draft` suffix is dropped.
 
+## [1.2.0-draft] — 2026-06-23
+
+Folds in a second-pass cross-review. Hardens the handshake and fixes
+inconsistencies the review caught in 1.1.
+
+### Added
+- `JobStatus.cancelled` — 1.1 updated the diagram but not the enum, leaving the
+  state machine inconsistent with `FinalStatus`. Now consistent.
+- `auth.challenge.challenge_id` + `expires_at`; `nonce` is now ≥256-bit. The
+  `hello.auth` signature covers the transcript
+  `challenge_id|nonce|agent_id|protocol_version|alg`, not the bare nonce (which
+  was replayable).
+- `PendingResult.final_status` + `ResumeDirective.ack_pending` — explicit path
+  to confirm a stored terminal result on reconnect.
+- `negotiateVersion` strict-semver input validation + regression tests
+  (`negotiateVersion("", [".1.0"])` used to return ok).
+
+### Changed
+- `FinalStatus` trimmed to {success, error, cancelled, timeout}. `rejected`
+  removed — a refused assignment ends at `job.reject`, never `job.result`.
+
+### Corrected (1.1 overstatements)
+- "can't be lost on crash" holds **only if** the daemon durably stores the full
+  `job.result` payload locally; `pending_results` is just the index. Now stated
+  in the spec.
+- "cancelled transitions now match FinalStatus" was false in 1.1 (the enum
+  lacked `cancelled`); fixed here.
+
 ## [1.1.0-draft] — 2026-06-23
 
 Folds in the first cloud-side review. Themes: authenticate the handshake, make

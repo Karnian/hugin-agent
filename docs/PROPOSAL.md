@@ -41,6 +41,22 @@ in the spec. The ones on the critical path for correctness/security:
 3. **Auth specifics** — signature alg(s), nonce lifetime/replay, key rotation.
 4. **Multiplexing flow-control** — per-job window vs the coarse `capacity` hint.
 
+### Still unspecified — must be nailed down before freeze
+
+The cross-review flagged these as present-in-spirit but under-specified:
+
+- **Pairing/registration** — how `agent_id` binds to a device public key.
+- **Auth details** — signature alg(s), nonce entropy/TTL, the signed transcript
+  (now `challenge_id|nonce|agent_id|version|alg`, not the bare nonce), key
+  rotation/revocation.
+- **TLS** — mandatory transport; not expressible in the JSON schema.
+- **Terminal-result persistence** — the agent must durably store the full
+  `job.result` payload (not just its id) to honor replay.
+- **Approval bridge** — the daemon caches the original tool input to reconstruct
+  Claude Code's `updatedInput`; define restart-mid-approval behavior (fails closed).
+- **Lease id semantics** — does `lease.granted` reissue `lease_id`, and should
+  work messages carry it for token validation?
+
 ## How we keep the two sides in sync
 
 Pick one and we'll set it up:

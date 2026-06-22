@@ -24,13 +24,19 @@
  *     removed server-rewritten updated_input (injection surface)
  *   + bounded prompt, heartbeat.capacity (backpressure)
  *
+ * rev 1.2 — folds in cross-review:
+ *   + JobStatus.cancelled (state machine ↔ FinalStatus were inconsistent)
+ *   + auth.challenge nonce entropy/TTL + signed transcript (challenge_id)
+ *   + PendingResult.final_status + ResumeDirective.ack_pending (reconnect)
+ *   + FinalStatus drops `rejected` (job.reject already covers refusal)
+ *
  * NOTE: proposal for review, not a frozen contract. See ../README.md.
  */
 
 import { z } from "zod";
 
 /** Semantic version of this protocol revision. */
-export const PROTOCOL_VERSION = "1.1.0-draft" as const;
+export const PROTOCOL_VERSION = "1.2.0-draft" as const;
 
 // ---------------------------------------------------------------------------
 // Shared scalars
@@ -68,11 +74,15 @@ export const JobStatus = z.enum([
   "starting",
   "running",
   "cancelling",
+  "cancelled",
   "completed",
   "failed",
 ]);
 
-export const FinalStatus = z.enum(["success", "error", "cancelled", "timeout", "rejected"]);
+// `rejected` is intentionally absent: a refused *assignment* ends via
+// `job.reject` (a2s) and never produces a job.result. `timeout` is a terminal
+// reason carried by job.result; the job's last JobStatus for it is `failed`.
+export const FinalStatus = z.enum(["success", "error", "cancelled", "timeout"]);
 export const Risk = z.enum(["low", "medium", "high"]);
 
 /** Who made an approval decision. Closed set so `local_user` can't be spoofed. */
@@ -139,8 +149,12 @@ const ActiveJob = z.object({
   last_emitted_seq: z.number().int().nonnegative(),
 });
 
-/** A terminal result the agent produced but hasn't seen acked — replay on reconnect. */
-const PendingResult = z.object({ job_id: JobId, attempt_id: AttemptId });
+/**
+ * A terminal result the agent produced but hasn't seen acked — replayed on
+ * reconnect. The agent MUST durably store the full job.result payload locally
+ * (SQLite); this is only the index into it, not the payload.
+ */
+const PendingResult = z.object({ job_id: JobId, attempt_id: AttemptId, final_status: FinalStatus });
 
 // ---------------------------------------------------------------------------
 // Envelope: every message shares { id, ts }. `type` is the discriminant.
@@ -154,8 +168,11 @@ const base = { id: MessageId, ts: Iso };
 export const AuthChallenge = z.object({
   ...base,
   type: z.literal("auth.challenge"),
-  nonce: NonEmpty,
+  challenge_id: NonEmpty.describe("Echoed in hello.auth so the response binds to this challenge."),
+  /** >=256-bit random, base64url. Single-use; the server tracks spent nonces. */
+  nonce: z.string().min(43),
   server_time: Iso,
+  expires_at: Iso.describe("Nonce TTL; a hello arriving after this is rejected."),
 });
 
 export const Hello = z.object({
@@ -164,8 +181,14 @@ export const Hello = z.object({
   protocol_version: z.string(),
   agent_id: NonEmpty,
   agent_version: NonEmpty,
-  /** Proof of possession of the paired device key over auth.challenge.nonce. */
+  /**
+   * Proof of possession of the paired device key. `signature` signs the
+   * canonical transcript `challenge_id | nonce | agent_id | protocol_version |
+   * alg` — NOT the bare nonce, which would be replayable. The server resolves
+   * the device public key by `agent_id` (registered at pairing).
+   */
   auth: z.object({
+    challenge_id: NonEmpty,
     signature: NonEmpty,
     alg: z.enum(["ed25519", "ecdsa-p256"]),
   }),
@@ -183,7 +206,9 @@ export const Hello = z.object({
 const ResumeDirective = z.object({
   job_id: JobId,
   attempt_id: AttemptId,
-  action: z.enum(["resume_from", "abandon"]),
+  // ack_pending: the server already holds this terminal result; the agent may
+  // GC it (a job.result.ack delivered inside the handshake).
+  action: z.enum(["resume_from", "abandon", "ack_pending"]),
   resume_after_seq: z.number().int().nonnegative().optional(),
 });
 

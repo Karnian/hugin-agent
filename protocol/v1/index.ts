@@ -22,18 +22,26 @@ export function negotiateVersion(
   agentVersion: string,
   serverSupported: readonly string[],
 ): { ok: true; version: string } | { ok: false; reason: string } {
-  const majorOf = (v: string) => (v.split("-")[0] ?? v).split(".")[0] ?? "";
+  // Strict semver so empty/malformed inputs ("", ".1.0", "1.x.y") can't match.
+  const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+  const majorOf = (v: string) => v.split(".")[0] ?? "";
   const preOf = (v: string) => v.split("-")[1] ?? null;
 
+  if (!SEMVER.test(agentVersion)) {
+    return { ok: false, reason: `malformed agent version "${agentVersion}"` };
+  }
+  // Ignore malformed entries the server may advertise.
+  const supported = serverSupported.filter((v) => SEMVER.test(v));
+
   if (preOf(agentVersion)) {
-    const exact = serverSupported.find((v) => v === agentVersion);
+    const exact = supported.find((v) => v === agentVersion);
     return exact
       ? { ok: true, version: exact }
       : { ok: false, reason: `prerelease ${agentVersion} requires exact server support` };
   }
 
   const want = majorOf(agentVersion);
-  const match = serverSupported.find((v) => !preOf(v) && majorOf(v) === want);
+  const match = supported.find((v) => !preOf(v) && majorOf(v) === want);
   return match
     ? { ok: true, version: match }
     : { ok: false, reason: `stable major v${want} not in server-supported {${serverSupported.join(", ")}}` };

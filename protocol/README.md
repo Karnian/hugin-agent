@@ -1,4 +1,4 @@
-# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.1)
+# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.2)
 
 WSS JSON contract between the local daemon (`hugind`, **agent**) and the cloud
 relay (**server**). This is a **proposal for review**, not a frozen contract —
@@ -61,6 +61,13 @@ The server resolves `agent_id` → the device public key registered at pairing,
 verifies the signature, and only then accepts. A bad/absent signature →
 `hello.rejected{bad_signature|unauthorized}`.
 
+**Signed transcript, not the bare nonce:** `signature` covers
+`challenge_id | nonce | agent_id | protocol_version | alg`, so a captured
+`(nonce, sig)` pair can't be replayed against a different identity or version.
+`nonce` is ≥256-bit single-use with a TTL (`auth.challenge.expires_at`); the
+server tracks spent nonces. **TLS is mandatory** — the transport (not the JSON
+schema) protects `server_time` and the frames in flight.
+
 ## Job lifecycle
 
 ```mermaid
@@ -83,8 +90,10 @@ stateDiagram-v2
 ```
 
 Every terminal state emits a `job.result` and is GC'd only after
-`job.result.ack`. `final_status` ∈ {success, error, cancelled, timeout,
-rejected} mirrors these terminal states exactly.
+`job.result.ack`. `final_status` ∈ {success, error, cancelled, timeout}:
+`completed→success`, `cancelled→cancelled`, `failed→error|timeout`. A refused
+*assignment* never reaches here — it ends at `job.reject`. (`JobStatus` carries
+`cancelled`; `timeout` is a `failed`-state result reason, not a status.)
 
 ## Lease lifecycle
 
@@ -113,9 +122,11 @@ A lease binds **one attempt** to the agent that owns it.
 3. Backpressure: if unacked bytes exceed a cap, the agent pauses reading the
    engine's stdout; `heartbeat.capacity` advertises headroom.
 4. On reconnect, `hello.active_jobs[].last_emitted_seq` + `pending_results[]`
-   tell the server where the agent is; it replies in `hello.accepted.resume[]`
-   with `resume_from(resume_after_seq)` or `abandon`. Completed-but-unacked
-   results are re-sent and re-acked.
+   (each carrying `final_status`) tell the server where the agent is; it replies
+   in `hello.accepted.resume[]` with `resume_from(resume_after_seq)`, `abandon`,
+   or `ack_pending` (server already stored that terminal result → GC it). The
+   agent durably stores the full `job.result` payload locally so it can re-send
+   on `resume_from` — `pending_results` is only the index into that store.
 
 ```mermaid
 sequenceDiagram
@@ -148,6 +159,13 @@ sequenceDiagram
 > local user presence — otherwise a compromised orchestrator self-approves. The
 > server cannot rewrite tool input (no `updated_input`); allow/deny only.
 >
+> **Bridge contract (claude `--permission-prompt-tool`):** the prompt tool
+> expects `{behavior:"allow", updatedInput}` / `{behavior:"deny"}`. Since the
+> wire has no `updated_input`, the daemon caches the *original* tool input when
+> it sends `approval.request`, and on a remote `allow` replays
+> `updatedInput = originalInput` to the engine. If the daemon restarts between
+> request and response the cached input is lost and the attempt **fails closed**.
+>
 > **Spike finding:** the daemon must run the engine with an *isolated*
 > permission config (don't inherit the user's `~/.claude` allow-list/`dontAsk`,
 > which silently disables the gate) **while preserving auth**. See
@@ -161,13 +179,19 @@ sequenceDiagram
 
 ## Open questions
 
-### Resolved in rev 1.1
-- ✅ **Auth proof** — `auth.challenge` + signed `hello`.
-- ✅ **`updated_input` injection** — removed; allow/deny only.
-- ✅ **Result durability** — `job.result.ack` + `hello.pending_results`.
+### Resolved in rev 1.1–1.2
+- ✅ **Auth proof** — `auth.challenge` + signed `hello` over a transcript
+  (challenge_id|nonce|agent_id|version|alg), ≥256-bit single-use nonce + TTL.
+- ✅ **`updated_input` injection** — removed; allow/deny only (bridge contract
+  for reconstructing `updatedInput` is documented above).
+- ✅ **Result durability** — `job.result.ack` + `hello.pending_results`
+  (`final_status`) + `ack_pending` reconnect directive.
 - ✅ **Lease fencing (wire side)** — `lease.renew`/`granted`/`revoke`; local
   fencing remains a daemon duty (noted above).
-- ✅ **Version guessing** — prerelease-exact negotiation.
+- ✅ **Version negotiation** — prerelease-exact + strict-semver input validation
+  (empty/malformed rejected).
+- ✅ **State-machine consistency** — `JobStatus.cancelled` added; `FinalStatus`
+  trimmed to {success, error, cancelled, timeout}.
 
 ### Still open (need cloud-team agreement before freeze)
 1. **Lease renewal cadence** — how often must `lease.renew` fire; what grace

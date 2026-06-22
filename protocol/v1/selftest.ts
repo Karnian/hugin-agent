@@ -19,16 +19,18 @@ import {
 
 const now = "2026-06-23T00:00:00.000Z";
 const env = { mode: "whitelist" as const, allow: ["PATH", "HOME"] };
+const nonce = "x".repeat(43); // >=256-bit base64url placeholder
 
 const samples: Record<MessageType, unknown> = {
   "auth.challenge": {
-    id: "m0", ts: now, type: "auth.challenge", nonce: "n-deadbeef", server_time: now,
+    id: "m0", ts: now, type: "auth.challenge",
+    challenge_id: "ch-1", nonce, server_time: now, expires_at: now,
   },
   hello: {
     id: "m1", ts: now, type: "hello",
     protocol_version: PROTOCOL_VERSION,
     agent_id: "agent-abc", agent_version: "0.0.0",
-    auth: { signature: "base64sig", alg: "ed25519" },
+    auth: { challenge_id: "ch-1", signature: "base64sig", alg: "ed25519" },
     os: { platform: "darwin", arch: "arm64", release: "25.5.0" },
     capabilities: {
       engines: {
@@ -38,12 +40,15 @@ const samples: Record<MessageType, unknown> = {
       project_roots: ["/Users/k/code/repo-a"],
     },
     active_jobs: [],
-    pending_results: [{ job_id: "j0", attempt_id: "a0" }],
+    pending_results: [{ job_id: "j0", attempt_id: "a0", final_status: "success" }],
   },
   "hello.accepted": {
     id: "m2", ts: now, type: "hello.accepted",
     negotiated_version: PROTOCOL_VERSION, heartbeat_interval_ms: 15000,
-    resume: [{ job_id: "j1", attempt_id: "a1", action: "resume_from", resume_after_seq: 42 }],
+    resume: [
+      { job_id: "j1", attempt_id: "a1", action: "resume_from", resume_after_seq: 42 },
+      { job_id: "j0", attempt_id: "a0", action: "ack_pending" },
+    ],
   },
   "hello.rejected": {
     id: "m3", ts: now, type: "hello.rejected", code: "bad_signature", message: "sig invalid",
@@ -92,7 +97,7 @@ const samples: Record<MessageType, unknown> = {
     request_id: "r1", decision: "deny", decided_by: "local_user",
   },
   "job.status": {
-    id: "m11", ts: now, type: "job.status", job_id: "j1", attempt_id: "a1", status: "running",
+    id: "m11", ts: now, type: "job.status", job_id: "j1", attempt_id: "a1", status: "cancelled",
   },
   "job.result": {
     id: "m12", ts: now, type: "job.result", job_id: "j1", attempt_id: "a1",
@@ -146,12 +151,16 @@ for (const type of allTypes) {
   }
 }
 
-// version negotiation
+// version negotiation — happy paths AND the malformed-input edge cases Codex
+// found probing v1.1 (e.g. negotiateVersion("", [".1.0"]) used to return ok).
 const checks: Array<[string, boolean]> = [
   ["stable major match (1.4.0 vs {1.0.0,2.0.0})", negotiateVersion("1.4.0", ["1.0.0", "2.0.0"]).ok],
   ["stable rejects major 3 (3.0.0 vs {1.0.0})", !negotiateVersion("3.0.0", ["1.0.0"]).ok],
   ["draft exact match", negotiateVersion(PROTOCOL_VERSION, [PROTOCOL_VERSION]).ok],
   ["draft rejects non-exact (draft vs 1.5.0)", !negotiateVersion(PROTOCOL_VERSION, ["1.5.0"]).ok],
+  ["rejects empty agent version", !negotiateVersion("", [".1.0"]).ok],
+  ["ignores malformed server entry (1.2.3 vs 1.x.y)", !negotiateVersion("1.2.3", ["1.x.y"]).ok],
+  ["rejects empty server list", !negotiateVersion("1.2.3", []).ok],
 ];
 for (const [label, pass] of checks) {
   console.log(pass ? `✓ ${label}` : `✗ ${label}`);
