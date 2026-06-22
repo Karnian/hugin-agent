@@ -1,0 +1,25 @@
+{
+  "name": "@contextualai/hugin-agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Hugin Agent — outbound-only local bridge daemon that runs headless Claude Code / Codex CLI for a cloud orchestrator, without opening inbound ports.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "protocol:check": "tsx protocol/v1/selftest.ts",
+    "spike:approval": "tsx spikes/approval-prompt-tool/run.ts"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
