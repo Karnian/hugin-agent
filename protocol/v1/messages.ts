@@ -33,6 +33,11 @@
  *   + fixed-size crypto fields: Ed25519 signature, SHA-256 digest
  *   + bounded (signed) exit_code
  *
+ * rev 1.5 — freeze-readiness fixes:
+ *   + exact-length crypto fields (Ed25519 86, SHA-256 43)
+ *   + lease rotation overlap window (LIMITS) + PendingResult.lease_id
+ *   + ResumeDirective enforces lease_id for resume_from/resend_result
+ *
  * Canonical signing bytes, pairing, key rotation/revocation: see
  * ../../docs/auth-pairing-spec.md (separate security surface).
  *
@@ -41,7 +46,7 @@
 
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = "1.4.0-draft" as const;
+export const PROTOCOL_VERSION = "1.5.0-draft" as const;
 
 // ---------------------------------------------------------------------------
 // Operational limits (part of the contract — both sides enforce these)
@@ -62,6 +67,7 @@ export const LIMITS = {
   LEASE_TTL_MS_MIN: 30_000,
   LEASE_TTL_MS_MAX: 300_000,
   LEASE_REASSIGN_GRACE_MS: 30_000,
+  LEASE_ROTATION_OVERLAP_MS: 5_000, // accept old+new lease_id during a rotation
   // Heartbeat (A8)
   HEARTBEAT_INTERVAL_MS: 15_000,
   HEARTBEAT_SUSPECT_MISSES: 3,
@@ -97,9 +103,9 @@ const SafeInt = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const PosInt = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const SemVer = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
 const Base64Url = z.string().regex(/^[A-Za-z0-9_-]+$/);
-/** Fixed-size crypto material, base64url unpadded. */
-const Ed25519Sig = Base64Url.min(86).max(88); // 64 bytes
-const Sha256Digest = Base64Url.min(43).max(44); // 32 bytes
+/** Fixed-size crypto material, base64url unpadded (no `=` padding). */
+const Ed25519Sig = Base64Url.length(86); // 64 bytes → exactly 86 chars
+const Sha256Digest = Base64Url.length(43); // 32 bytes → exactly 43 chars
 /** Signed JSON-safe integer (exit codes may be negative). */
 const Int = z.number().int().min(-Number.MAX_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER);
 
@@ -210,6 +216,7 @@ const ActiveJob = z.strictObject({
 const PendingResult = z.strictObject({
   job_id: JobId,
   attempt_id: AttemptId,
+  lease_id: LeaseId,
   final_status: FinalStatus,
   result_digest: Sha256Digest.describe("base64url(SHA-256(canonical job.result bytes)); see auth-pairing-spec."),
   result_size: SafeInt,
@@ -270,6 +277,10 @@ const ResumeDirective = z.strictObject({
   /** The current lease the agent must stamp on resumed/resent attempt messages
    *  (required for resume_from / resend_result; omitted for ack_pending/abandon). */
   lease_id: LeaseId.optional(),
+}).superRefine((v, ctx) => {
+  if ((v.action === "resume_from" || v.action === "resend_result") && !v.lease_id) {
+    ctx.addIssue({ code: "custom", message: "lease_id is required for resume_from / resend_result" });
+  }
 });
 
 export const HelloAccepted = z.strictObject({
@@ -305,8 +316,9 @@ export const LeaseGranted = z.strictObject({
   type: z.literal("lease.granted"),
   job_id: JobId,
   attempt_id: AttemptId,
-  /** The NEW current-generation token. The agent must use it on all subsequent
-   *  attempt-scoped messages; the server nacks the old one. */
+  /** The NEW current-generation token. The agent switches to it immediately; the
+   *  server accepts BOTH old and new for LEASE_ROTATION_OVERLAP_MS to avoid
+   *  false-nacking in-flight messages, then nacks the old one (`stale_lease`). */
   lease_id: LeaseId,
   lease_ttl_ms: PosInt.min(LIMITS.LEASE_TTL_MS_MIN).max(LIMITS.LEASE_TTL_MS_MAX),
 });

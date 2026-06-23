@@ -185,8 +185,10 @@ free of provider creds even under a hostile prompt.
 
 ## 11. Open questions (cloud-team agreement)
 
-1. ⚙️ Exact `tenant_id`/`server_origin` formats and where the agent learns them
-   (pairing response vs config).
+1. ⚙️ `tenant_id`/`server_origin` formats. **Proposed (confirm):** `tenant_id` =
+   opaque ASCII ≤64 chars issued in the pairing response (§3); `server_origin` =
+   lowercase WSS origin `wss://host[:port]`, no path/query, exactly as dialed
+   (from the configured server URL).
 2. ⚙️ Nonce store consistency model + multi-region behavior.
 3. ⚙️ Rotation grace window; max concurrent `key_id`s per host.
 4. ⚙️ Pairing-code TTL, device limits, re-pair UX.

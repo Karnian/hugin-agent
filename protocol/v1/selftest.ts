@@ -44,7 +44,7 @@ const samples: Record<MessageType, unknown> = {
     },
     active_jobs: [],
     pending_results: [
-      { job_id: "j0", attempt_id: "a0", final_status: "success", result_digest: digest, result_size: 4096, last_emitted_seq: 10 },
+      { job_id: "j0", attempt_id: "a0", lease_id: lease, final_status: "success", result_digest: digest, result_size: 4096, last_emitted_seq: 10 },
     ],
   },
   "hello.accepted": {
@@ -166,6 +166,8 @@ const checks: Array<[string, boolean]> = [
   ["strict rejects unknown field", !Message.safeParse({ ...(samples.hello as object), bogus: 1 }).success],
   // safe-integer bound (C2)
   ["rejects unsafe seq", !Message.safeParse({ ...(samples["stream.event"] as object), seq: 2 ** 53 }).success],
+  // resume_from/resend_result must carry a lease_id (G3)
+  ["resume_from requires lease_id", !Message.safeParse({ ...(samples["hello.accepted"] as object), resume: [{ job_id: "j1", attempt_id: "a1", action: "resume_from" }] }).success],
   // inbound direction + phase enforcement (C3)
   ["agent accepts s2a auth.challenge pre-auth", validateInbound(parseMessage(samples["auth.challenge"]), { receiver: "agent", authed: false }).ok],
   ["agent rejects a2s hello (bad_direction)", !validateInbound(parseMessage(samples.hello), { receiver: "agent", authed: false }).ok],

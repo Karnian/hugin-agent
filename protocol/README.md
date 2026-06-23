@@ -1,4 +1,4 @@
-# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.3)
+# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.5)
 
 WSS JSON contract between the local daemon (`hugind`, **agent**) and the cloud
 relay (**server**). A **proposal for review**, not a frozen contract. rev 1.3
@@ -186,4 +186,8 @@ malformed/empty rejected. See `negotiateVersion()`.
 ### Still open (cloud-team agreement before freeze)
 1. Per-job credit-window flow control (Phase 2; static caps + `capacity` for now).
 2. Event `kind` core enum final membership before adapters lock.
-3. `connection_epoch` semantics on multi-region relays (cross-POP).
+3. `tenant_id` / `server_origin` formats (they enter the signed auth transcript) —
+   a proposal is in [auth-pairing-spec §11](../docs/auth-pairing-spec.md).
+
+Multi-region / cross-POP consistency (nonce, `connection_epoch`, lease) is **out
+of MVP scope** — MVP assumes a single logical POP (auth spec §6).

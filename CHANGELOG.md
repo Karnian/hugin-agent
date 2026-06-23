@@ -3,6 +3,25 @@
 All notable changes to the `hugind ↔ orchestrator` wire contract. The protocol
 is a draft strawman; nothing here is frozen until the `-draft` suffix is dropped.
 
+## [1.5.0-draft] — 2026-06-23
+
+Freeze-readiness pass (third cross-review follow-up). Closes G1–G4; G5
+(identifier formats) has a proposed value pending cloud confirmation.
+
+### Fixed
+- Crypto fields are exact-length: Ed25519 `signature` = 86, SHA-256
+  `result_digest` = 43 base64url chars (were loosely `max(88)`/`max(44)`).
+
+### Added
+- `LIMITS.LEASE_ROTATION_OVERLAP_MS` + `PendingResult.lease_id`; `lease.granted`
+  doc now matches the README overlap rule (no false-nack of in-flight messages).
+- `ResumeDirective` enforces `lease_id` for `resume_from`/`resend_result`
+  (was documented-but-not-enforced).
+
+### Changed
+- README "Still open" aligned with the auth spec — multi-region/cross-POP is out
+  of MVP scope; `tenant_id`/`server_origin` formats proposed for confirmation.
+
 ## [1.4.0-draft] — 2026-06-23
 
 Folds in a third cross-review (pre-freeze). Closes the auth/crypto + lease
