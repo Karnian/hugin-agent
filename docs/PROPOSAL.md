@@ -1,86 +1,55 @@
-# Wire Protocol v1.1 — Review Request (agent → cloud team)
+# Freeze Review Request — Wire Protocol v1.5 → v1.0.0
 
-**TL;DR:** the local-daemon side proposes a wire contract for the
-`hugind ↔ orchestrator` WSS link. It's a strawman, not a decree — please review
-the [Open questions](#what-we-need-you-to-agree-to) before we freeze v1. The
-schema is executable and passes its own conformance check.
+**To:** cloud team. **Ask:** confirm the one remaining item (§G5) + two
+deferrals; then we drop `-draft` and freeze `v1.0.0`.
 
-## Why this needs both sides
+## Where we are
 
-The protocol is a **shared contract**: a field only exists if *both* codebases
-encode/decode it. Several additions (lease, seq/ack, result.ack, auth) impose
-work on **your** side too, not just ours — so they can't be merged locally. This
-document is the strawman that opens that agreement.
+Five review rounds (cloud ×2, Codex ×3) since v1.2. Each found less —
+big design gaps → security/contract → precision → crypto lengths → naming.
+All blockers are now closed in the schema/spec. Conformance: **23/23 messages +
+strict / safe-integer / direction-phase / refine checks** (`npm run protocol:check`).
+Full history in [CHANGELOG](../CHANGELOG.md); contract in
+[protocol/README](../protocol/README.md); security in
+[auth-pairing-spec](auth-pairing-spec.md).
 
-## What's in the box
+## Blocker closure checklist
 
-| Artifact | What |
-|----------|------|
-| [`protocol/v1/messages.ts`](../protocol/v1/messages.ts) | **SSOT** — zod schema, 23 messages. `z.toJSONSchema(Message)` or codegen for your side. |
-| [`protocol/README.md`](../protocol/README.md) | Spec: handshake, job/lease lifecycle, reliability, approval. |
-| [`protocol/v1/selftest.ts`](../protocol/v1/selftest.ts) | `npm run protocol:check` → 23/23 valid + version negotiation. |
-| [`CHANGELOG.md`](../CHANGELOG.md) | v1.0 → v1.1 deltas (from your first review). |
+| From | Item | Status |
+|------|------|--------|
+| cloud B1 | lease fencing both directions + rotation (overlap window) | ✅ |
+| cloud B2 | `connection_epoch` (fence older sessions) | ✅ |
+| cloud B3/B4 | auth proof + canonical signing bytes (transcript w/ `key_id`) | ✅ spec §5 |
+| cloud B5 | result digest + `resend_result` | ✅ |
+| cloud B6 | `session_id` cross-job leak | ✅ removed |
+| cloud B7 | `decided_by` remote-only | ✅ |
+| cloud B8 | safety downgrade → `policy_violation` reject (no clamp) | ✅ |
+| Codex | strict objects, safe-int, `validateInbound`, semver, NackCode | ✅ |
+| Codex G1–G4 | exact crypto lengths, lease overlap, lease coverage, multi-region doc | ✅ |
 
-## Decisions we baked in (please confirm)
+## What we need from you
 
-- **Outbound-only**, one JSON object per WSS frame.
-- **At-least-once + idempotent** delivery; cumulative `stream.ack`.
-- **Lease per attempt**; reconnect/reassign mint a new `attempt_id`.
-- **Authenticated handshake**: `auth.challenge` (you) → signed `hello` (us),
-  verified against the device key registered at pairing.
-- **Acked terminal results** (`job.result` → `job.result.ack`).
-- **Approval is allow/deny only** — the server cannot rewrite tool input.
+1. **§G5 — confirm identifier formats.** They enter the signed transcript, so
+   they must be fixed before production auth. **Proposed:**
+   - `tenant_id` = opaque ASCII ≤64 chars, issued in the pairing response
+   - `server_origin` = `wss://host[:port]`, lowercase, no path/query, as dialed
+2. **Confirm deferrals** (not freeze blockers — agree they're post-freeze):
+   - Per-job credit-window flow control → Phase 2 (static caps + `capacity` now)
+   - Final `event.kind` core-enum membership → when the claude/codex adapters lock
+3. **Re-affirm cloud-side commitments** (your §D): linearizable
+   `(job_id, attempt_id, lease_generation)` leasing, durable stream log keyed by
+   `(attempt_id, seq)`/`(attempt_id, event_id)` with ack-after-commit, global
+   nonce/replay store, quotas, approval binding. Single logical POP assumed
+   (cross-POP is out of MVP scope).
 
-## What we need you to agree to
+## On freeze
 
-The 8 [Open questions](../protocol/README.md#still-open-need-cloud-team-agreement-before-freeze)
-in the spec. The ones on the critical path for correctness/security:
+Once §1 is confirmed we drop `-draft` across `messages.ts` + spec → **`v1.0.0`**.
+The shared package `@contextualai/hugin-agent/protocol` becomes the single import
+for both codebases (preferred over codegen — no generator drift).
 
-1. **Lease renewal cadence + reassignment grace** — prevents double execution.
-2. **Ack granularity** — cumulative ack assumes your storage is in-order durable.
-3. **Auth specifics** — signature alg(s), nonce lifetime/replay, key rotation.
-4. **Multiplexing flow-control** — per-job window vs the coarse `capacity` hint.
-
-### Status after v1.3 (both reviews folded in)
-
-Most of the prior gaps are now in the schema (see [CHANGELOG 1.3](../CHANGELOG.md)):
-lease fencing + rotation on all attempt messages, `connection_epoch`, removed
-`session_id`, relative-duration authority (`*_ms`), result digests +
-`resend_result`, remote-only `decided_by`, `policy_violation` rejection (no
-silent clamp), and strict/safe-integer/direction-phase hardening.
-
-**Remaining work is carved into a standalone
-[auth/pairing security spec](auth-pairing-spec.md):**
-
-- Canonical signing bytes (encoding, domain separation, tenant/server binding).
-- Pairing/registration, `agent_id` minting, `key_id`, rotation, revocation,
-  lost-device flow.
-
-These gate the **production auth path** — not mock-relay development. After the
-spec + v1.3 get one more cloud review, drop `-draft` → `v1.0.0`.
-
-## How we keep the two sides in sync
-
-Pick one and we'll set it up:
-- **Shared package** — both import `@contextualai/hugin-agent/protocol`.
-- **Codegen** — we publish `protocol.schema.json` (via `z.toJSONSchema`) and you
-  generate types from it in CI.
-
-Either way, `protocol_version` is negotiated at handshake (prerelease = exact
-match), so once v1 is stable we can roll changes one side at a time.
-
-## Implementation note from the approval spike
-
-We verified the headless `--permission-prompt-tool` channel **connects**, but
-found that a daemon inheriting the user's global `~/.claude` settings
-(`allow(*)` + `dontAsk`) would **silently disable the approval gate**. The
-daemon must isolate the engine's permission config while preserving auth — a
-local concern, but it's *why* the contract keeps approval allow/deny-only with a
-mandatory local gate. Details:
-[`spikes/approval-prompt-tool`](../spikes/approval-prompt-tool/README.md).
-
-## Status & next step
-
-Schema type-checks and self-tests green. **Not frozen.** Once you've reviewed the
-Open questions, we'll cut `protocol/v2` … `v1.0.0` (drop the `-draft`) and start
-building `hugind` against it.
+**Sequencing:** mock-relay `hugind` development (daemon skeleton, WSS dial-out,
+Claude adapter, non-auth job/stream/cancel paths) can start in parallel now. The
+**production auth path waits on §1** — `tenant_id`/`server_origin` are signed, so
+implementing pairing/handshake before they're fixed means redoing the signing
+bytes.
