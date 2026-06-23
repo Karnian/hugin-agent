@@ -281,6 +281,67 @@ function signatureMismatchNegative(): NegativeVector {
   };
 }
 
+/** Strict-Ed25519 negative: sign the baseline transcript, then mutate the
+ *  signature (or override the public key) so a ZIP-215-strict verifier MUST
+ *  reject it. Node's `crypto.verify` is strict enough to reject all of these
+ *  (empirically: tampered, wrong length, non-canonical S, low-order key). */
+function strictSigNegative(
+  label: string,
+  reason: string,
+  mutate: (sig: Buffer) => Buffer,
+  pubOverride?: Buffer,
+): NegativeVector {
+  const challenge_id = "ch-v6-0001";
+  const agent_id = "agent-abc";
+  const key_id = "key-1";
+  const tenant_id = "acme";
+  const canonical = "wss://relay.example.com";
+  const transcript = buildTranscript({
+    challenge_id, nonce_raw: nonceRaw, agent_id, key_id,
+    protocol_version: PROTOCOL_VERSION, tenant_id, server_origin: canonical,
+  });
+  const sig = sign(null, transcript, kp.privateKey);
+  const pub = pubOverride ?? kp.publicRaw;
+  return {
+    label,
+    reason,
+    failure_mode: "signature",
+    challenge_id,
+    nonce_raw_hex: NONCE_RAW_HEX,
+    agent_id,
+    key_id,
+    protocol_version: PROTOCOL_VERSION,
+    tenant_id,
+    canonical_server_origin: canonical,
+    ed25519_seed_hex: SEED_HEX,
+    ed25519_public_hex: pub.toString("hex"),
+    transcript_hex: transcript.toString("hex"),
+    expected_signature_base64url: b64u(mutate(sig)),
+  };
+}
+
+/** S' = S + L (group order): the same scalar mod L, but a non-canonical encoding
+ *  (S' >= L). A strict verifier MUST reject; a lenient (reduce-mod-L) one accepts. */
+function nonCanonicalS(sig: Buffer): Buffer {
+  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
+  const R = sig.subarray(0, 32);
+  const Sb = sig.subarray(32, 64);
+  let S = 0n;
+  for (let i = 31; i >= 0; i--) S = (S << 8n) | BigInt(Sb[i]!);
+  const Sn = S + L;
+  if (Sn >= 2n ** 256n) throw new Error("non-canonical S overflows 32 bytes for this seed");
+  const out = Buffer.alloc(32);
+  let t = Sn;
+  for (let i = 0; i < 32; i++) {
+    out[i] = Number(t & 0xffn);
+    t >>= 8n;
+  }
+  return Buffer.concat([R, out]);
+}
+
+/** The Ed25519 identity point (y=1) — a low-order public key. */
+const LOW_ORDER_POINT = Buffer.from(`01${"00".repeat(31)}`, "hex");
+
 export function buildVectors(): VectorsFile {
   const positives: PositiveVector[] = [
     positive("baseline", {}),
@@ -301,10 +362,15 @@ export function buildVectors(): VectorsFile {
     { label: "origin-trailing-dot", reason: "trailing-dot host is non-canonical", failure_mode: "origin", input_server_origin: "wss://relay.example.com." },
     { label: "origin-raw-idn", reason: "raw IDN host must be ASCII punycode", failure_mode: "origin", input_server_origin: "wss://café.example.com" },
     { label: "origin-invalid-dns-label", reason: "host with '_' is not a valid DNS label", failure_mode: "origin", input_server_origin: "wss://relay_example.com" },
+    { label: "nonce-invalid-alphabet", reason: "nonce has a non-base64url char ('+')", failure_mode: "parse", wire_message: "auth.challenge", field: "nonce", value: `${"A".repeat(42)}+` },
+    { label: "nonce-noncanonical-padbits", reason: "43-char base64url with non-zero trailing pad bits (non-canonical)", failure_mode: "parse", wire_message: "auth.challenge", field: "nonce", value: `${"A".repeat(42)}B` },
     // --- tenant_id grammar reject ---
     { label: "tenant-id-129-chars", reason: "tenant_id exceeds 128 chars", failure_mode: "tenant", tenant_id: "t".repeat(129) },
-    // --- signature mismatch ---
+    // --- signature / strict-Ed25519 verifier negatives (F4 nit; verifier MUST reject) ---
     signatureMismatchNegative(),
+    strictSigNegative("signature-wrong-length", "Ed25519 signature is not 64 bytes (also schema-rejected: Ed25519Sig.length(86))", (sig) => sig.subarray(0, 63)),
+    strictSigNegative("signature-non-canonical-s", "S >= group order L (malleable, non-canonical); strict verifier MUST reject", nonCanonicalS),
+    strictSigNegative("signature-low-order-pubkey", "public key is a low-order point (identity); strict verifier MUST reject", (sig) => sig, LOW_ORDER_POINT),
   ];
 
   return {

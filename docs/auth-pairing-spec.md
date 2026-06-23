@@ -1,10 +1,12 @@
-# Hugin Agent — Auth & Pairing Security Spec (DRAFT v0.1)
+# Hugin Agent — Auth & Pairing Security Spec (v1.0, companion to frozen wire v1.0.0)
 
 Companion to the [wire protocol](../protocol/README.md). This is the **security
 surface** the cloud team reviews independently. It gates the **production auth
 path** (not mock-relay development).
 
-> Status: strawman for review. Values marked ⚙️ need cloud-team agreement.
+> Status: **frozen companion to wire v1.0.0** (cloud diff-review: FREEZE-OK). The
+> remaining ⚙️ items are post-freeze operational parameters (rotation grace,
+> pairing-code TTL/device limits, audit schema), not wire/transcript shape.
 
 ## 1. Scope & threat model
 
@@ -45,6 +47,12 @@ one device reconnecting never fences another device of the same user.
 
 A host may hold multiple `key_id`s during rotation (§7) — so `key_id` is 1:N. The
 pairing record maps `agent_id → (tenant_id, user_id, key_id[])`.
+
+> **Cloud enforcement (normative).** `user_id` is off-wire and the transcript
+> binds only `tenant_id`, so the relay MUST enforce active `(tenant_id, agent_id)`
+> uniqueness, MUST NOT reuse an `agent_id` across users within a tenant, and MUST
+> resolve `user_id` **only** from the pairing record. Without this, the off-wire
+> `user_id` model becomes a cloud authorization bug (cloud diff-review, Locked #2).
 
 ## 3. Pairing (first run)
 
@@ -178,7 +186,9 @@ resent result yields an identical digest and `job.result.ack` confirms the
 ## 6. Nonce & replay
 
 - 32 cryptographically-random bytes, base64url on the wire (**exactly 43 chars,
-  unpadded**; reject `=` padding or non-alphabet characters).
+  unpadded, canonical**; reject `=` padding, non-alphabet characters, and
+  non-canonical encodings — re-encoding the decoded 32 bytes must reproduce the
+  string, so non-zero trailing pad bits are rejected).
 - `challenge_ttl_ms` default **60_000** (advisory display/TTL hint; the
   authoritative nonce lifetime is enforced server-side via `challenge_id` lookup,
   not the signed transcript — see §5).

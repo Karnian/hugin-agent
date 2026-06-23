@@ -1,7 +1,28 @@
 # Changelog — Wire Protocol
 
-All notable changes to the `hugind ↔ orchestrator` wire contract. The protocol
-is a draft strawman; nothing here is frozen until the `-draft` suffix is dropped.
+All notable changes to the `hugind ↔ orchestrator` wire contract. The protocol is
+**frozen at v1.0.0** (cloud diff-review: FREEZE-OK, 0 blockers); entries below
+1.0.0 are draft history.
+
+## [1.0.0] — 2026-06-23
+
+**FROZEN.** Cloud diff-review returned **FREEZE-OK (0 blockers)**, with Codex
+independently reproducing the auth transcript + positive signatures. Frozen from
+`1.6.0-draft`; the wire shape is unchanged. Pre-tag nits applied:
+
+- Auth test vectors **regenerated with the signed `protocol_version: "1.0.0"`**
+  (the version is part of the signed transcript, so signatures change).
+- Added strict-Ed25519 negative vectors — non-canonical S, low-order public key,
+  wrong signature length — plus nonce **canonical base64url** negatives (invalid
+  alphabet, non-zero trailing pad bits). `nonce` now requires canonical base64url
+  at parse. `protocol:check` = 73 checks (2 positive + 18 negative F4 vectors).
+- Recorded the cloud-side condition for the off-wire `user_id` model: the relay
+  MUST enforce active `(tenant_id, agent_id)` uniqueness / no cross-user reuse and
+  resolve `user_id` only from the pairing record (auth-spec §2).
+
+Post-freeze production gates (NOT freeze blockers, cloud-side): real §5 Ed25519
+verification, PG-concurrency tests for nonce/epoch/lease, static quota
+enforcement, approval binding.
 
 ## [1.6.0-draft] — 2026-06-23
 

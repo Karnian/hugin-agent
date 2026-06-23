@@ -1,8 +1,10 @@
-# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.6)
+# Hugin Agent — Wire Protocol v1.0.0 (FROZEN)
 
 WSS JSON contract between the local daemon (`hugind`, **agent**) and the cloud
-relay (**server**). A **proposal for review**, not a frozen contract. See the
-[CHANGELOG](../CHANGELOG.md) for the rev 1.1–1.6 review history.
+relay (**server**). The **frozen** v1.0.0 wire contract — cloud diff-review:
+**FREEZE-OK** (0 blockers). See the [CHANGELOG](../CHANGELOG.md) for the
+rev 1.1–1.6 → 1.0.0 history. Wire-visible changes now require both sides to agree;
+a new core message/field is a major bump (v2).
 
 - **SSOT:** [`v1/messages.ts`](v1/messages.ts) (zod). Both codebases import it.
 - **Runnable spec:** `npm run protocol:check` — 23/23 messages + negotiation,

@@ -1,7 +1,11 @@
-# Freeze Review Request — Wire Protocol v1.6 → v1.0.0
+# Freeze Record — Wire Protocol v1.6 → v1.0.0 (FROZEN)
 
-**To:** cloud team. **Ask:** a mechanical **diff-review** of v1.6 (no redesign);
-on confirmation we drop `-draft` and freeze **`v1.0.0`**.
+**Status:** cloud diff-review **complete → FREEZE-OK (0 blockers)**; Codex
+independently reproduced the auth transcript + signatures. `1.6.0-draft` is frozen
+as **`v1.0.0`** with the pre-tag nits applied (vectors regenerated at `1.0.0`,
+strict-Ed25519 + nonce-canonical negatives — see [CHANGELOG](../CHANGELOG.md)).
+This doc is retained as the freeze record. Remaining cloud-side items are
+post-freeze production gates, not freeze blockers.
 
 ## Where we are
 

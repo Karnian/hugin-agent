@@ -170,8 +170,9 @@ const checks: Array<[string, boolean]> = [
   // version negotiation (incl. the malformed-input edge cases Codex found)
   ["stable major match", negotiateVersion("1.4.0", ["1.0.0", "2.0.0"]).ok],
   ["stable rejects major 3", !negotiateVersion("3.0.0", ["1.0.0"]).ok],
-  ["draft exact match", negotiateVersion(PROTOCOL_VERSION, [PROTOCOL_VERSION]).ok],
-  ["draft rejects non-exact", !negotiateVersion(PROTOCOL_VERSION, ["1.5.0"]).ok],
+  ["draft exact match", negotiateVersion("9.9.9-draft", ["9.9.9-draft"]).ok],
+  ["draft rejects non-exact", !negotiateVersion("9.9.9-draft", ["9.9.9"]).ok],
+  ["v1.0.0 negotiates within major", negotiateVersion(PROTOCOL_VERSION, ["1.0.0"]).ok],
   ["rejects empty agent version", !negotiateVersion("", [".1.0"]).ok],
   ["ignores malformed server entry", !negotiateVersion("1.2.3", ["1.x.y"]).ok],
   ["rejects empty server list", !negotiateVersion("1.2.3", []).ok],
@@ -261,14 +262,16 @@ for (const v of vectors.negatives) {
       pass = !validateTenantId(v.tenant_id as string);
       break;
     case "signature": {
-      const kp = deriveKeypairFromSeed(Buffer.from(v.ed25519_seed_hex as string, "hex"));
+      // Verify against the vector's stated public key (raw-imported) so low-order
+      // pubkey negatives work; the seed is informational for these vectors.
+      const pub = publicKeyFromRaw(Buffer.from(v.ed25519_public_hex as string, "hex"));
       const transcript = buildTranscript({
         challenge_id: v.challenge_id as string, nonce_raw: Buffer.from(v.nonce_raw_hex as string, "hex"),
         agent_id: v.agent_id as string, key_id: v.key_id as string, protocol_version: v.protocol_version as string,
         tenant_id: v.tenant_id as string, server_origin: v.canonical_server_origin as string,
       });
       const sig = Buffer.from(v.expected_signature_base64url as string, "base64url");
-      pass = !verify(null, transcript, kp.publicKey, sig); // signature must NOT verify
+      pass = !verify(null, transcript, pub, sig); // signature/key must NOT verify
       break;
     }
   }

@@ -1,5 +1,5 @@
 /**
- * Hugin Agent — Wire protocol v1 (STRAWMAN / DRAFT, rev 1.6)
+ * Hugin Agent — Wire protocol v1.0.0 (FROZEN)
  * =========================================================
  *
  * Single source of truth for the WSS JSON contract shared between:
@@ -44,15 +44,22 @@
  *   + EventKind core FROZEN for v1 (Option A) — unknown core → NACK (F6)
  *   + F4 cross-language test vectors (v1/gen-vectors.ts → v1/test-vectors.json)
  *
+ * v1.0.0 — FROZEN (cloud diff-review verdict: FREEZE-OK, 0 blockers). Tagged from
+ * 1.6.0-draft. Pre-tag nits applied: vectors regenerated with the SIGNED
+ * protocol_version "1.0.0"; strict Ed25519 negatives (non-canonical S, low-order
+ * key, wrong length) + nonce canonical/alphabet negatives added; nonce now must
+ * be canonical base64url. A new CORE message/field now requires a major bump (v2).
+ *
  * Canonical signing bytes, pairing, key rotation/revocation: see
  * ../../docs/auth-pairing-spec.md (separate security surface).
  *
- * NOTE: proposal for review, not a frozen contract.
+ * NOTE: FROZEN as v1.0.0. Wire-visible changes now require both sides to agree
+ * and (for core additions) a major bump.
  */
 
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = "1.6.0-draft" as const;
+export const PROTOCOL_VERSION = "1.0.0" as const;
 
 // ---------------------------------------------------------------------------
 // Operational limits (part of the contract — both sides enforce these)
@@ -256,8 +263,13 @@ export const AuthChallenge = z.strictObject({
   ...base,
   type: z.literal("auth.challenge"),
   challenge_id: AuthId,
-  /** 32 random bytes, base64url (exactly 43 chars unpadded). Single-use, server-tracked. */
-  nonce: Base64Url.length(43),
+  /** 32 random bytes, base64url — exactly 43 chars, unpadded, and CANONICAL:
+   *  re-encoding the decoded bytes must yield the same string, so non-zero
+   *  trailing pad bits are rejected (F1 nit). Single-use, server-tracked. */
+  nonce: Base64Url.length(43).refine(
+    (s) => Buffer.from(s, "base64url").toString("base64url") === s,
+    "nonce is not canonical base64url (non-zero trailing pad bits)",
+  ),
   server_time: Iso,
   challenge_ttl_ms: PosInt,
 });
