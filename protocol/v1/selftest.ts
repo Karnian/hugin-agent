@@ -8,15 +8,30 @@
  * inbound direction/phase validation. Executable documentation for the cloud team.
  */
 
+import { readFileSync } from "node:fs";
+import { verify } from "node:crypto";
 import {
   DIRECTION,
   Message,
   type MessageType,
   PROTOCOL_VERSION,
+  SemVer,
   negotiateVersion,
   parseMessage,
   validateInbound,
 } from "./index";
+import {
+  ALG,
+  DOMAIN_TAG,
+  b64u,
+  buildTranscript,
+  canonicalizeServerOrigin,
+  deriveKeypairFromSeed,
+  lp,
+  publicKeyFromRaw,
+  validateTenantId,
+  type VectorsFile,
+} from "./gen-vectors";
 
 const now = "2026-06-23T00:00:00.000Z";
 const env = { mode: "whitelist" as const, allow: ["PATH", "HOME"] };
@@ -173,7 +188,88 @@ const checks: Array<[string, boolean]> = [
   ["agent rejects a2s hello (bad_direction)", !validateInbound(parseMessage(samples.hello), { receiver: "agent", authed: false }).ok],
   ["agent rejects job.assign pre-auth (bad_state)", !validateInbound(parseMessage(samples["job.assign"]), { receiver: "agent", authed: false }).ok],
   ["agent accepts job.assign once authed", validateInbound(parseMessage(samples["job.assign"]), { receiver: "agent", authed: true }).ok],
+  // --- v1.6 schema tightenings (5a) ---
+  ["reject 44-char nonce", !Message.safeParse({ ...(samples["auth.challenge"] as object), nonce: "A".repeat(44) }).success],
+  ["reject 42-char nonce", !Message.safeParse({ ...(samples["auth.challenge"] as object), nonce: "A".repeat(42) }).success],
+  ["accept exact 43-char nonce", Message.safeParse({ ...(samples["auth.challenge"] as object), nonce: "A".repeat(43) }).success],
+  ["reject non-ASCII agent_id", !Message.safeParse({ ...(samples.hello as object), agent_id: "agent-café" }).success],
+  ["reject invalid agent_id (@)", !Message.safeParse({ ...(samples.hello as object), agent_id: "agent@host" }).success],
+  ["accept valid AuthId agent_id", Message.safeParse({ ...(samples.hello as object), agent_id: "agent.dev_01-x" }).success],
+  ["reject >64-char SemVer protocol_version", !Message.safeParse({ ...(samples.hello as object), protocol_version: `1.0.0-${"a".repeat(60)}` }).success],
+  ["dedup'd SemVer validates good versions", SemVer.safeParse("1.2.3").success && SemVer.safeParse(PROTOCOL_VERSION).success],
+  ["SemVer rejects >64 chars directly", !SemVer.safeParse(`1.0.0-${"a".repeat(60)}`).success],
+  ["SemVer rejects +build metadata", !SemVer.safeParse("1.2.3+build").success],
 ];
+
+// --- F4 cross-language auth vectors (5d): verify the committed test-vectors.json ---
+const vectors = JSON.parse(
+  readFileSync(new URL("./test-vectors.json", import.meta.url), "utf8"),
+) as VectorsFile;
+
+for (const v of vectors.positives) {
+  const kp = deriveKeypairFromSeed(Buffer.from(v.ed25519_seed_hex, "hex"));
+  const nonceRaw = Buffer.from(v.nonce_raw_hex, "hex");
+  const transcript = buildTranscript({
+    challenge_id: v.challenge_id, nonce_raw: nonceRaw, agent_id: v.agent_id, key_id: v.key_id,
+    protocol_version: v.protocol_version, tenant_id: v.tenant_id, server_origin: v.canonical_server_origin,
+  });
+  const sig = Buffer.from(v.expected_signature_base64url, "base64url");
+  // The wire fields embedded in this vector must themselves parse.
+  const wireOk =
+    Message.safeParse({ ...(samples["auth.challenge"] as object), challenge_id: v.challenge_id, nonce: v.nonce_base64url }).success &&
+    Message.safeParse({
+      ...(samples.hello as object),
+      agent_id: v.agent_id,
+      protocol_version: v.protocol_version,
+      auth: { challenge_id: v.challenge_id, key_id: v.key_id, signature: v.expected_signature_base64url, alg: "ed25519" },
+    }).success;
+  const pass =
+    kp.publicRaw.toString("hex") === v.ed25519_public_hex &&
+    transcript.toString("hex") === v.transcript_hex &&
+    lp(DOMAIN_TAG).toString("hex") === v.domain_tag_hex &&
+    lp(ALG).toString("hex") === v.alg_lp_hex &&
+    b64u(nonceRaw) === v.nonce_base64url &&
+    v.nonce_base64url.length === 43 &&
+    canonicalizeServerOrigin(v.input_server_origin) === v.canonical_server_origin &&
+    validateTenantId(v.tenant_id) &&
+    verify(null, transcript, kp.publicKey, sig) && // verify recomputed transcript with seed-derived key
+    verify(null, transcript, publicKeyFromRaw(kp.publicRaw), sig) && // ...and with raw-imported key (cross-impl path)
+    verify(null, Buffer.from(v.transcript_hex, "hex"), kp.publicKey, sig) && // ...and against the COMMITTED bytes (independent of buildTranscript)
+    wireOk;
+  checks.push([`vector+ ${v.label}: transcript+signature+wire`, pass]);
+}
+
+for (const v of vectors.negatives) {
+  let pass = false;
+  switch (v.failure_mode) {
+    case "parse": {
+      const base = samples[v.wire_message as MessageType] as object;
+      const res = Message.safeParse({ ...base, [v.field as string]: v.value });
+      // Must fail AND fail on the patched field — guards against base-sample drift
+      // silently making a negative pass for the wrong reason (Codex P2 review).
+      pass = res.success ? false : res.error.issues.some((i) => i.path[0] === v.field);
+      break;
+    }
+    case "origin":
+      pass = canonicalizeServerOrigin(v.input_server_origin as string) === null;
+      break;
+    case "tenant":
+      pass = !validateTenantId(v.tenant_id as string);
+      break;
+    case "signature": {
+      const kp = deriveKeypairFromSeed(Buffer.from(v.ed25519_seed_hex as string, "hex"));
+      const transcript = buildTranscript({
+        challenge_id: v.challenge_id as string, nonce_raw: Buffer.from(v.nonce_raw_hex as string, "hex"),
+        agent_id: v.agent_id as string, key_id: v.key_id as string, protocol_version: v.protocol_version as string,
+        tenant_id: v.tenant_id as string, server_origin: v.canonical_server_origin as string,
+      });
+      const sig = Buffer.from(v.expected_signature_base64url as string, "base64url");
+      pass = !verify(null, transcript, kp.publicKey, sig); // signature must NOT verify
+      break;
+    }
+  }
+  checks.push([`vector- ${v.label} (${v.failure_mode}): rejected`, pass]);
+}
 for (const [label, pass] of checks) {
   console.log(pass ? `✓ ${label}` : `✗ ${label}`);
   if (!pass) failures++;

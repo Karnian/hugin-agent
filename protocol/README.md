@@ -1,12 +1,13 @@
-# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.5)
+# Hugin Agent — Wire Protocol v1 (STRAWMAN, rev 1.6)
 
 WSS JSON contract between the local daemon (`hugind`, **agent**) and the cloud
-relay (**server**). A **proposal for review**, not a frozen contract. rev 1.3
-folds in two cloud-side reviews (cloud team + Codex) — see [CHANGELOG](../CHANGELOG.md).
+relay (**server**). A **proposal for review**, not a frozen contract. See the
+[CHANGELOG](../CHANGELOG.md) for the rev 1.1–1.6 review history.
 
 - **SSOT:** [`v1/messages.ts`](v1/messages.ts) (zod). Both codebases import it.
 - **Runnable spec:** `npm run protocol:check` — 23/23 messages + negotiation,
-  strict-field, safe-integer, and direction/phase checks.
+  strict-field, safe-integer, direction/phase, and F4 cross-language auth-vector
+  checks ([`v1/test-vectors.json`](v1/test-vectors.json)).
 - **TLS is mandatory.** The transport protects `server_time` and frames in flight.
 
 ## Design principles
@@ -70,9 +71,9 @@ sequenceDiagram
     S->>A: hello.accepted (negotiated_version, connection_epoch, resume[])
 ```
 
-`signature` covers the **canonical transcript** (`challenge_id | nonce |
-agent_id | protocol_version | alg` + domain separation + tenant binding), **not
-the bare nonce** — defined byte-for-byte in
+`signature` covers the **canonical transcript** (domain tag + `challenge_id |
+nonce | agent_id | key_id | protocol_version | alg | tenant_id | server_origin`),
+**not the bare nonce** — defined byte-for-byte in
 [`docs/auth-pairing-spec.md`](../docs/auth-pairing-spec.md). The server resolves
 `agent_id` + `key_id` → device public key (registered at pairing), checks the
 single-use nonce within its TTL, and assigns a `connection_epoch`. A newer
@@ -165,12 +166,30 @@ sequenceDiagram
 
 ## Versioning
 
-Prerelease/draft → exact match; stable → identical MAJOR. Strict-semver fields;
-malformed/empty rejected. See `negotiateVersion()`.
+Prerelease/draft → exact match; stable → identical MAJOR. Strict-semver fields
+(`SemVer`, ≤64 chars, `+build` rejected); malformed/empty rejected. See
+`negotiateVersion()`.
+
+## Event kinds
+
+`stream.event`'s `event.kind` is either a **core** kind (the closed enum in the
+SSOT) or a vendor kind matching `vendor.<engine>.*`. The core list is **frozen for
+v1** (EventKind Option A): adding a core kind is a major bump (v2).
+
+- **Unknown core kind → NACK** (`invalid_message`). A receiver MUST NOT reinterpret
+  an unrecognized non-vendor kind as a vendor event.
+- **Unknown vendor kind →** MAY be ignored, logged, or passed through opaquely
+  (stored but not trusted/rendered).
+- **Sender obligation:** a sender emits only core kinds defined at or below the
+  negotiated version. Within frozen-v1 this is automatic (the core list never
+  grows), so it is a no-op that becomes meaningful only at a future major bump.
+- **Enforcement:** the closed `EventKind` enum makes `parseMessage` reject an
+  unknown core kind, so `validateInbound()` cannot enforce this rule (parse throws
+  first) — F6 lives in the daemon/relay's parse-error→`nack` layer.
 
 ## Open questions
 
-### Resolved in rev 1.1–1.3
+### Resolved in rev 1.1–1.6
 - ✅ Auth proof, Ed25519-only, `key_id`, 32-byte single-use nonce, `*_ms` TTLs.
 - ✅ Lease fencing on all attempt messages (both directions) + rotation + `connection_epoch`.
 - ✅ Terminal-result durability — `result_digest`/`result_size` + `resend_result`.
@@ -178,16 +197,26 @@ malformed/empty rejected. See `negotiateVersion()`.
 - ✅ `decided_by` spoofing — remote-only enum.
 - ✅ Safety downgrade — local-max policy → reject (`policy_violation`).
 - ✅ Strict fields, safe integers, direction/phase enforcement, semver validation.
+- ✅ **rev 1.6** — `nonce` exact length 43; `AuthId` charset on signed ids
+  (`challenge_id`/`agent_id`/`key_id`); `SemVer` deduped + bounded (≤64); dead
+  `SIG_MAX` removed.
+- ✅ **rev 1.6** — `event.kind` core list **FROZEN for v1** (no longer deferred):
+  unknown core → NACK; engine extras via `vendor.<engine>.*` only (see
+  [Event kinds](#event-kinds)).
+- ✅ **rev 1.6** — `tenant_id` / `server_origin` formats specced (they enter the
+  signed transcript): `tenant_id` = `1*128(ALPHA/DIGIT/-/_/.)`; `server_origin` =
+  canonical `wss://` origin (DNS-only, default ports omitted, reconstructed — not
+  on the wire). See [auth-pairing-spec §5/§11](../docs/auth-pairing-spec.md).
+- ✅ **rev 1.6** — F4 cross-language auth test vectors
+  ([`v1/test-vectors.json`](v1/test-vectors.json)), verified by `protocol:check`.
 
-### Deferred to the auth/pairing security spec
-- Canonical signing bytes (encoding, domain separation, tenant/server binding).
+### Specified in the auth/pairing security spec
+- Canonical signing bytes (encoding, domain separation, tenant/server binding) — §5.
 - Pairing/registration, `agent_id` minting, key rotation/revocation, lost-device.
 
-### Still open (cloud-team agreement before freeze)
-1. Per-job credit-window flow control (Phase 2; static caps + `capacity` for now).
-2. Event `kind` core enum final membership before adapters lock.
-3. `tenant_id` / `server_origin` formats (they enter the signed auth transcript) —
-   a proposal is in [auth-pairing-spec §11](../docs/auth-pairing-spec.md).
+### Deferred — post-freeze, not v1.0.0 blockers
+1. Per-job credit-window flow control → **Phase 2** (agreed deferral; v1 uses
+   static caps independent of the `capacity` hint). See [PROPOSAL](../docs/PROPOSAL.md).
 
 Multi-region / cross-POP consistency (nonce, `connection_epoch`, lease) is **out
 of MVP scope** — MVP assumes a single logical POP (auth spec §6).

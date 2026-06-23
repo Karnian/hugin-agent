@@ -3,6 +3,48 @@
 All notable changes to the `hugind ↔ orchestrator` wire contract. The protocol
 is a draft strawman; nothing here is frozen until the `-draft` suffix is dropped.
 
+## [1.6.0-draft] — 2026-06-23
+
+Mechanical pre-freeze pass — closes cloud F1–F6 and Codex A/B/C. No redesign.
+Locks two decisions: the `event.kind` core list is **frozen** for v1 (no longer
+"deferred"), and `agent_id` is **per-device** under a `user_id` 1:N layer
+(`user_id` off-wire).
+
+### Fixed (messages.ts)
+- **F1** — `auth.challenge.nonce` is exact length 43 (was `min(43).max(44)`).
+- **Codex B** — `challenge_id` / `agent_id` / `key_id` use a strict `AuthId`
+  charset (`^[A-Za-z0-9._-]{1,128}$`; ASCII, no `:`). These enter the signed
+  transcript, so a loose `Id` risked UTF-16-vs-byte signature mismatches.
+- **Codex A** — `SemVer` deduped into `messages.ts` (was also copied in
+  `index.ts`), bounded to ≤64 chars; `+build` metadata stays intentionally rejected.
+- Removed the dead `SIG_MAX` constant (superseded by `Ed25519Sig`).
+
+### Added
+- **F4** — cross-language auth **test vectors**: `v1/gen-vectors.ts` →
+  `v1/test-vectors.json` (deterministic Ed25519 from a fixed seed; canonical
+  transcript per auth-spec §5; positive + negative vectors). Loaded and verified
+  by `selftest.ts` — positives must sign-match, negatives must fail.
+- **F6 / EventKind Option A** — documented in README "Event kinds": unknown
+  **core** kind → NACK; unknown **vendor** kind → may be ignored/passed through;
+  the core list is frozen (no `non-critical` field — cores can't be unknown-but-ok).
+
+### Changed (auth-pairing-spec.md)
+- **F2** — `server_origin`: REJECT non-canonical input (no silent normalize);
+  DNS-only in production, `ws://` loopback-only, default ports omitted, port 0 /
+  trailing-dot / zone-id / raw-IDN rejected, lowercase after IDNA.
+- **F3** — `tenant_id`: grammar `1*128(ALPHA/DIGIT/-/_/.)` (≤128; was ≤64 in
+  §2/§11); stable for the key lifetime; no silent cross-tenant rebind.
+- **F5** — linearizability made concrete: atomic nonce-consume, per-`agent_id`
+  monotonic `connection_epoch`, CAS/fenced lease ownership; OK/NOT-OK store list.
+- Identity model `tenant_id > user_id > agent_id(device) > engines`; `user_id`
+  lives in the pairing record/response/audit, never on the wire.
+- Clarified: all base64url unpadded; `server_origin`/`tenant_id` reconstructed by
+  the verifier (not in `hello`); transcript `protocol_version` = exact `hello`
+  value; `challenge_ttl_ms` advisory.
+
+### Version
+- `PROTOCOL_VERSION` → `1.6.0-draft`.
+
 ## [1.5.0-draft] — 2026-06-23
 
 Freeze-readiness pass (third cross-review follow-up). Closes G1–G4; G5

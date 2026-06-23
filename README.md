@@ -18,7 +18,7 @@ writing the daemon:
 
 | Path | What |
 |------|------|
-| [`protocol/`](protocol/README.md) | **Wire protocol v1.1 (strawman)** — the WSS JSON contract shared with the cloud relay. zod SSOT + spec + open questions. 23/23 conformance. |
+| [`protocol/`](protocol/README.md) | **Wire protocol v1.6 (freeze candidate)** — the WSS JSON contract shared with the cloud relay. zod SSOT + spec + F4 cross-language test vectors. `protocol:check` green. |
 | [`spikes/approval-prompt-tool/`](spikes/approval-prompt-tool/README.md) | **Approval spike** — empirically probes headless Claude's `--permission-prompt-tool` request/response behavior. |
 | [`docs/PROPOSAL.md`](docs/PROPOSAL.md) | **Review request** for the cloud team — what to confirm before the contract is frozen. |
 

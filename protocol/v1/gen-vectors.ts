@@ -1,0 +1,384 @@
+/**
+ * F4 — cross-language auth test vectors (generator).
+ * ==================================================
+ *
+ *   tsx protocol/v1/gen-vectors.ts      # (re)writes ./test-vectors.json
+ *
+ * Emits DETERMINISTIC Ed25519 signing vectors (fixed 32-byte seed) so a Go/Rust
+ * verifier can confirm byte-identical transcript construction (auth-pairing-spec
+ * §5) and signature verification, independent of this TypeScript implementation.
+ *
+ * `selftest.ts` imports the helpers below (no side effect on import — the file
+ * write is guarded to direct invocation) and verifies the COMMITTED JSON:
+ * positives must recompute the same transcript and verify; negatives must fail
+ * exactly as documented (schema parse-reject, canonicalization reject, or
+ * signature-verify fail).
+ *
+ * Transcript (auth-pairing-spec §5):
+ *   LP(x)      := uint32_be(byte_length(x)) || x        # UTF-8 unless noted
+ *   transcript := LP(domain_tag) || LP(challenge_id) || nonce_raw  # nonce: RAW 32B, NO LP
+ *              || LP(agent_id) || LP(key_id) || LP(protocol_version)
+ *              || LP("ed25519") || LP(tenant_id) || LP(server_origin)
+ */
+
+import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:crypto";
+// `createPublicKey` is used by publicKeyFromRaw (SPKI DER input — type-safe).
+import { realpathSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { PROTOCOL_VERSION } from "./messages";
+
+// ---------------------------------------------------------------------------
+// Byte helpers
+// ---------------------------------------------------------------------------
+
+/** Length-prefix: uint32_be(byte_length(x)) || x. Strings are UTF-8 encoded. */
+export function lp(x: string | Buffer): Buffer {
+  const body = Buffer.isBuffer(x) ? x : Buffer.from(x, "utf8");
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(body.length, 0);
+  return Buffer.concat([len, body]);
+}
+
+/** Unpadded base64url (Node's "base64url" omits `=`). */
+export function b64u(buf: Buffer): string {
+  return buf.toString("base64url");
+}
+
+export const DOMAIN_TAG = "hugin-agent/auth/v1";
+export const ALG = "ed25519";
+
+// ---------------------------------------------------------------------------
+// Ed25519 key derivation from a FIXED seed (reproducible vectors)
+// ---------------------------------------------------------------------------
+
+/** PKCS8 v0 wrapper for an Ed25519 private key (RFC 8410): the 16-byte prefix
+ *  precedes the raw 32-byte seed → a 48-byte DER that Node imports directly. */
+const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
+/** SPKI wrapper for an Ed25519 public key: 12-byte prefix + raw 32-byte key. */
+const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+
+export interface Keypair {
+  privateKey: KeyObject;
+  publicKey: KeyObject;
+  /** Raw 32-byte public key. */
+  publicRaw: Buffer;
+}
+
+export function deriveKeypairFromSeed(seed: Buffer): Keypair {
+  if (seed.length !== 32) throw new Error(`Ed25519 seed must be 32 bytes, got ${seed.length}`);
+  const der = Buffer.concat([PKCS8_ED25519_PREFIX, seed]);
+  const privateKey = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  // The JWK `x` is the raw public key (base64url). Going via JWK avoids
+  // createPublicKey(KeyObject), which @types/node omits from its input union.
+  const jwk = privateKey.export({ format: "jwk" });
+  if (!jwk.x) throw new Error("Ed25519 private key JWK missing public component 'x'");
+  const publicRaw = Buffer.from(jwk.x, "base64url");
+  const publicKey = publicKeyFromRaw(publicRaw);
+  return { privateKey, publicKey, publicRaw };
+}
+
+/** Reconstruct an Ed25519 public KeyObject from its raw 32 bytes — the path a
+ *  cross-language verifier takes (it has only the published `ed25519_public_hex`). */
+export function publicKeyFromRaw(publicRaw: Buffer): KeyObject {
+  if (publicRaw.length !== 32) throw new Error(`Ed25519 public key must be 32 bytes, got ${publicRaw.length}`);
+  const spki = Buffer.concat([SPKI_ED25519_PREFIX, publicRaw]);
+  return createPublicKey({ key: spki, format: "der", type: "spki" });
+}
+
+// ---------------------------------------------------------------------------
+// Transcript
+// ---------------------------------------------------------------------------
+
+export interface TranscriptFields {
+  challenge_id: string;
+  /** 32 raw nonce bytes — inserted into the transcript WITHOUT a length prefix. */
+  nonce_raw: Buffer;
+  agent_id: string;
+  key_id: string;
+  protocol_version: string;
+  tenant_id: string;
+  /** Canonical server origin (see canonicalizeServerOrigin). */
+  server_origin: string;
+}
+
+export function buildTranscript(f: TranscriptFields): Buffer {
+  return Buffer.concat([
+    lp(DOMAIN_TAG),
+    lp(f.challenge_id),
+    f.nonce_raw, // RAW 32 bytes, NO length prefix
+    lp(f.agent_id),
+    lp(f.key_id),
+    lp(f.protocol_version),
+    lp(ALG),
+    lp(f.tenant_id),
+    lp(f.server_origin),
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// server_origin canonicalization (auth-pairing-spec §5 — normative)
+// ---------------------------------------------------------------------------
+
+/** Returns the canonical origin, or `null` if `input` is non-canonical/invalid.
+ *  A verifier REJECTS non-canonical input — it never silently normalizes. The
+ *  canonical stored form has NO trailing slash (`wss://relay.example.com`). */
+export function canonicalizeServerOrigin(input: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    return null; // unparseable
+  }
+  const scheme = url.protocol; // "wss:" | "ws:" | ...
+  const host = url.hostname; // URL lowercases + IDNA-punycodes; IPv6 keeps [..]
+  const isLoopback =
+    host === "localhost" || host === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(host);
+
+  if (scheme !== "wss:" && scheme !== "ws:") return null; // ws/wss only
+  if (scheme === "ws:" && !isLoopback) return null; // ws:// only for loopback dev
+  if (url.username || url.password) return null; // no userinfo
+  if (url.search || url.hash) return null; // no query/fragment
+  if (url.pathname && url.pathname !== "/") return null; // no path
+  if (url.port === "0") return null; // reject port 0
+  if (host.endsWith(".")) return null; // trailing-dot host (URL keeps it)
+  if (host.includes("%")) return null; // zone-id / percent-encoded authority
+
+  const isIPv6 = host.startsWith("[");
+  const isIPv4 = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
+  if ((isIPv6 || isIPv4) && !isLoopback) return null; // production = DNS-only
+  if (!isLoopback) {
+    // Production host must be a syntactically valid DNS name (RFC 1035 labels):
+    // each label 1–63 chars, alphanumeric with internal hyphens, no empty label
+    // (consecutive dots) / leading-or-trailing hyphen / underscore. IPs already rejected.
+    const dnsLabel = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
+    if (!host.split(".").every((label) => dnsLabel.test(label))) return null;
+  }
+
+  const portPart = url.port ? `:${url.port}` : "";
+  const canonical = `${scheme}//${host}${portPart}`;
+  if (canonical !== input) return null; // input must already be canonical
+  return canonical;
+}
+
+// ---------------------------------------------------------------------------
+// tenant_id grammar (auth-pairing-spec §2/§11): 1*128(ALPHA/DIGIT/-/_/.)
+// ---------------------------------------------------------------------------
+
+const TENANT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+export function validateTenantId(t: string): boolean {
+  return TENANT_ID_RE.test(t);
+}
+
+// ---------------------------------------------------------------------------
+// Vector shapes
+// ---------------------------------------------------------------------------
+
+export interface PositiveVector {
+  label: string;
+  challenge_id: string;
+  nonce_base64url: string;
+  nonce_raw_hex: string;
+  agent_id: string;
+  key_id: string;
+  protocol_version: string;
+  tenant_id: string;
+  input_server_origin: string;
+  canonical_server_origin: string;
+  domain_tag_hex: string;
+  alg_lp_hex: string;
+  transcript_hex: string;
+  ed25519_seed_hex: string;
+  ed25519_public_hex: string;
+  expected_signature_base64url: string;
+}
+
+export type FailureMode = "parse" | "origin" | "tenant" | "signature";
+
+export interface NegativeVector {
+  label: string;
+  reason: string;
+  failure_mode: FailureMode;
+  // failure_mode "parse": embed `value` into `wire_message`.`field` → Message.parse must reject.
+  wire_message?: "auth.challenge" | "hello";
+  field?: string;
+  value?: string;
+  // failure_mode "origin": canonicalizeServerOrigin(input_server_origin) must return null.
+  input_server_origin?: string;
+  // failure_mode "tenant": validateTenantId(tenant_id) must be false.
+  tenant_id?: string;
+  // failure_mode "signature": rebuild transcript from these fields → verify(expected_sig) must FAIL.
+  challenge_id?: string;
+  nonce_raw_hex?: string;
+  agent_id?: string;
+  key_id?: string;
+  protocol_version?: string;
+  canonical_server_origin?: string;
+  ed25519_seed_hex?: string;
+  ed25519_public_hex?: string;
+  transcript_hex?: string;
+  expected_signature_base64url?: string;
+}
+
+export interface VectorsFile {
+  _comment: string;
+  domain_tag: string;
+  alg: string;
+  ed25519_seed_hex: string;
+  ed25519_public_hex: string;
+  positives: PositiveVector[];
+  negatives: NegativeVector[];
+}
+
+// ---------------------------------------------------------------------------
+// Fixed inputs
+// ---------------------------------------------------------------------------
+
+const SEED_HEX = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"; // bytes 0x01..0x20
+const NONCE_RAW_HEX = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"; // bytes 0x20..0x3f
+
+const kp = deriveKeypairFromSeed(Buffer.from(SEED_HEX, "hex"));
+const PUB_HEX = kp.publicRaw.toString("hex");
+const nonceRaw = Buffer.from(NONCE_RAW_HEX, "hex");
+const NONCE_B64U = b64u(nonceRaw); // 43 chars
+
+type PositiveOverrides = Partial<
+  Pick<
+    PositiveVector,
+    "challenge_id" | "agent_id" | "key_id" | "protocol_version" | "tenant_id" | "input_server_origin"
+  >
+>;
+
+function positive(label: string, over: PositiveOverrides): PositiveVector {
+  const challenge_id = over.challenge_id ?? "ch-v6-0001";
+  const agent_id = over.agent_id ?? "agent-abc";
+  const key_id = over.key_id ?? "key-1";
+  const protocol_version = over.protocol_version ?? PROTOCOL_VERSION;
+  const tenant_id = over.tenant_id ?? "acme";
+  const input_server_origin = over.input_server_origin ?? "wss://relay.example.com";
+
+  const canonical = canonicalizeServerOrigin(input_server_origin);
+  if (canonical === null) throw new Error(`positive ${label}: non-canonical origin "${input_server_origin}"`);
+  if (!validateTenantId(tenant_id)) throw new Error(`positive ${label}: invalid tenant_id`);
+
+  const transcript = buildTranscript({
+    challenge_id, nonce_raw: nonceRaw, agent_id, key_id, protocol_version, tenant_id, server_origin: canonical,
+  });
+  const signature = sign(null, transcript, kp.privateKey);
+
+  return {
+    label,
+    challenge_id,
+    nonce_base64url: NONCE_B64U,
+    nonce_raw_hex: NONCE_RAW_HEX,
+    agent_id,
+    key_id,
+    protocol_version,
+    tenant_id,
+    input_server_origin,
+    canonical_server_origin: canonical,
+    domain_tag_hex: lp(DOMAIN_TAG).toString("hex"),
+    alg_lp_hex: lp(ALG).toString("hex"),
+    transcript_hex: transcript.toString("hex"),
+    ed25519_seed_hex: SEED_HEX,
+    ed25519_public_hex: PUB_HEX,
+    expected_signature_base64url: b64u(signature),
+  };
+}
+
+/** Negative whose signature was computed over a DIFFERENT protocol_version than
+ *  the one presented — proves the transcript binds protocol_version. */
+function signatureMismatchNegative(): NegativeVector {
+  const challenge_id = "ch-v6-0001";
+  const agent_id = "agent-abc";
+  const key_id = "key-1";
+  const tenant_id = "acme";
+  const canonical = "wss://relay.example.com";
+  const presentedPv = "1.7.0-draft"; // differs from PROTOCOL_VERSION (the signed value)
+
+  const signedTranscript = buildTranscript({
+    challenge_id, nonce_raw: nonceRaw, agent_id, key_id, protocol_version: PROTOCOL_VERSION, tenant_id, server_origin: canonical,
+  });
+  const signature = sign(null, signedTranscript, kp.privateKey);
+  const presentedTranscript = buildTranscript({
+    challenge_id, nonce_raw: nonceRaw, agent_id, key_id, protocol_version: presentedPv, tenant_id, server_origin: canonical,
+  });
+
+  return {
+    label: "protocol_version-signature-mismatch",
+    reason: "signature computed over protocol_version != presented (transcript binding)",
+    failure_mode: "signature",
+    challenge_id,
+    nonce_raw_hex: NONCE_RAW_HEX,
+    agent_id,
+    key_id,
+    protocol_version: presentedPv,
+    tenant_id,
+    canonical_server_origin: canonical,
+    ed25519_seed_hex: SEED_HEX,
+    ed25519_public_hex: PUB_HEX,
+    transcript_hex: presentedTranscript.toString("hex"),
+    expected_signature_base64url: b64u(signature),
+  };
+}
+
+export function buildVectors(): VectorsFile {
+  const positives: PositiveVector[] = [
+    positive("baseline", {}),
+    positive("tenant-id-max-128", { tenant_id: "t".repeat(128) }),
+  ];
+
+  const negatives: NegativeVector[] = [
+    // --- schema parse rejects (wire-level) ---
+    { label: "nonce-42-chars", reason: "nonce shorter than 43 chars", failure_mode: "parse", wire_message: "auth.challenge", field: "nonce", value: "A".repeat(42) },
+    { label: "nonce-44-chars", reason: "nonce longer than 43 chars", failure_mode: "parse", wire_message: "auth.challenge", field: "nonce", value: "A".repeat(44) },
+    { label: "nonce-padded", reason: "padded base64url nonce ('=' rejected)", failure_mode: "parse", wire_message: "auth.challenge", field: "nonce", value: `${"A".repeat(42)}=` },
+    { label: "agent_id-non-ascii", reason: "non-ASCII agent_id (UTF-16-vs-byte signature-mismatch defense)", failure_mode: "parse", wire_message: "hello", field: "agent_id", value: "agent-café" },
+    { label: "agent_id-invalid-charset", reason: "agent_id with '@' is outside AuthId charset", failure_mode: "parse", wire_message: "hello", field: "agent_id", value: "agent@host" },
+    { label: "protocol_version-over-64", reason: "protocol_version exceeds 64 chars (SemVer .max(64))", failure_mode: "parse", wire_message: "hello", field: "protocol_version", value: `1.0.0-${"a".repeat(60)}` },
+    // --- server_origin canonicalization rejects ---
+    { label: "origin-uppercase-host", reason: "uppercase host is non-canonical", failure_mode: "origin", input_server_origin: "wss://Relay.Example.com" },
+    { label: "origin-explicit-default-port", reason: "explicit :443 default port is non-canonical", failure_mode: "origin", input_server_origin: "wss://relay.example.com:443" },
+    { label: "origin-trailing-dot", reason: "trailing-dot host is non-canonical", failure_mode: "origin", input_server_origin: "wss://relay.example.com." },
+    { label: "origin-raw-idn", reason: "raw IDN host must be ASCII punycode", failure_mode: "origin", input_server_origin: "wss://café.example.com" },
+    { label: "origin-invalid-dns-label", reason: "host with '_' is not a valid DNS label", failure_mode: "origin", input_server_origin: "wss://relay_example.com" },
+    // --- tenant_id grammar reject ---
+    { label: "tenant-id-129-chars", reason: "tenant_id exceeds 128 chars", failure_mode: "tenant", tenant_id: "t".repeat(129) },
+    // --- signature mismatch ---
+    signatureMismatchNegative(),
+  ];
+
+  return {
+    _comment:
+      "F4 cross-language auth test vectors (auth-pairing-spec §5). DO NOT EDIT BY HAND — regenerate with: tsx protocol/v1/gen-vectors.ts. Verified by protocol/v1/selftest.ts (npm run protocol:check).",
+    domain_tag: DOMAIN_TAG,
+    alg: ALG,
+    ed25519_seed_hex: SEED_HEX,
+    ed25519_public_hex: PUB_HEX,
+    positives,
+    negatives,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Write only when invoked directly (no side effect when imported by selftest).
+// ---------------------------------------------------------------------------
+
+/** True iff this module is the entry script. Compares realpaths (not file URLs)
+ *  so a symlinked `tsx`/script invocation still resolves to this module; when
+ *  selftest imports it the paths differ → no write (Codex P2 review). */
+function invokedDirectly(): boolean {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined) return false;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) {
+  const out = new URL("./test-vectors.json", import.meta.url);
+  const data = buildVectors();
+  writeFileSync(out, `${JSON.stringify(data, null, 2)}\n`);
+  console.log(`wrote ${fileURLToPath(out)} (${data.positives.length} positive, ${data.negatives.length} negative)`);
+}

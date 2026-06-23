@@ -1,5 +1,5 @@
 /**
- * Hugin Agent — Wire protocol v1 (STRAWMAN / DRAFT, rev 1.3)
+ * Hugin Agent — Wire protocol v1 (STRAWMAN / DRAFT, rev 1.6)
  * =========================================================
  *
  * Single source of truth for the WSS JSON contract shared between:
@@ -38,6 +38,12 @@
  *   + lease rotation overlap window (LIMITS) + PendingResult.lease_id
  *   + ResumeDirective enforces lease_id for resume_from/resend_result
  *
+ * rev 1.6 — mechanical pre-freeze pass (cloud F1–F6 + Codex A/B/C):
+ *   + nonce exact length 43 (F1); AuthId charset on signed ids (Codex B)
+ *   + SemVer deduped into this file + bounded .max(64) (Codex A); SIG_MAX removed
+ *   + EventKind core FROZEN for v1 (Option A) — unknown core → NACK (F6)
+ *   + F4 cross-language test vectors (v1/gen-vectors.ts → v1/test-vectors.json)
+ *
  * Canonical signing bytes, pairing, key rotation/revocation: see
  * ../../docs/auth-pairing-spec.md (separate security surface).
  *
@@ -46,7 +52,7 @@
 
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = "1.5.0-draft" as const;
+export const PROTOCOL_VERSION = "1.6.0-draft" as const;
 
 // ---------------------------------------------------------------------------
 // Operational limits (part of the contract — both sides enforce these)
@@ -85,7 +91,6 @@ export const LIMITS = {
 const ID_MAX = 256;
 const TEXT_MAX = 8_192;
 const PATH_MAX = 4_096;
-const SIG_MAX = 512;
 const ARRAY_MAX = 256;
 const TIMEOUT_MS_MAX = 3_600_000; //                1 hour
 const OUTPUT_BYTES_MAX = 100 << 20; //              100 MiB
@@ -101,8 +106,15 @@ const Path = z.string().min(1).max(PATH_MAX);
 /** JSON-safe non-negative integer (guards against 2^53 precision loss). */
 const SafeInt = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const PosInt = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const SemVer = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
+/** SemVer 2.0 core + optional prerelease, bounded to 64 chars. `+build` metadata
+ *  is INTENTIONALLY rejected: build tags must not affect version identity or
+ *  negotiation. Single source of truth — index.ts imports this (Codex A). */
+export const SemVer = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).max(64);
 const Base64Url = z.string().regex(/^[A-Za-z0-9_-]+$/);
+/** Charset for ids that enter the signed auth transcript (challenge_id, agent_id,
+ *  key_id). ASCII-only, no `:` (avoids IPv6/host ambiguity). A loose `Id` would let
+ *  unicode/control chars cause TS-UTF16-vs-Go-byte signature mismatches (Codex B). */
+const AuthId = z.string().regex(/^[A-Za-z0-9._-]{1,128}$/);
 /** Fixed-size crypto material, base64url unpadded (no `=` padding). */
 const Ed25519Sig = Base64Url.length(86); // 64 bytes → exactly 86 chars
 const Sha256Digest = Base64Url.length(43); // 32 bytes → exactly 43 chars
@@ -152,8 +164,17 @@ export const ErrorCode = z.enum([
   "internal", "engine_unavailable", "workspace_error", "approval_timeout", "policy_violation",
 ]);
 
-/** Core, frozen event kinds + a vendor namespace for engine-specific extras.
- *  Unknown vendor events MAY be stored but not trusted/rendered (A5). */
+/** Core event kinds are FROZEN for v1 (EventKind Option A): the closed enum below
+ *  is the COMPLETE core set — a new core kind is a major bump (v2). This closed
+ *  enum IS the F6 enforcement: an unknown CORE kind fails to parse, and the
+ *  daemon/relay's parse-error→nack layer turns that into `invalid_message`
+ *  (`validateInbound` can't enforce F6 — parse throws first). Engine-specific
+ *  events use the `vendor.<engine>.*` namespace only; unknown VENDOR events MAY be
+ *  stored/passed through opaquely but not trusted/rendered (A5). Do NOT add a
+ *  "non-critical unknown core" branch — cores are frozen, so it cannot occur.
+ *
+ *  The vendor regex MUST track the `Engine` enum above: adding a 3rd engine is a
+ *  contract change (there is no mechanical binding to `Engine` in v1). */
 export const EventKind = z.union([
   z.enum([
     "assistant_text", "tool_use", "tool_result", "usage",
@@ -234,9 +255,9 @@ const base = { id: MessageId, ts: Iso };
 export const AuthChallenge = z.strictObject({
   ...base,
   type: z.literal("auth.challenge"),
-  challenge_id: Id,
-  /** 32 random bytes, base64url (43 chars unpadded). Single-use, server-tracked. */
-  nonce: Base64Url.min(43).max(44),
+  challenge_id: AuthId,
+  /** 32 random bytes, base64url (exactly 43 chars unpadded). Single-use, server-tracked. */
+  nonce: Base64Url.length(43),
   server_time: Iso,
   challenge_ttl_ms: PosInt,
 });
@@ -245,13 +266,13 @@ export const Hello = z.strictObject({
   ...base,
   type: z.literal("hello"),
   protocol_version: SemVer,
-  agent_id: Id,
+  agent_id: AuthId,
   agent_version: SemVer,
   /** Ed25519 signature over the canonical transcript defined in the
    *  auth/pairing spec — NOT the bare nonce. `key_id` selects the device key. */
   auth: z.strictObject({
-    challenge_id: Id,
-    key_id: Id,
+    challenge_id: AuthId,
+    key_id: AuthId,
     signature: Ed25519Sig,
     alg: z.literal("ed25519"),
   }),

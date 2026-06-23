@@ -5,7 +5,7 @@
  * contract never drifts between the two codebases.
  */
 
-import { DIRECTION, HANDSHAKE_TYPES, type Message } from "./messages";
+import { DIRECTION, HANDSHAKE_TYPES, SemVer, type Message } from "./messages";
 
 export * from "./messages";
 export { PROTOCOL_VERSION } from "./messages";
@@ -24,16 +24,17 @@ export function negotiateVersion(
   agentVersion: string,
   serverSupported: readonly string[],
 ): { ok: true; version: string } | { ok: false; reason: string } {
-  // Strict semver so empty/malformed inputs ("", ".1.0", "1.x.y") can't match.
-  const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+  // Strict semver via the single SemVer SSOT from messages.ts (incl. its .max(64)
+  // bound) so empty/malformed/over-long inputs ("", ".1.0", "1.x.y") can't match.
+  const isSemVer = (v: string) => SemVer.safeParse(v).success;
   const majorOf = (v: string) => v.split(".")[0] ?? "";
   const preOf = (v: string) => v.split("-")[1] ?? null;
 
-  if (!SEMVER.test(agentVersion)) {
+  if (!isSemVer(agentVersion)) {
     return { ok: false, reason: `malformed agent version "${agentVersion}"` };
   }
   // Ignore malformed entries the server may advertise.
-  const supported = serverSupported.filter((v) => SEMVER.test(v));
+  const supported = serverSupported.filter((v) => isSemVer(v));
 
   if (preOf(agentVersion)) {
     const exact = supported.find((v) => v === agentVersion);
