@@ -10,15 +10,23 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "protocol:check": "tsx protocol/v1/selftest.ts",
-    "spike:approval": "tsx spikes/approval-prompt-tool/run.ts"
+    "spike:approval": "tsx spikes/approval-prompt-tool/run.ts",
+    "hugind": "tsx src/index.ts",
+    "mock-relay": "tsx mock-relay/server.ts",
+    "e2e": "tsx scripts/e2e.ts",
+    "e2e:claude": "HUGIN_E2E_REAL_CLI=1 tsx scripts/e2e.ts"
   },
   "license": "Apache-2.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.11.1",
+    "ws": "^8.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.0.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }

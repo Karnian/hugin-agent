@@ -26,26 +26,16 @@ import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:cr
 import { realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "./messages";
+import { ALG, DOMAIN_TAG, buildTranscript, lp } from "./transcript";
 
 // ---------------------------------------------------------------------------
 // Byte helpers
 // ---------------------------------------------------------------------------
 
-/** Length-prefix: uint32_be(byte_length(x)) || x. Strings are UTF-8 encoded. */
-export function lp(x: string | Buffer): Buffer {
-  const body = Buffer.isBuffer(x) ? x : Buffer.from(x, "utf8");
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(body.length, 0);
-  return Buffer.concat([len, body]);
-}
-
 /** Unpadded base64url (Node's "base64url" omits `=`). */
 export function b64u(buf: Buffer): string {
   return buf.toString("base64url");
 }
-
-export const DOMAIN_TAG = "hugin-agent/auth/v1";
-export const ALG = "ed25519";
 
 // ---------------------------------------------------------------------------
 // Ed25519 key derivation from a FIXED seed (reproducible vectors)
@@ -83,36 +73,6 @@ export function publicKeyFromRaw(publicRaw: Buffer): KeyObject {
   if (publicRaw.length !== 32) throw new Error(`Ed25519 public key must be 32 bytes, got ${publicRaw.length}`);
   const spki = Buffer.concat([SPKI_ED25519_PREFIX, publicRaw]);
   return createPublicKey({ key: spki, format: "der", type: "spki" });
-}
-
-// ---------------------------------------------------------------------------
-// Transcript
-// ---------------------------------------------------------------------------
-
-export interface TranscriptFields {
-  challenge_id: string;
-  /** 32 raw nonce bytes — inserted into the transcript WITHOUT a length prefix. */
-  nonce_raw: Buffer;
-  agent_id: string;
-  key_id: string;
-  protocol_version: string;
-  tenant_id: string;
-  /** Canonical server origin (see canonicalizeServerOrigin). */
-  server_origin: string;
-}
-
-export function buildTranscript(f: TranscriptFields): Buffer {
-  return Buffer.concat([
-    lp(DOMAIN_TAG),
-    lp(f.challenge_id),
-    f.nonce_raw, // RAW 32 bytes, NO length prefix
-    lp(f.agent_id),
-    lp(f.key_id),
-    lp(f.protocol_version),
-    lp(ALG),
-    lp(f.tenant_id),
-    lp(f.server_origin),
-  ]);
 }
 
 // ---------------------------------------------------------------------------

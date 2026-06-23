@@ -21,17 +21,15 @@ import {
   validateInbound,
 } from "./index";
 import {
-  ALG,
-  DOMAIN_TAG,
   b64u,
-  buildTranscript,
   canonicalizeServerOrigin,
   deriveKeypairFromSeed,
-  lp,
   publicKeyFromRaw,
   validateTenantId,
   type VectorsFile,
 } from "./gen-vectors";
+import { ALG, DOMAIN_TAG, buildTranscript, lp } from "./transcript";
+import { jcsCanonicalize, resultDigest } from "./digest";
 
 const now = "2026-06-23T00:00:00.000Z";
 const env = { mode: "whitelist" as const, allow: ["PATH", "HOME"] };
@@ -199,6 +197,12 @@ const checks: Array<[string, boolean]> = [
   ["dedup'd SemVer validates good versions", SemVer.safeParse("1.2.3").success && SemVer.safeParse(PROTOCOL_VERSION).success],
   ["SemVer rejects >64 chars directly", !SemVer.safeParse(`1.0.0-${"a".repeat(60)}`).success],
   ["SemVer rejects +build metadata", !SemVer.safeParse("1.2.3+build").success],
+  // --- result_digest: RFC 8785 JCS (auth-pairing-spec §5b) ---
+  ["jcs sorts keys, no whitespace", jcsCanonicalize({ b: 1, a: 2, c: [3, 2, 1] }) === '{"a":2,"b":1,"c":[3,2,1]}'],
+  ["jcs rejects lone surrogate (cross-lang determinism)", (() => { try { jcsCanonicalize({ s: "\uD800" }); return false; } catch { return true; } })()],
+  ["result_digest known-answer", resultDigest(samples["job.result"] as Record<string, unknown>) === "e6raIvKksPn724T0swZTHpF429DjIr03kECehRDQH-M"],
+  ["result_digest is 43-char base64url", /^[A-Za-z0-9_-]{43}$/.test(resultDigest(samples["job.result"] as Record<string, unknown>))],
+  ["result_digest ignores id/ts + key order", resultDigest({ ts: "2099-01-01T00:00:00.000Z", stats: { bytes: 4096, event_count: 10 }, type: "job.result", head_sha: "cafebabe", final_status: "success", attempt_id: "a1", duration_ms: 1234, exit_code: 0, lease_id: "l1", job_id: "j1", id: "X" }) === resultDigest(samples["job.result"] as Record<string, unknown>)],
 ];
 
 // --- F4 cross-language auth vectors (5d): verify the committed test-vectors.json ---

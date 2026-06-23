@@ -11,5 +11,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["protocol", "spikes"]
+  "include": ["protocol", "spikes", "src", "mock-relay", "scripts"]
 }
