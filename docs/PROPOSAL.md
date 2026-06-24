@@ -57,24 +57,27 @@ and can be confirmed after freeze (strawman values in
 Plus the standing, already-agreed deferral: per-job credit-window flow control →
 Phase 2 (v1 enforces static caps independent of the `capacity` hint).
 
-## What we need from you
+## Cloud verdict (received)
 
-1. **Diff-review v1.6** — the diff + `test-vectors.json`. It is mechanical: no wire
-   shape changed in a way that needs redesign; F1–F6 + A/B/C are closed above.
-2. **Re-affirm cloud-side commitments** (your §D): linearizable
-   `(job_id, attempt_id, lease_generation)` leasing + unique live-attempt; durable
-   stream log keyed by `(attempt_id, seq)`/`(attempt_id, event_id)` with
-   ack-after-commit; global single-use nonce/replay store; quotas; approval
-   binding. Single logical POP assumed (cross-POP out of MVP scope).
+1. **Diff-review → FREEZE-OK (0 blockers)**, with Codex independently reproducing
+   the auth transcript + signatures. F1–F6 + Codex A/B/C closed; two pre-tag nits
+   applied — vectors regenerated at the signed `protocol_version:"1.0.0"`, plus
+   strict-Ed25519 and nonce-canonical negatives (see [CHANGELOG](../CHANGELOG.md)).
+2. **Cloud-side commitments** (your §D): [AFFIRMED] durable stream log keyed by
+   `(attempt_id, seq)`/`(attempt_id, event_id)` with ack-after-commit + result
+   durability-before-ack. [CONDITIONAL on PG-concurrency tests] single-use
+   nonce/replay, monotonic `connection_epoch`, lease CAS/fencing. [GAP — production
+   gates, not freeze blockers] real §5 Ed25519 verification, static quota
+   enforcement, approval binding. Single logical POP assumed (cross-POP out of MVP).
 
-## On freeze
+## Freeze outcome
 
-On your confirmation we drop `-draft` across `messages.ts` + spec → **`v1.0.0`**.
-The shared package `@contextualai/hugin-agent/protocol` becomes the single import
-for both codebases (preferred over codegen — no generator drift).
+`-draft` dropped across `messages.ts` + spec → **`v1.0.0`** (committed). The shared
+package `@contextualai/hugin-agent/protocol` is the single import for both
+codebases (preferred over codegen — no generator drift).
 
 **Sequencing:** mock-relay `hugind` development (daemon skeleton, WSS dial-out,
-Claude adapter, non-auth job/stream/cancel paths) can proceed in parallel now. The
-**production auth path** is unblocked once v1.6 is confirmed — `tenant_id` /
-`server_origin` formats and the canonical transcript are now fixed (F1–F5), so
-pairing/handshake can be built against the F4 vectors without rework.
+Claude adapter, non-auth job/stream/cancel paths) is underway. The **production
+auth path** is unblocked now that `tenant_id` / `server_origin` formats and the
+canonical transcript are frozen (F1–F5), so pairing/handshake builds against the
+F4 vectors without rework.
