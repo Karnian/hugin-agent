@@ -34,7 +34,7 @@ export interface TranscriptFields {
   key_id: string;
   protocol_version: string;
   tenant_id: string;
-  /** Canonical server origin (see canonicalizeServerOrigin in gen-vectors.ts). */
+  /** Canonical server origin (see canonicalizeServerOrigin in origin.ts). */
   server_origin: string;
 }
 

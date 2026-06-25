@@ -22,13 +22,12 @@ import {
 } from "./index";
 import {
   b64u,
-  canonicalizeServerOrigin,
   deriveKeypairFromSeed,
   publicKeyFromRaw,
-  validateTenantId,
   type VectorsFile,
 } from "./gen-vectors";
 import { ALG, DOMAIN_TAG, buildTranscript, lp } from "./transcript";
+import { canonicalizeServerOrigin, validateTenantId } from "./origin";
 import { jcsCanonicalize, resultDigest } from "./digest";
 
 const now = "2026-06-23T00:00:00.000Z";

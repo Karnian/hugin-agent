@@ -20,6 +20,11 @@ export const Config = z.strictObject({
   agentId: AuthId,
   /** Device key id selecting the signing key (a stub key in the non-auth MVP). */
   keyId: AuthId.default("dev-key"),
+  /** Daemon version reported in `hello.agent_version`. */
+  agentVersion: z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).max(64).default("0.0.0"),
+  /** Tenant the device is paired to (off-wire; used only to build the signed
+   *  transcript). Grammar 1*128(ALPHA/DIGIT/-/_/.). */
+  tenantId: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/).default("dev-tenant"),
   /** Absolute repo roots jobs may run under (allowlist; realpath-checked at use). */
   projectRoots: z.array(z.string()).default([]),
   /** Daemon-owned dir for per-attempt worktrees + the SQLite event log. */
