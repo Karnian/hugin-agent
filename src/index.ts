@@ -13,7 +13,8 @@
 import { type Config, loadConfig } from "./config";
 import { Daemon } from "./daemon";
 import { devSigner } from "./conn/handshake";
-import { FakeEngine } from "./engine/fake-engine";
+import { ClaudeEngine } from "./engine/claude";
+import { buildIsolation, selfCheckLogin } from "./engine/isolate";
 import { log } from "./log";
 
 function loadConfigOrExit(): Config {
@@ -42,10 +43,33 @@ function loadConfigOrExit(): Config {
 
 async function main(): Promise<void> {
   const config = loadConfigOrExit();
-  // P2a: the real Claude adapter lands in P2b; until then jobs run a placeholder
-  // fake engine. The transport/handshake/reconnect path above is production-real.
-  log.warn("P2a build: using the FAKE engine — the real Claude adapter lands in P2b");
-  const engine = new FakeEngine({ events: [{ kind: "system_status", note: "fake engine (P2a)" }] });
+
+  // Permission isolation + startup login self-check (plan §5.6). If isolation
+  // drops the login (macOS keychain hosts — see isolate.ts), fall back to the
+  // host config; the approval gate is then UNAVAILABLE and gated write/exec jobs
+  // must fail closed (P3 wires the enforcement + the prompt bridge).
+  const iso = buildIsolation(config.isolation, config.stateDir);
+  let engineEnv = iso.env;
+  if (iso.mode !== "none") {
+    const login = await selfCheckLogin(iso.env, config.engineCommand);
+    if (login.loggedIn) {
+      log.info("permission isolation active + login preserved", { mode: iso.mode });
+    } else {
+      log.warn("isolation dropped the login — falling back to host config; approval gate UNAVAILABLE (gated jobs must fail closed, P3)", { mode: iso.mode, detail: login.detail });
+      iso.cleanup();
+      engineEnv = {};
+    }
+  } else {
+    log.warn("isolation=none — under host config; approval gate disabled if the host allow-list is permissive (P3 fail-closed)");
+  }
+
+  const engine = new ClaudeEngine({
+    command: config.engineCommand,
+    env: engineEnv,
+    allowlist: config.projectRoots,
+    stateDir: config.stateDir,
+    timeoutMs: 3_600_000,
+  });
   const daemon = new Daemon(config, devSigner(config.keyId), engine);
   const shutdown = () => {
     log.info("signal received — shutting down");

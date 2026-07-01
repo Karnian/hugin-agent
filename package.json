@@ -14,7 +14,7 @@
     "hugind": "tsx src/index.ts",
     "mock-relay": "tsx mock-relay/server.ts",
     "e2e": "tsx scripts/e2e.ts",
-    "e2e:claude": "HUGIN_E2E_REAL_CLI=1 tsx scripts/e2e.ts"
+    "e2e:claude": "tsx scripts/e2e-claude.ts"
   },
   "license": "Apache-2.0",
   "dependencies": {

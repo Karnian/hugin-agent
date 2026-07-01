@@ -9,7 +9,7 @@
 
 import type { Message } from "../../protocol/v1/index";
 import { resultDigest } from "../../protocol/v1/digest";
-import type { Engine, EngineEvent, EngineOutcome } from "../engine/types";
+import type { Engine, EngineEvent, EngineOutcome, EngineSpec } from "../engine/types";
 import type { EventLog } from "../store/eventlog";
 import { JobRegistry, type JobState } from "./registry";
 import { leaseMatches } from "./lease";
@@ -73,6 +73,22 @@ export class JobManager {
       return;
     }
 
+    const spec: EngineSpec = {
+      engine: msg.engine,
+      prompt: msg.prompt,
+      attemptId: msg.attempt_id,
+      repoRoot: msg.workspace.repo_root,
+      baseSha: msg.workspace.base_sha,
+      cwd: msg.workspace.cwd,
+    };
+    // Pre-accept workspace/policy validation (allowlist, git, path safety) → reject
+    // BEFORE accept/spawn (plan §5.10). The fake engine omits validate → skipped.
+    const rej = this.engine.validate?.(spec);
+    if (rej) {
+      this.send(jobReject(ctx, rej.code, rej.message));
+      return;
+    }
+
     const runId = agentRunId();
     this.store.createAttempt({
       attempt_id: msg.attempt_id,
@@ -102,11 +118,7 @@ export class JobManager {
     this.store.setAttemptStatus(msg.attempt_id, "running");
     this.send(jobStatusMsg(ctx, "running"));
 
-    const run = this.engine.run({
-      engine: msg.engine,
-      prompt: msg.prompt,
-      cwd: msg.workspace.cwd ?? msg.workspace.repo_root,
-    });
+    const run = this.engine.run(spec);
     state.run = run;
     run.onEvent((ev) => this.onEvent(state, ev));
     run.onDone((outcome) => this.onDone(state, outcome));

@@ -12,6 +12,9 @@
  * daemon's epoch gate is strictly monotonic.
  */
 
+import { execFileSync } from "node:child_process";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import type { WebSocket } from "ws";
 import { LIMITS, parseMessage } from "../protocol/v1/index";
 import { loadConfig } from "../src/config";
@@ -20,10 +23,14 @@ import { devSigner } from "../src/conn/handshake";
 import { decodeInbound } from "../src/conn/framing";
 import { RelayClient } from "../src/conn/client";
 import { FakeEngine } from "../src/engine/fake-engine";
+import type { Engine } from "../src/engine/types";
 import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
+import { validateWorkspace } from "../src/workspace/worktree";
 import { MockRelay } from "../mock-relay/server";
+
+const SCRATCH = "/private/tmp/claude-501/-Users-k-Desktop-sub-project-hugin-agent/500bdae6-f9cf-45b3-9e5b-a2819e8bcd4b/scratchpad/e2e-worktree";
 
 let failures = 0;
 function check(label: string, cond: boolean): void {
@@ -483,6 +490,66 @@ function scenarioK(): void {
   store.close();
 }
 
+function tryCode(fn: () => void): string | null {
+  try {
+    fn();
+    return null;
+  } catch (e) {
+    return (e as { code?: string }).code ?? "throw";
+  }
+}
+
+/** Worktree validation (P2b): path-injection-safe attempt segment + allowlist +
+ *  git + cwd guards. Uses a throwaway git repo (no real claude needed). */
+function scenarioM(): void {
+  const base = join(SCRATCH, "wt");
+  const repo = join(base, "repo");
+  const notGit = join(base, "notgit");
+  rmSync(base, { recursive: true, force: true });
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(notGit, { recursive: true });
+  const git = (...a: string[]) => execFileSync("git", ["-C", repo, ...a], { stdio: "pipe" });
+  git("init", "-q");
+  git("config", "user.email", "e2e@test.local");
+  git("config", "user.name", "e2e");
+  writeFileSync(join(repo, "f.txt"), "x\n");
+  git("add", "-A");
+  git("commit", "-qm", "init");
+
+  const wtBase = resolve(base, "worktrees");
+  const ok = validateWorkspace({ repoRoot: repo, allowlist: [repo], stateDir: base, attemptId: "a1" });
+  check("M1 valid allowlisted git repo validates", ok.root === realpathSync(repo) && ok.wtDir === join(wtBase, "a1"));
+  const inj = validateWorkspace({ repoRoot: repo, allowlist: [repo], stateDir: base, attemptId: "../../evil" });
+  check(
+    "M2 path-injection attempt_id stays contained under worktrees/",
+    (inj.wtDir + sep).startsWith(wtBase + sep) && !inj.wtDir.includes(".."),
+  );
+  check("M3 non-allowlisted repo → root_not_allowlisted", tryCode(() => validateWorkspace({ repoRoot: repo, allowlist: [], stateDir: base, attemptId: "a1" })) === "root_not_allowlisted");
+  check("M4 non-git repo → not_a_git_repo", tryCode(() => validateWorkspace({ repoRoot: notGit, allowlist: [notGit], stateDir: base, attemptId: "a1" })) === "not_a_git_repo");
+  check("M5 cwd escaping repo_root → cwd_escape", tryCode(() => validateWorkspace({ repoRoot: repo, allowlist: [repo], stateDir: base, attemptId: "a1", cwd: "../notgit" })) === "cwd_escape");
+  rmSync(base, { recursive: true, force: true });
+}
+
+/** A workspace-invalid job must be rejected (job.reject) BEFORE accept/spawn,
+ *  via engine.validate — not surface as an error result mid-run. */
+function scenarioN(): void {
+  const store = new EventLog(":memory:");
+  const registry = new JobRegistry(2);
+  const sent: string[] = [];
+  const rejectEngine: Engine = {
+    run: () => {
+      throw new Error("engine.run must not be called for a rejected workspace");
+    },
+    validate: () => ({ code: "root_not_allowlisted", message: "repo_root not on the allowlist" }),
+  };
+  const manager = new JobManager(registry, store, rejectEngine, (m) => sent.push(m.type), { events: 1024, bytes: 8 << 20, conn: 32 << 20 });
+  const a = parseMessage(fakeAssign("j", "x", "L1"));
+  if (a.type === "job.assign") manager.handleAssign(a);
+  check("N1 workspace-invalid job → job.reject (not job.accept)", sent.includes("job.reject") && !sent.includes("job.accept"));
+  check("N2 rejected job created no durable attempt", store.activeAttempts().length === 0);
+  store.close();
+}
+
 async function main(): Promise<void> {
   console.log("=== hugind P1+P2a e2e ===\n[scenario A: live handshake + heartbeat + reconnect]");
   await scenarioA();
@@ -510,6 +577,10 @@ async function main(): Promise<void> {
   scenarioK();
   console.log("\n[scenario L: stale-callback race on async cancel + re-assign]");
   await scenarioL();
+  console.log("\n[scenario M: worktree validation + path-injection safety]");
+  scenarioM();
+  console.log("\n[scenario N: workspace-invalid job → job.reject pre-accept]");
+  scenarioN();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }

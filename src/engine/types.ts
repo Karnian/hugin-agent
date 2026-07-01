@@ -19,7 +19,14 @@ export type EngineOutcome =
 export interface EngineSpec {
   engine: "claude" | "codex";
   prompt: string;
-  cwd: string;
+  /** Attempt id — used to name the per-attempt worktree. */
+  attemptId: string;
+  /** Repo root to run under (validated against the allowlist by the adapter). */
+  repoRoot: string;
+  /** Optional base commit to branch the worktree from (defaults to HEAD). */
+  baseSha?: string;
+  /** Optional working subdir within the repo. */
+  cwd?: string;
 }
 
 export interface EngineRun {
@@ -33,6 +40,11 @@ export interface EngineRun {
   cancel(graceMs: number): void;
 }
 
+import type { RejectCode } from "../conn/outbound";
+
 export interface Engine {
   run(spec: EngineSpec): EngineRun;
+  /** Optional pre-accept validation (workspace/policy). A non-null result makes
+   *  the daemon `job.reject` BEFORE accepting/spawning. The fake engine omits it. */
+  validate?(spec: EngineSpec): { code: RejectCode; message: string } | null;
 }
