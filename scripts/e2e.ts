@@ -13,13 +13,19 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import type { WebSocket } from "ws";
-import { LIMITS, parseMessage } from "../protocol/v1/index";
+import { LIMITS, PROTOCOL_VERSION, parseMessage } from "../protocol/v1/index";
+import { canonicalizeServerOrigin } from "../protocol/v1/origin";
+import { buildTranscript } from "../protocol/v1/transcript";
+import { deriveKeypairFromSeed, verifyTranscript } from "../protocol/v1/ed25519";
 import { loadConfig } from "../src/config";
+import { connect } from "../src/auth/connect";
+import { readPairingConfig } from "../src/auth/config-file";
 import { Daemon } from "../src/daemon";
-import { devSigner } from "../src/conn/handshake";
+import { devSigner, performHandshake } from "../src/conn/handshake";
+import { keychainSeedStore, keychainSigner, memorySeedStore, newDeviceKey } from "../src/auth/keystore";
 import { decodeInbound } from "../src/conn/framing";
 import { RelayClient } from "../src/conn/client";
 import { FakeEngine } from "../src/engine/fake-engine";
@@ -28,7 +34,8 @@ import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
 import { validateWorkspace } from "../src/workspace/worktree";
-import { MockRelay } from "../mock-relay/server";
+import { MockRelay, verifyHello, type PairingRecord } from "../mock-relay/server";
+import { MockPairingServer } from "../mock-relay/pairing-server";
 
 const SCRATCH = "/private/tmp/claude-501/-Users-k-Desktop-sub-project-hugin-agent/500bdae6-f9cf-45b3-9e5b-a2819e8bcd4b/scratchpad/e2e-worktree";
 
@@ -855,8 +862,292 @@ async function scenarioZ(): Promise<void> {
   check("Z1 graceful stop() sends agent.draining before disconnect", sawDrain);
 }
 
+// ---------------------------------------------------------------------------
+// Track A — production auth: real Ed25519 device-key signer ⇄ verifying relay.
+// ---------------------------------------------------------------------------
+
+/** Set up a real keychain-style signer over an in-memory seed store (CI-safe:
+ *  no OS keychain) + the pairing record the relay verifies it against. */
+async function makeAuthPair(keyId: string, agentId: string, tenantId: string, serverUrl: string, recordTenantId = tenantId) {
+  const store = memorySeedStore();
+  const dk = newDeviceKey();
+  await store.set(keyId, dk.seed);
+  const signer = await keychainSigner(keyId, store);
+  const origin = canonicalizeServerOrigin(serverUrl);
+  const record: PairingRecord = {
+    agentId,
+    keyId,
+    publicKeyHex: dk.publicRaw.toString("hex"),
+    tenantId: recordTenantId,
+    serverOrigin: origin ?? "ORIGIN_NON_CANONICAL",
+  };
+  return { signer, record, originOk: origin !== null };
+}
+
+/** Track A positive (live): a real keychain-style Ed25519 signer completes a
+ *  handshake the relay actually VERIFIES against the registered public key. */
+async function scenarioAA(): Promise<void> {
+  let accepts = 0;
+  let rejectCode: string | null = null;
+  const relay = new MockRelay({
+    onAccept: () => { accepts++; },
+    onHandshakeReject: (code) => { rejectCode = code; },
+  });
+  const port = await relay.start();
+  const serverUrl = `ws://127.0.0.1:${port}`;
+  const { signer, record, originOk } = await makeAuthPair("key-aa", "agent-abc", "acme", serverUrl);
+  relay.setVerifyAuth(record);
+  const daemon = new Daemon(
+    loadConfig({ serverUrl, agentId: "agent-abc", keyId: "key-aa", tenantId: "acme", dbPath: ":memory:" }),
+    signer,
+    new FakeEngine({ events: [] }),
+  );
+  void daemon.start().catch(() => {});
+  const accepted = await waitUntil(() => accepts >= 1, 6000);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+  check("AA0 loopback server_origin canonicalizes", originOk);
+  check("AA1 real Ed25519 signer accepted by a VERIFYING relay", accepted && accepts >= 1);
+  check("AA2 no handshake rejection on the valid signature", rejectCode === null);
+}
+
+/** Track A negative (live): a tampered transcript field — the relay reconstructs
+ *  a DIFFERENT tenant_id than the daemon signed — must fail verification with
+ *  bad_signature, and the daemon must NOT be accepted (fail closed). */
+async function scenarioAB(): Promise<void> {
+  let accepts = 0;
+  let rejectCode: string | null = null;
+  const relay = new MockRelay({
+    onAccept: () => { accepts++; },
+    onHandshakeReject: (code) => { rejectCode = code; },
+  });
+  const port = await relay.start();
+  const serverUrl = `ws://127.0.0.1:${port}`;
+  // Daemon signs tenant "acme"; the relay's pairing record binds a DIFFERENT
+  // tenant — the reconstructed transcript diverges by one field.
+  const { signer, record } = await makeAuthPair("key-ab", "agent-abc", "acme", serverUrl, "acme-TAMPERED");
+  relay.setVerifyAuth(record);
+  const daemon = new Daemon(
+    loadConfig({ serverUrl, agentId: "agent-abc", keyId: "key-ab", tenantId: "acme", dbPath: ":memory:" }),
+    signer,
+    new FakeEngine({ events: [] }),
+  );
+  void daemon.start().catch(() => {});
+  const rejected = await waitUntil(() => rejectCode !== null, 6000);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+  check("AB1 tampered transcript field → relay rejects bad_signature", rejected && rejectCode === "bad_signature");
+  check("AB2 daemon NOT accepted on a failed signature (fail closed)", accepts === 0);
+}
+
+interface BaselineVector {
+  label: string;
+  challenge_id: string;
+  nonce_base64url: string;
+  agent_id: string;
+  key_id: string;
+  protocol_version: string;
+  tenant_id: string;
+  canonical_server_origin: string;
+  ed25519_public_hex: string;
+  expected_signature_base64url: string;
+}
+
+function loadBaselineVector(): BaselineVector {
+  const vf = JSON.parse(readFileSync(new URL("../protocol/v1/test-vectors.json", import.meta.url), "utf8")) as {
+    positives: BaselineVector[];
+  };
+  const v = vf.positives.find((p) => p.label === "baseline");
+  if (!v) throw new Error("baseline positive vector missing from test-vectors.json");
+  return v;
+}
+
+function helloFromVector(v: BaselineVector, over: { signature?: string; agentId?: string } = {}) {
+  const m = parseMessage({
+    id: "m", ts: "2026-07-01T00:00:00.000Z", type: "hello",
+    protocol_version: v.protocol_version, agent_id: over.agentId ?? v.agent_id, agent_version: "0.0.0",
+    auth: { challenge_id: v.challenge_id, key_id: v.key_id, signature: over.signature ?? v.expected_signature_base64url, alg: "ed25519" },
+    os: { platform: "darwin", arch: "arm64" },
+    capabilities: { engines: { claude: { installed: true }, codex: { installed: false } }, project_roots: [] },
+    active_jobs: [], pending_results: [],
+  });
+  if (m.type !== "hello") throw new Error("helloFromVector did not build a hello");
+  return m;
+}
+
+/** Track A reference (deterministic): drive the relay's verifyHello directly with
+ *  the committed F4 vector (auth-pairing-spec §5) — the same transcript/signature
+ *  a Go/Rust relay uses. Positive verifies; each tampered input fails as stated. */
+function scenarioAC(): void {
+  const v = loadBaselineVector();
+  const issued = { challengeId: v.challenge_id, nonce: v.nonce_base64url };
+  const record: PairingRecord = {
+    agentId: v.agent_id, keyId: v.key_id, publicKeyHex: v.ed25519_public_hex,
+    tenantId: v.tenant_id, serverOrigin: v.canonical_server_origin,
+  };
+  check("AC1 committed baseline vector verifies (relay verifyHello)", verifyHello(helloFromVector(v), issued, record).ok);
+
+  const rTenant = verifyHello(helloFromVector(v), issued, { ...record, tenantId: "evil" });
+  check("AC2 tampered tenant_id → bad_signature", !rTenant.ok && rTenant.code === "bad_signature");
+
+  const rOrigin = verifyHello(helloFromVector(v), issued, { ...record, serverOrigin: "wss://evil.example.com" });
+  check("AC3 tampered server_origin → bad_signature", !rOrigin.ok && rOrigin.code === "bad_signature");
+
+  const otherNonce = Buffer.alloc(32, 0xab).toString("base64url");
+  const rNonce = verifyHello(helloFromVector(v), { challengeId: v.challenge_id, nonce: otherNonce }, record);
+  check("AC4 tampered nonce → bad_signature", !rNonce.ok && rNonce.code === "bad_signature");
+
+  const rAgent = verifyHello(helloFromVector(v, { agentId: "agent-x" }), issued, record);
+  check("AC5 unknown (agent_id,key_id) → agent_unknown (before curve check)", !rAgent.ok && rAgent.code === "agent_unknown");
+
+  const badSig = (v.expected_signature_base64url[0] === "A" ? "B" : "A") + v.expected_signature_base64url.slice(1);
+  const rSig = verifyHello(helloFromVector(v, { signature: badSig }), issued, record);
+  check("AC6 corrupted signature → bad_signature", !rSig.ok && rSig.code === "bad_signature");
+
+  // record-level validation: the verifier never binds a non-canonical origin or
+  // invalid tenant from a misconfigured pairing record (rejects, never normalizes).
+  const rBadOrigin = verifyHello(helloFromVector(v), issued, { ...record, serverOrigin: "wss://relay.example.com/" });
+  check("AC7 non-canonical record server_origin → agent_unknown (record validated)", !rBadOrigin.ok && rBadOrigin.code === "agent_unknown");
+  const rBadTenant = verifyHello(helloFromVector(v), issued, { ...record, tenantId: "bad tenant!" });
+  check("AC8 invalid record tenant_id → agent_unknown (record validated)", !rBadTenant.ok && rBadTenant.code === "agent_unknown");
+}
+
+/** Track A OS-keychain round-trip (guarded): exercise the REAL keychain via
+ *  @napi-rs/keyring — generate → store → keychainSigner loads + signs → verify →
+ *  delete. SKIPPED (not failed) where no OS keychain is present (CI). */
+async function scenarioAD(): Promise<void> {
+  const service = "com.contextualai.hugin-agent.e2e";
+  const keyId = `e2e-${process.pid}-${Date.now()}`; // Date.now is fine in the e2e script
+  const store = keychainSeedStore(service);
+  const dk = newDeviceKey();
+  let available = true;
+  try {
+    await store.set(keyId, dk.seed);
+    if ((await store.get(keyId)) === null) available = false;
+  } catch {
+    available = false;
+  }
+  if (!available) {
+    console.log("⚠ AD keychain round-trip SKIPPED (no OS keychain in this environment)");
+    return;
+  }
+  try {
+    const signer = await keychainSigner(keyId, store);
+    const t = buildTranscript({
+      challenge_id: "ch-ad", nonce_raw: Buffer.alloc(32, 0x11), agent_id: "agent-ad",
+      key_id: keyId, protocol_version: "1.0.0", tenant_id: "acme", server_origin: "wss://relay.example.com",
+    });
+    check("AD1 keychain-loaded signer verifies against its public key", verifyTranscript(dk.publicRaw, t, signer.sign(t)));
+  } finally {
+    await store.delete(keyId); // always clean up the e2e keychain entry
+  }
+  check("AD2 keychain entry deleted after cleanup", (await store.get(keyId)) === null);
+}
+
+/** Track A pairing (auth-pairing-spec §3): the connect flow persists
+ *  agent_id/key_id/tenant_id + serverUrl to the config file and the device seed
+ *  to the (injected) store — and the PRIVATE key NEVER crosses the wire (only the
+ *  public key is registered). In-memory seed store keeps it CI-safe. */
+async function scenarioAE(): Promise<void> {
+  const cfgDir = join(SCRATCH, "pairing");
+  rmSync(cfgDir, { recursive: true, force: true });
+  const cfgPath = join(cfgDir, "config.json");
+  const relayUrl = "ws://127.0.0.1:34567"; // canonical loopback origin the daemon would dial
+  const pairing = new MockPairingServer({
+    relayUrl, agentId: "agent-mint-01", keyId: "key-mint-01", tenantId: "acme", userId: "user-42", pendingPolls: 1,
+  });
+  await pairing.start();
+  const store = memorySeedStore();
+  const res = await connect({
+    serverUrl: pairing.baseUrl(),
+    seedStore: store,
+    configPath: cfgPath,
+    sleepImpl: () => Promise.resolve(), // no real poll delay under test
+    onUserCode: () => {},
+  });
+  await pairing.stop();
+
+  const cfg = readPairingConfig(cfgPath);
+  check(
+    "AE1 pairing persists agent_id/key_id/tenant_id + serverUrl (config file)",
+    cfg?.agentId === "agent-mint-01" &&
+      cfg?.keyId === "key-mint-01" &&
+      cfg?.tenantId === "acme" &&
+      cfg?.serverUrl === relayUrl &&
+      res.serverUrl === relayUrl,
+  );
+
+  const seed = await store.get("key-mint-01");
+  const pubB64u = seed ? deriveKeypairFromSeed(seed).publicRaw.toString("base64url") : "NONE";
+  check(
+    "AE2 device seed stored under the minted key_id; its public key is the one registered",
+    seed?.length === 32 && pairing.registeredPublicKeys.length === 1 && pairing.registeredPublicKeys[0] === pubB64u,
+  );
+
+  // The private key (seed) must NEVER appear in any request body — only the public key.
+  const seedB64u = seed ? seed.toString("base64url") : "SEED_ABSENT";
+  const leaked = pairing.requestBodies.some((b) => b.includes(seedB64u));
+  const publicSent = pairing.requestBodies.some((b) => b.includes(pubB64u));
+  check("AE3 private key never on the wire (public key sent; seed absent from every body)", !leaked && publicSent);
+
+  rmSync(cfgDir, { recursive: true, force: true });
+}
+
+/** Track A robustness (Codex re-review): a duplicate `hello` on an ALREADY-
+ *  authenticated connection is ignored — no re-verify, no second hello.accepted.
+ *  (`validateInbound` permits handshake types post-auth, so the relay guards it;
+ *  cross-connection replay is separately defeated by the per-connection nonce.) */
+async function scenarioAF(): Promise<void> {
+  let accepts = 0;
+  const relay = new MockRelay({ onAccept: () => { accepts++; } });
+  const port = await relay.start();
+  const serverUrl = `ws://127.0.0.1:${port}`;
+  const client = new RelayClient();
+  await client.connect(serverUrl);
+  const config = loadConfig({ serverUrl, agentId: "agent-af", dbPath: ":memory:" });
+  await performHandshake(client, config, devSigner("key-af"), { activeJobs: [], pendingResults: [] });
+  await waitUntil(() => accepts >= 1, 3000);
+  // Re-send a hello on the SAME authed socket — must NOT be re-accepted.
+  client.send(
+    parseMessage({
+      id: "m-dup", ts: "2026-07-01T00:00:00.000Z", type: "hello",
+      protocol_version: PROTOCOL_VERSION, agent_id: "agent-af", agent_version: "0.0.0",
+      auth: { challenge_id: "ch-dup", key_id: "key-af", signature: "A".repeat(86), alg: "ed25519" },
+      os: { platform: "darwin", arch: "arm64" },
+      capabilities: { engines: { claude: { installed: true }, codex: { installed: false } }, project_roots: [] },
+      active_jobs: [], pending_results: [],
+    }),
+  );
+  await sleep(250);
+  client.close();
+  await relay.stop();
+  await sleep(50);
+  check("AF1 duplicate post-auth hello ignored (exactly one accept)", accepts === 1);
+}
+
+/** Track A handshake integrity (Codex final review): a `hello.accepted` the relay
+ *  sends BEFORE the daemon's signed hello is DISCARDED — the handshake completes
+ *  only on the real post-hello accept (armForAccept), never a premature/replayed
+ *  one. The mock sends a premature accept{epoch:999}; the real post-hello accept
+ *  carries epoch 1, so completing at 1 proves the premature one was dropped. */
+async function scenarioAG(): Promise<void> {
+  const relay = new MockRelay({ prematureAcceptEpoch: 999 });
+  const port = await relay.start();
+  const serverUrl = `ws://127.0.0.1:${port}`;
+  const client = new RelayClient();
+  await client.connect(serverUrl);
+  const config = loadConfig({ serverUrl, agentId: "agent-ag", dbPath: ":memory:" });
+  const hs = await performHandshake(client, config, devSigner("key-ag"), { activeJobs: [], pendingResults: [] });
+  client.close();
+  await relay.stop();
+  await sleep(50);
+  check("AG1 premature hello.accepted discarded — handshake used the post-hello accept", hs.connectionEpoch === 1);
+}
+
 async function main(): Promise<void> {
-  console.log("=== hugind P1+P2a e2e ===\n[scenario A: live handshake + heartbeat + reconnect]");
+  console.log("=== hugind e2e (P1–P5 + Track A auth) ===\n[scenario A: live handshake + heartbeat + reconnect]");
   await scenarioA();
   console.log("\n[scenario B: framing + epoch gate]");
   scenarioB();
@@ -906,6 +1197,20 @@ async function main(): Promise<void> {
   await scenarioY();
   console.log("\n[scenario Z: graceful drain on stop]");
   await scenarioZ();
+  console.log("\n[scenario AA: Track A live positive — verifying relay accepts real signer]");
+  await scenarioAA();
+  console.log("\n[scenario AB: Track A live negative — tampered transcript → bad_signature]");
+  await scenarioAB();
+  console.log("\n[scenario AC: Track A relay verifyHello vs committed F4 vectors]");
+  scenarioAC();
+  console.log("\n[scenario AD: Track A OS-keychain round-trip (guarded)]");
+  await scenarioAD();
+  console.log("\n[scenario AE: Track A device pairing — persist config + seed off-wire]");
+  await scenarioAE();
+  console.log("\n[scenario AF: Track A duplicate post-auth hello ignored]");
+  await scenarioAF();
+  console.log("\n[scenario AG: Track A premature hello.accepted discarded]");
+  await scenarioAG();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }

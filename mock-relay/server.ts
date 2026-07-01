@@ -9,9 +9,92 @@ import { randomBytes } from "node:crypto";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
 import { LIMITS, type Message, PROTOCOL_VERSION } from "../protocol/v1/index";
 import { resultDigest } from "../protocol/v1/digest";
+import { buildTranscript } from "../protocol/v1/transcript";
+import { verifyTranscript } from "../protocol/v1/ed25519";
+import { canonicalizeServerOrigin, validateTenantId } from "../protocol/v1/origin";
 import { decodeInbound } from "../src/conn/framing";
 import { messageId } from "../src/util/ids";
 import { log } from "../src/log";
+
+/**
+ * A pairing record the relay resolves `(agent_id, key_id)` → registered public
+ * key against (auth-pairing-spec §2/§3). `tenant_id` and `server_origin` are the
+ * OFF-WIRE values the verifier reconstructs from the record + trusted connection
+ * metadata — never from `hello` — and binds into the transcript (§5). The mock
+ * holds a single record; a real relay looks it up per connection.
+ */
+export interface PairingRecord {
+  agentId: string;
+  keyId: string;
+  /** Registered raw 32-byte Ed25519 public key, hex-encoded. */
+  publicKeyHex: string;
+  tenantId: string;
+  /** Canonical server_origin the verifier binds (see canonicalizeServerOrigin). */
+  serverOrigin: string;
+}
+
+export type HandshakeRejectCode = "expired_challenge" | "agent_unknown" | "bad_signature";
+export type VerifyResult = { ok: true } | { ok: false; code: HandshakeRejectCode; message: string };
+
+/**
+ * Verify a `hello` possession proof (auth-pairing-spec §4 server steps + §5).
+ * Pure + exported so an e2e can drive it against the committed F4 vectors.
+ *
+ * The verifier reconstructs the transcript from TRUSTED values only: the nonce +
+ * challenge_id IT issued, the pairing record's `tenant_id`/`server_origin`, and
+ * the agent-supplied `agent_id`/`key_id`/`protocol_version` (each pinned to the
+ * record / the exact hello value). `tenant_id` and `server_origin` are NEVER read
+ * from `hello`. Any field mismatch ⇒ the signature fails ⇒ `bad_signature`.
+ */
+export function verifyHello(
+  hello: Extract<Message, { type: "hello" }>,
+  issued: { challengeId: string; nonce: string },
+  record: PairingRecord,
+): VerifyResult {
+  // 0. The pairing record is trusted config, but the verifier NEVER binds a
+  //    non-canonical origin or an invalid tenant into the transcript (auth-spec §5
+  //    "rejects non-canonical input — never silently normalizes"). A malformed
+  //    record is a relay misconfiguration → reject, don't sign off on ambiguous
+  //    bytes a differently-canonicalizing client might reproduce.
+  if (!validateTenantId(record.tenantId) || canonicalizeServerOrigin(record.serverOrigin) !== record.serverOrigin) {
+    return { ok: false, code: "agent_unknown", message: "pairing record has an invalid tenant_id or non-canonical server_origin" };
+  }
+  // 1. Resolve the nonce by the echoed challenge_id — a mismatch means we never
+  //    issued it (or it is stale): treat as an expired/unknown challenge. Replay
+  //    is additionally defeated structurally: each connection issues a FRESH
+  //    nonce and we reconstruct with the nonce WE issued (not one from `hello`),
+  //    so a captured `hello` replayed on a new connection fails the signature.
+  //    Cross-connection single-use + TTL is the cloud's linearizable store
+  //    (auth-spec §6), out of this mock's scope.
+  if (hello.auth.challenge_id !== issued.challengeId) {
+    return { ok: false, code: "expired_challenge", message: "unknown or expired challenge_id" };
+  }
+  // 2. Resolve (agent_id, key_id) → registered public key. The key_id in the
+  //    transcript MUST equal hello.auth.key_id and be registered to this agent.
+  if (hello.agent_id !== record.agentId || hello.auth.key_id !== record.keyId) {
+    return { ok: false, code: "agent_unknown", message: "no registered key for (agent_id, key_id)" };
+  }
+  const publicRaw = Buffer.from(record.publicKeyHex, "hex");
+  if (publicRaw.length !== 32) {
+    return { ok: false, code: "agent_unknown", message: "registered public key is not 32 bytes" };
+  }
+  // 3. Recompute the canonical transcript and verify the Ed25519 signature. The
+  //    protocol_version bound is the EXACT hello value (never a negotiated one);
+  //    tenant_id + server_origin come from the record, not the wire.
+  const transcript = buildTranscript({
+    challenge_id: issued.challengeId,
+    nonce_raw: Buffer.from(issued.nonce, "base64url"),
+    agent_id: hello.agent_id,
+    key_id: hello.auth.key_id,
+    protocol_version: hello.protocol_version,
+    tenant_id: record.tenantId,
+    server_origin: record.serverOrigin,
+  });
+  if (!verifyTranscript(publicRaw, transcript, hello.auth.signature)) {
+    return { ok: false, code: "bad_signature", message: "Ed25519 signature does not verify over the transcript" };
+  }
+  return { ok: true };
+}
 
 export interface AcceptCtx {
   ws: WebSocket;
@@ -54,6 +137,17 @@ export interface MockRelayOpts {
   /** Send the challenge but never `hello.accepted` — stalls the handshake (tests
    *  stop() during the pre-auth window). */
   stallHandshake?: boolean;
+  /** When set, the relay VERIFIES the `hello` Ed25519 possession proof against
+   *  this pairing record (auth-pairing-spec §4/§5) and replies `hello.rejected`
+   *  with the failure code on mismatch. Unset ⇒ accept any signature (the
+   *  non-auth default the pre-Track-A scenarios rely on). */
+  verifyAuth?: PairingRecord;
+  /** Called with the reject code when a VERIFIED handshake is refused. */
+  onHandshakeReject?: (code: HandshakeRejectCode) => void;
+  /** When set, send a `hello.accepted` carrying THIS epoch immediately after the
+   *  challenge — BEFORE any `hello` — to exercise the daemon discarding a premature
+   *  accept (it must complete only on a post-`hello` accept). */
+  prematureAcceptEpoch?: number;
 }
 
 export interface AssignSpec {
@@ -77,8 +171,17 @@ export class MockRelay {
   private wss: WebSocketServer | null = null;
   private epoch = 0;
   port = 0;
+  private verifyRecord: PairingRecord | null;
 
-  constructor(private readonly opts: MockRelayOpts = {}) {}
+  constructor(private readonly opts: MockRelayOpts = {}) {
+    this.verifyRecord = opts.verifyAuth ?? null;
+  }
+
+  /** Register/replace the pairing record the relay verifies `hello` against.
+   *  Used by e2e once the listen port (→ canonical server_origin) is known. */
+  setVerifyAuth(record: PairingRecord): void {
+    this.verifyRecord = record;
+  }
 
   start(port = 0): Promise<number> {
     return new Promise((resolve, reject) => {
@@ -102,15 +205,31 @@ export class MockRelay {
     let authed = false;
     const now = new Date().toISOString();
     const nonce = this.opts.nonce ?? randomBytes(32).toString("base64url");
+    const challengeId = `ch-${messageId()}`;
     this.send(ws, {
       id: messageId(),
       ts: now,
       type: "auth.challenge",
-      challenge_id: `ch-${messageId()}`,
+      challenge_id: challengeId,
       nonce,
       server_time: now,
       challenge_ttl_ms: LIMITS.CHALLENGE_TTL_MS,
     });
+
+    // Optional attack probe: a hello.accepted BEFORE the daemon sends its hello.
+    // A hardened client discards it (armForAccept), completing only on the real
+    // post-hello accept below.
+    if (this.opts.prematureAcceptEpoch !== undefined) {
+      this.send(ws, {
+        id: messageId(),
+        ts: new Date().toISOString(),
+        type: "hello.accepted",
+        negotiated_version: PROTOCOL_VERSION,
+        connection_epoch: this.opts.prematureAcceptEpoch,
+        heartbeat_interval_ms: this.opts.heartbeatIntervalMs ?? LIMITS.HEARTBEAT_INTERVAL_MS,
+        resume: [],
+      });
+    }
 
     ws.on("message", (data: RawData) => {
       // Same single framing choke point as the daemon (plan §5.1): size → schema
@@ -125,6 +244,41 @@ export class MockRelay {
         return; // never send hello.accepted → handshake stalls
       }
       if (m.type === "hello") {
+        // A second `hello` on an already-authenticated connection is a protocol
+        // violation — ignore it (no re-verify, no second hello.accepted, no epoch
+        // bump). `validateInbound` permits handshake types post-auth (it only
+        // gates NON-handshake types pre-auth), so this phase guard lives here.
+        // Cross-connection replay is separately defeated by the per-connection
+        // fresh nonce (see verifyHello).
+        if (authed) {
+          log.warn("[mock] ignoring duplicate hello on an already-authenticated connection");
+          return;
+        }
+        // Track A: verify the Ed25519 possession proof before accepting. No
+        // record preserves the non-auth default (accept any signature).
+        const record = this.verifyRecord;
+        if (record) {
+          const res = verifyHello(m, { challengeId, nonce }, record);
+          if (!res.ok) {
+            log.warn("[mock] hello rejected", { code: res.code, reason: res.message });
+            this.send(ws, {
+              id: messageId(),
+              ts: new Date().toISOString(),
+              type: "hello.rejected",
+              code: res.code,
+              message: res.message,
+            });
+            this.opts.onHandshakeReject?.(res.code);
+            return; // fail closed: no epoch, no accept
+          }
+        } else {
+          // No pairing record → NON-AUTH test mode: accept any signature (the
+          // pre-Track-A transport/job scenarios rely on this). Emitted LOUDLY so a
+          // test that meant to exercise auth but forgot setVerifyAuth() is visible
+          // — not a silent fail-open. The production verifier is the cloud relay,
+          // which always verifies; this mock is not a security boundary.
+          log.warn("[mock] accepting hello WITHOUT signature verification (non-auth test mode — set verifyAuth to verify)");
+        }
         const epoch = this.opts.forceEpoch ?? ++this.epoch;
         this.send(ws, {
           id: messageId(),

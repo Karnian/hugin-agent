@@ -21,63 +21,18 @@
  *              || LP("ed25519") || LP(tenant_id) || LP(server_origin)
  */
 
-import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:crypto";
-// `createPublicKey` is used by publicKeyFromRaw (SPKI DER input — type-safe).
+import { sign } from "node:crypto";
 import { realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "./messages";
 import { ALG, DOMAIN_TAG, buildTranscript, lp } from "./transcript";
+import { b64u, deriveKeypairFromSeed } from "./ed25519";
 import { canonicalizeServerOrigin, validateTenantId } from "./origin";
 
-// ---------------------------------------------------------------------------
-// Byte helpers
-// ---------------------------------------------------------------------------
-
-/** Unpadded base64url (Node's "base64url" omits `=`). */
-export function b64u(buf: Buffer): string {
-  return buf.toString("base64url");
-}
-
-// ---------------------------------------------------------------------------
-// Ed25519 key derivation from a FIXED seed (reproducible vectors)
-// ---------------------------------------------------------------------------
-
-/** PKCS8 v0 wrapper for an Ed25519 private key (RFC 8410): the 16-byte prefix
- *  precedes the raw 32-byte seed → a 48-byte DER that Node imports directly. */
-const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
-/** SPKI wrapper for an Ed25519 public key: 12-byte prefix + raw 32-byte key. */
-const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
-
-export interface Keypair {
-  privateKey: KeyObject;
-  publicKey: KeyObject;
-  /** Raw 32-byte public key. */
-  publicRaw: Buffer;
-}
-
-export function deriveKeypairFromSeed(seed: Buffer): Keypair {
-  if (seed.length !== 32) throw new Error(`Ed25519 seed must be 32 bytes, got ${seed.length}`);
-  const der = Buffer.concat([PKCS8_ED25519_PREFIX, seed]);
-  const privateKey = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
-  // The JWK `x` is the raw public key (base64url). Going via JWK avoids
-  // createPublicKey(KeyObject), which @types/node omits from its input union.
-  const jwk = privateKey.export({ format: "jwk" });
-  if (!jwk.x) throw new Error("Ed25519 private key JWK missing public component 'x'");
-  const publicRaw = Buffer.from(jwk.x, "base64url");
-  const publicKey = publicKeyFromRaw(publicRaw);
-  return { privateKey, publicKey, publicRaw };
-}
-
-/** Reconstruct an Ed25519 public KeyObject from its raw 32 bytes — the path a
- *  cross-language verifier takes (it has only the published `ed25519_public_hex`). */
-export function publicKeyFromRaw(publicRaw: Buffer): KeyObject {
-  if (publicRaw.length !== 32) throw new Error(`Ed25519 public key must be 32 bytes, got ${publicRaw.length}`);
-  const spki = Buffer.concat([SPKI_ED25519_PREFIX, publicRaw]);
-  return createPublicKey({ key: spki, format: "der", type: "spki" });
-}
-
-// server_origin canonicalization + tenant_id grammar live in ./origin (B9 —
-// shared contract code), imported above for use in the positive vectors.
+// Ed25519 key mechanics (deriveKeypairFromSeed, publicKeyFromRaw, b64u) live in
+// ./ed25519 — shared contract code so production signing/verification never
+// imports this test generator and the two can never drift. server_origin
+// canonicalization + tenant_id grammar live in ./origin (both imported above).
 
 // ---------------------------------------------------------------------------
 // Vector shapes

@@ -12,6 +12,7 @@
     "protocol:check": "tsx protocol/v1/selftest.ts",
     "spike:approval": "tsx spikes/approval-prompt-tool/run.ts",
     "hugind": "tsx src/index.ts",
+    "connect": "tsx src/connect.ts",
     "mock-relay": "tsx mock-relay/server.ts",
     "e2e": "tsx scripts/e2e.ts",
     "e2e:claude": "tsx scripts/e2e-claude.ts"
@@ -19,6 +20,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@napi-rs/keyring": "^1.3.0",
     "better-sqlite3": "^12.11.1",
     "ws": "^8.21.0",
     "zod": "^4.4.3"

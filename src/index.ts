@@ -12,7 +12,10 @@
 
 import { type Config, loadConfig } from "./config";
 import { Daemon } from "./daemon";
-import { devSigner } from "./conn/handshake";
+import type { Signer } from "./conn/handshake";
+import { keychainSigner } from "./auth/keystore";
+import { readPairingConfig } from "./auth/config-file";
+import { configFilePath } from "./auth/paths";
 import { ClaudeEngine } from "./engine/claude";
 import { buildIsolation, selfCheckLogin } from "./engine/isolate";
 import { log } from "./log";
@@ -23,18 +26,22 @@ function loadConfigOrExit(): Config {
       .map((s) => s.trim())
       .filter(Boolean) ?? [];
   try {
+    // Persisted pairing identity (`hugin-agent connect`) is the baseline; each
+    // HUGIND_* env var overrides its field (tests / custom installs). A malformed
+    // config file throws here → fail closed rather than run half-paired.
+    const paired = readPairingConfig(configFilePath());
     return loadConfig({
-      serverUrl: process.env.HUGIND_SERVER_URL,
-      agentId: process.env.HUGIND_AGENT_ID,
-      keyId: process.env.HUGIND_KEY_ID,
-      tenantId: process.env.HUGIND_TENANT_ID,
+      serverUrl: process.env.HUGIND_SERVER_URL ?? paired?.serverUrl,
+      agentId: process.env.HUGIND_AGENT_ID ?? paired?.agentId,
+      keyId: process.env.HUGIND_KEY_ID ?? paired?.keyId,
+      tenantId: process.env.HUGIND_TENANT_ID ?? paired?.tenantId,
       agentVersion: process.env.HUGIND_AGENT_VERSION,
       projectRoots: roots,
       stateDir: process.env.HUGIND_STATE_DIR,
       engineCommand: process.env.HUGIND_ENGINE_CMD,
     });
   } catch (e) {
-    log.error("invalid config (set HUGIND_SERVER_URL + HUGIND_AGENT_ID at minimum)", {
+    log.error("invalid config — pair with `hugin-agent connect`, or set HUGIND_SERVER_URL + HUGIND_AGENT_ID", {
       err: String(e),
     });
     process.exit(1);
@@ -78,7 +85,19 @@ async function main(): Promise<void> {
     stateDir: config.stateDir,
     timeoutMs: 3_600_000,
   });
-  const daemon = new Daemon(config, devSigner(config.keyId), engine, gateAvailable);
+  // Production device-key signer (auth-pairing-spec §2): loads the keychain seed
+  // for key_id and signs the handshake transcript — the transcript bytes +
+  // performHandshake caller are unchanged (only the key source is). No paired key
+  // → fail closed: an unpaired daemon cannot connect (run `hugin-agent connect`).
+  let signer: Signer;
+  try {
+    signer = await keychainSigner(config.keyId);
+  } catch (e) {
+    log.error("no device key in the OS keychain — run `hugin-agent connect` to pair this device", { err: String(e) });
+    process.exit(1);
+  }
+
+  const daemon = new Daemon(config, signer, engine, gateAvailable);
   const shutdown = () => {
     log.info("signal received — shutting down");
     daemon.stop();

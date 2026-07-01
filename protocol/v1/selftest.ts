@@ -20,12 +20,8 @@ import {
   parseMessage,
   validateInbound,
 } from "./index";
-import {
-  b64u,
-  deriveKeypairFromSeed,
-  publicKeyFromRaw,
-  type VectorsFile,
-} from "./gen-vectors";
+import { type VectorsFile } from "./gen-vectors";
+import { b64u, deriveKeypairFromSeed, publicKeyFromRaw } from "./ed25519";
 import { ALG, DOMAIN_TAG, buildTranscript, lp } from "./transcript";
 import { canonicalizeServerOrigin, validateTenantId } from "./origin";
 import { jcsCanonicalize, resultDigest } from "./digest";

@@ -29,6 +29,11 @@ interface Waiter {
 export class RelayClient {
   private ws: WebSocket | null = null;
   private authed = false;
+  /** Set once the signed `hello` has been sent. A `hello.accepted` that arrives
+   *  BEFORE this is a protocol violation (an accept can't precede the possession
+   *  proof it accepts) and is discarded — so a premature/replayed accept can't be
+   *  consumed by the post-hello `waitFor`. Defense-in-depth atop TLS relay auth. */
+  private armedForAccept = false;
   private pending: Message[] = [];
   private waiters: Waiter[] = [];
   private messageHandlers = new Set<(m: Message) => void>();
@@ -49,11 +54,20 @@ export class RelayClient {
           log.warn("inbound rejected", { code: res.code, reason: res.reason });
           return;
         }
-        // The phase flip on hello.accepted MUST be synchronous: the relay may send
-        // hello.accepted and job.assign in one read, and ws emits both 'message'
-        // events in the same tick — the job.assign is decoded before any handshake
-        // microtask could set the flag, so flip it here before decoding the next.
-        if (res.msg.type === "hello.accepted") this.authed = true;
+        if (res.msg.type === "hello.accepted") {
+          // Only valid once we've sent our signed hello (armForAccept). An accept
+          // received before that is discarded — it can't accept a possession proof
+          // we hadn't sent, and must not be consumable by the post-hello waitFor.
+          if (!this.armedForAccept) {
+            log.warn("discarding premature hello.accepted (arrived before hello sent)");
+            return;
+          }
+          // The phase flip MUST be synchronous: the relay may send hello.accepted
+          // and job.assign in one read, and ws emits both 'message' events in the
+          // same tick — the job.assign is decoded before any handshake microtask
+          // could set the flag, so flip it here before decoding the next.
+          this.authed = true;
+        }
         this.deliver(res.msg);
       });
       ws.on("error", (err) => {
@@ -93,6 +107,12 @@ export class RelayClient {
 
   setAuthed(b: boolean): void {
     this.authed = b;
+  }
+
+  /** Arm the client to accept a `hello.accepted`. The handshake calls this right
+   *  after sending the signed `hello`: any accept received earlier is discarded. */
+  armForAccept(): void {
+    this.armedForAccept = true;
   }
 
   send(msg: Message): void {

@@ -101,6 +101,10 @@ export async function performHandshake(
     pending_results: resume.pendingResults,
   };
   client.send(hello);
+  // Only now is a hello.accepted valid — it must follow our signed hello. Arming
+  // AFTER the send makes the client discard any accept the relay sent BEFORE the
+  // possession proof, so the waitFor below can only resolve on a post-hello accept.
+  client.armForAccept();
 
   const reply = await client.waitFor(
     (m) => m.type === "hello.accepted" || m.type === "hello.rejected",

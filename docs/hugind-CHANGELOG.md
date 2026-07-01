@@ -4,6 +4,31 @@ The daemon, built against the frozen wire protocol `v1.0.0` + a mock relay, phas
 by phase ([hugind-mvp-plan.md](hugind-mvp-plan.md) §6). Each phase gated on
 `npm run typecheck` + `npm run e2e` + a Codex cross-review (looped to zero issues).
 
+## Track A — production auth (device-key signer + pairing + relay verify)
+Real Ed25519 device key replaces the dev stub signer, security surface per
+[auth-pairing-spec.md](auth-pairing-spec.md). `protocol/v1/ed25519.ts` — shared
+seed→key + `signTranscript`/`verifyTranscript`, extracted from `gen-vectors.ts` so
+the signer, relay verifier, F4 vectors, and selftest can't drift (vectors stay
+byte-identical). `src/auth/keystore.ts` holds the 32-byte seed in the OS keychain
+(`@napi-rs/keyring`, lazy-imported) and `keychainSigner(keyId)` signs the SAME
+frozen transcript — the `performHandshake` caller is unchanged (only the key
+source is). `hugin-agent connect` device-code pairing
+(`src/auth/{connect,config-file,paths}.ts` + `src/connect.ts`) mints
+`agent_id`/`key_id`/`tenant_id`, registers the PUBLIC key, and persists non-secret
+config; the private key never leaves the host. The mock relay now VERIFIES the
+possession proof (`verifyHello`, reconstructing the transcript per auth-spec §5 —
+`tenant_id`/`server_origin` off-wire from the pairing record) instead of accepting
+any signature; a duplicate `hello` post-auth is ignored. Handshake hardening
+(`conn/client.ts`): a `hello.accepted` that arrives BEFORE the signed `hello` is
+discarded (`armForAccept`), so a premature/replayed accept can't complete the
+handshake. `index.ts` loads the pairing config + keychain signer, fail-closed when
+unpaired. Wire unchanged (`v1.0.0` frozen); `protocol:check` green (F4 vectors
+byte-identical). e2e AA (verify accepts a real signer) / AB (tampered transcript →
+`bad_signature`, not accepted) / AC1–8 (`verifyHello` vs committed F4 vectors +
+record validation) / AD (OS-keychain round-trip, guarded) / AE (pairing persists
+config + seed off-wire) / AF (duplicate post-auth `hello` ignored) / AG (premature
+`hello.accepted` discarded). Codex cross-reviewed (4 rounds) → CLEAN.
+
 ## P5 — packaging + completeness
 Graceful drain (`agent.draining` on `stop()`); mock-relay `onJobStatus`/`onDraining`/
 `stallHandshake` hooks; `service/` skeleton (launchd + systemd + install README);

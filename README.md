@@ -24,11 +24,17 @@ ever opened.**
   fail-closed policy** are implemented and tested at the manager/protocol level
   with a fake engine — the **live Claude permission bridge is deferred**, so the
   daemon currently **fails closed** on write/exec jobs (see below).
-- **Deferred** (each explicitly scoped): production auth (dev stub signer →
-  OS-keychain Ed25519 + device-code pairing); the real MCP permission bridge for
-  the live approval gate (needs env-based CLI auth under isolation — see
-  [`src/engine/isolate.ts`](src/engine/isolate.ts)); P5 service packaging is a
-  skeleton under [`service/`](service/README.md).
+- **Production auth (Track A) — built + tested.** A real Ed25519 device key in the
+  OS keychain (`@napi-rs/keyring`) signs the frozen handshake transcript
+  (`keychainSigner`, drop-in for the dev stub); `hugin-agent connect` runs a
+  device-code pairing that mints `agent_id`/`key_id`/`tenant_id` and registers the
+  **public** key — the private key never leaves the host. The mock relay now
+  **verifies** the Ed25519 possession proof (`npm run e2e` scenarios AA–AE).
+  Security surface: [`docs/auth-pairing-spec.md`](docs/auth-pairing-spec.md).
+- **Deferred** (each explicitly scoped): the real MCP permission bridge for the
+  live approval gate (needs env-based CLI auth under isolation — see
+  [`src/engine/isolate.ts`](src/engine/isolate.ts)); cloud integration against the
+  real relay; P5 service packaging is a skeleton under [`service/`](service/README.md).
 
 ## Architecture
 
@@ -56,14 +62,20 @@ npm run typecheck        # type-check protocol + daemon
 npm run protocol:check   # validate every protocol message + F4 vectors
 npm run e2e              # daemon ⇄ mock relay, fake engine (CI-safe, no cloud/claude)
 npm run e2e:claude       # real-CLI adapter check (needs `claude` installed + logged in)
-npm run hugind           # run the daemon (config via env — see below)
+npm run connect -- --server <url>   # pair this device (device key → OS keychain); first run only
+npm run hugind           # run the daemon (paired config, or env override — see below)
 npm run mock-relay       # a standalone mock relay
 ```
 
 ## Configure (env — [`src/config.ts`](src/config.ts))
 
-`HUGIND_SERVER_URL` + `HUGIND_AGENT_ID` are required; the rest default. To run it
-supervised (launchd / systemd), see [`service/`](service/README.md).
+After pairing (`npm run connect -- --server <url>`), the daemon reads its identity
+from the persisted config (`~/.config/hugin-agent/config.json` — non-secret:
+`agent_id`/`key_id`/`tenant_id`/serverUrl; the device private key stays in the OS
+keychain) and needs no env vars. Without a paired key (and no env override) it
+**fails closed** and won't connect. `HUGIND_*` env vars override individual
+persisted fields; `HUGIND_SERVER_URL` + `HUGIND_AGENT_ID` are the minimum to run
+unpaired. To run it supervised (launchd / systemd), see [`service/`](service/README.md).
 
 ```bash
 HUGIND_SERVER_URL=wss://relay.example.com \
