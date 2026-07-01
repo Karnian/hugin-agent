@@ -36,6 +36,16 @@ export interface HandshakeResult {
   negotiatedVersion: string;
   connectionEpoch: number;
   heartbeatIntervalMs: number;
+  /** Resume directives the server returned for our reported durable state. */
+  resume: Extract<Message, { type: "hello.accepted" }>["resume"];
+}
+
+type HelloMsg = Extract<Message, { type: "hello" }>;
+
+/** Durable state reported in `hello` so the server can issue resume directives. */
+export interface ResumeState {
+  activeJobs: HelloMsg["active_jobs"];
+  pendingResults: HelloMsg["pending_results"];
 }
 
 function nodePlatform(): "darwin" | "linux" | "win32" {
@@ -48,6 +58,7 @@ export async function performHandshake(
   client: RelayClient,
   config: Config,
   signer: Signer,
+  resume: ResumeState,
   timeoutMs = 10_000,
 ): Promise<HandshakeResult> {
   const challenge = (await client.waitFor((m) => m.type === "auth.challenge", timeoutMs)) as Extract<
@@ -86,8 +97,8 @@ export async function performHandshake(
       engines: { claude: { installed: true }, codex: { installed: false } },
       project_roots: config.projectRoots,
     },
-    active_jobs: [],
-    pending_results: [],
+    active_jobs: resume.activeJobs,
+    pending_results: resume.pendingResults,
   };
   client.send(hello);
 
@@ -105,5 +116,6 @@ export async function performHandshake(
     negotiatedVersion: accepted.negotiated_version,
     connectionEpoch: accepted.connection_epoch,
     heartbeatIntervalMs: accepted.heartbeat_interval_ms,
+    resume: accepted.resume,
   };
 }

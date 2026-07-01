@@ -50,22 +50,26 @@ async function main(): Promise<void> {
   // must fail closed (P3 wires the enforcement + the prompt bridge).
   const iso = buildIsolation(config.isolation, config.stateDir);
   let engineEnv = iso.env;
-  // The approval gate is usable only when isolation is active (empty-allow settings
-  // → the prompt fires) AND the login survived it. Otherwise fail closed.
-  let gateAvailable = false;
+  // Isolation-readiness diagnostic: does isolation preserve the login? (A login
+  // probe is necessary-but-not-sufficient — it does NOT prove the permission
+  // prompt fires; that needs the real MCP bridge, deferred.)
   if (iso.mode !== "none") {
     const login = await selfCheckLogin(iso.env, config.engineCommand);
     if (login.loggedIn) {
-      gateAvailable = true;
-      log.info("permission isolation active + login preserved — approval gate AVAILABLE", { mode: iso.mode });
+      log.info("isolation preserves login", { mode: iso.mode });
     } else {
-      log.warn("isolation dropped the login — falling back to host config; approval gate UNAVAILABLE (gated jobs fail closed)", { mode: iso.mode, detail: login.detail });
+      log.warn("isolation dropped the login — using host config", { mode: iso.mode, detail: login.detail });
       iso.cleanup();
       engineEnv = {};
     }
-  } else {
-    log.warn("isolation=none — approval gate UNAVAILABLE if the host allow-list is permissive; gated jobs fail closed");
   }
+  // The real approval-prompt bridge (claude --permission-prompt-tool ->
+  // onApprovalRequest) is NOT wired to ClaudeEngine yet (deferred with the
+  // isolation solve), so there is no LIVE gate for the real engine. Fail closed:
+  // gated jobs (write/exec or approval_policy != never) are rejected until the
+  // bridge lands. A login probe passing is not proof the gate fires.
+  const gateAvailable = false;
+  log.warn("approval gate not yet wired (real MCP bridge deferred) — gated jobs are rejected (fail closed); read_only+never jobs run");
 
   const engine = new ClaudeEngine({
     command: config.engineCommand,

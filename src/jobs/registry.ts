@@ -31,6 +31,10 @@ export interface JobState {
   fenced: boolean;
   /** In-flight approvals: request_id → auto-deny timer (approval_timeout). */
   approvalTimers: Map<string, ReturnType<typeof setTimeout>>;
+  /** Previous lease during a `lease.granted` rotation — accepted on inbound until
+   *  `leaseOverlapUntil` to avoid false-nacking in-flight messages. */
+  prevLease?: string;
+  leaseOverlapUntil?: number;
 }
 
 export class JobRegistry {

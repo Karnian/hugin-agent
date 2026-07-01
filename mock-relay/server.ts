@@ -44,6 +44,14 @@ export interface MockRelayOpts {
   autoApprove?: boolean;
   /** Decision for the auto-response (default "allow"). */
   approvalDecision?: "allow" | "deny";
+  /** Resume directives for a reconnecting daemon's `hello` (default: none). */
+  resumeFor?: (hello: Extract<Message, { type: "hello" }>) => Extract<Message, { type: "hello.accepted" }>["resume"];
+  /** Auto-send `job.result.ack` (default true). Set false to keep a result
+   *  pending across a reconnect (resend_result tests). */
+  autoAckResult?: boolean;
+  /** Send the challenge but never `hello.accepted` — stalls the handshake (tests
+   *  stop() during the pre-auth window). */
+  stallHandshake?: boolean;
 }
 
 export interface AssignSpec {
@@ -54,6 +62,7 @@ export interface AssignSpec {
   prompt?: string;
   repo_root?: string;
   sandbox?: "read_only" | "workspace_write" | "full";
+  approval_policy?: "never" | "on_request" | "on_write" | "always";
 }
 
 function toBuffer(data: RawData): Buffer {
@@ -110,6 +119,9 @@ export class MockRelay {
         return;
       }
       const m = res.msg;
+      if (m.type === "hello" && this.opts.stallHandshake) {
+        return; // never send hello.accepted → handshake stalls
+      }
       if (m.type === "hello") {
         const epoch = this.opts.forceEpoch ?? ++this.epoch;
         this.send(ws, {
@@ -119,7 +131,7 @@ export class MockRelay {
           negotiated_version: PROTOCOL_VERSION,
           connection_epoch: epoch,
           heartbeat_interval_ms: this.opts.heartbeatIntervalMs ?? LIMITS.HEARTBEAT_INTERVAL_MS,
-          resume: [],
+          resume: this.opts.resumeFor?.(m) ?? [],
         });
         authed = true;
         this.opts.onAccept?.({ ws, epoch, hello: m });
@@ -136,15 +148,17 @@ export class MockRelay {
         }
       } else if (m.type === "job.result") {
         this.opts.onResult?.(m);
-        this.send(ws, {
-          id: messageId(),
-          ts: new Date().toISOString(),
-          type: "job.result.ack",
-          job_id: m.job_id,
-          attempt_id: m.attempt_id,
-          lease_id: m.lease_id,
-          result_digest: resultDigest(m as unknown as Record<string, unknown>),
-        });
+        if (this.opts.autoAckResult !== false) {
+          this.send(ws, {
+            id: messageId(),
+            ts: new Date().toISOString(),
+            type: "job.result.ack",
+            job_id: m.job_id,
+            attempt_id: m.attempt_id,
+            lease_id: m.lease_id,
+            result_digest: resultDigest(m as unknown as Record<string, unknown>),
+          });
+        }
       } else if (m.type === "approval.request") {
         this.opts.onApprovalRequest?.(m);
         if (this.opts.autoApprove !== false) {
@@ -181,7 +195,7 @@ export class MockRelay {
       workspace: { repo_root: spec.repo_root ?? "/tmp/repo" },
       prompt: spec.prompt ?? "do the thing",
       sandbox: spec.sandbox ?? "read_only",
-      approval_policy: "on_write",
+      approval_policy: spec.approval_policy ?? "on_write",
       env_policy: { mode: "whitelist", allow: [] },
       network_policy: { mode: "off" },
       limits: { timeout_ms: 600_000, max_output_bytes: 5_000_000 },

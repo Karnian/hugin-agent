@@ -16,6 +16,7 @@ import { leaseMatches } from "./lease";
 import {
   type AttemptCtx,
   approvalRequestMsg,
+  envelope,
   jobAccept,
   jobReject,
   jobResultMsg,
@@ -31,6 +32,8 @@ type JobResultAck = Extract<Message, { type: "job.result.ack" }>;
 type JobCancel = Extract<Message, { type: "job.cancel" }>;
 type LeaseRevoke = Extract<Message, { type: "lease.revoke" }>;
 type ApprovalResponse = Extract<Message, { type: "approval.response" }>;
+type LeaseGranted = Extract<Message, { type: "lease.granted" }>;
+type ResumeDirectives = Extract<Message, { type: "hello.accepted" }>["resume"];
 
 export interface Caps {
   events: number;
@@ -95,10 +98,13 @@ export class JobManager {
       return;
     }
 
-    // Fail closed: without a usable approval gate (startup isolation self-check),
-    // refuse jobs that could write/execute — no ungated mutation on the host.
-    if (!this.gateAvailable && msg.sandbox !== "read_only") {
-      this.send(jobReject(ctx, "policy_violation", "approval gate unavailable — daemon fails closed on write/exec jobs"));
+    // Fail closed: a job needs the approval gate if it can write/execute
+    // (sandbox beyond read_only) OR declares an approval policy that expects
+    // gating (approval_policy !== "never") — the protocol treats sandbox +
+    // approval_policy together as the local-maximum policy. Without a usable
+    // gate, reject it. Only a read_only + never job is safe ungated.
+    if (!this.gateAvailable && (msg.sandbox !== "read_only" || msg.approval_policy !== "never")) {
+      this.send(jobReject(ctx, "policy_violation", "approval gate unavailable — daemon fails closed on gated jobs"));
       return;
     }
 
@@ -142,6 +148,7 @@ export class JobManager {
   /** Engine needs approval for a tool → forward as approval.request; auto-deny on
    *  timeout (late responses are then ignored). */
   private onApprovalRequest(state: JobState, req: ApprovalRequest): void {
+    if (state.fenced) return; // revoked/abandoned — do not emit or arm a timer
     const ctx: AttemptCtx = { job_id: state.job_id, attempt_id: state.attempt_id, lease_id: state.lease_id };
     this.send(
       approvalRequestMsg(ctx, {
@@ -164,7 +171,7 @@ export class JobManager {
   handleApprovalResponse(msg: ApprovalResponse): void {
     const state = this.registry.get(msg.attempt_id);
     if (!state) return;
-    if (!leaseMatches(state.lease_id, msg.lease_id)) {
+    if (!this.leaseOk(state, msg.attempt_id, msg.lease_id)) {
       log.warn("stale lease on approval.response", { attempt_id: msg.attempt_id });
       return;
     }
@@ -181,6 +188,72 @@ export class JobManager {
   private clearApprovals(state: JobState): void {
     for (const t of state.approvalTimers.values()) clearTimeout(t);
     state.approvalTimers.clear();
+  }
+
+  /** Apply `hello.accepted.resume[]` from the DURABLE store (engine-independent —
+   *  survives a connection drop or process restart). Resends stored event/result
+   *  payloads (dedup'd server-side by seq/event_id/digest). */
+  applyResume(directives: ResumeDirectives): void {
+    for (const d of directives) {
+      switch (d.action) {
+        case "resume_from": {
+          // Adopt the directive's lease as current (durable + live) so re-stamped
+          // resends AND subsequent live events/inbound acks all agree; a stored
+          // payload carries the lease it was first sent under (stale post-rotation).
+          if (d.lease_id) this.adoptLease(d.attempt_id, d.lease_id);
+          const payloads = this.store.eventsAfter(d.attempt_id, d.resume_after_seq ?? 0);
+          for (const p of payloads) {
+            const msg = JSON.parse(p) as Record<string, unknown>;
+            if (d.lease_id) msg.lease_id = d.lease_id;
+            Object.assign(msg, envelope());
+            this.send(msg as unknown as Message);
+          }
+          log.info("resume_from — resent events (re-stamped lease)", { attempt_id: d.attempt_id, count: payloads.length });
+          break;
+        }
+        case "resend_result": {
+          if (d.lease_id) this.adoptLease(d.attempt_id, d.lease_id);
+          const r = this.store.getResult(d.attempt_id);
+          if (r) {
+            const msg = JSON.parse(r.payload) as Record<string, unknown>;
+            const lease = d.lease_id ?? (msg.lease_id as string);
+            msg.lease_id = lease;
+            Object.assign(msg, envelope());
+            const payload = JSON.stringify(msg);
+            // The lease is in the digest (only id/ts are stripped), so persist the
+            // re-stamped lease + digest so the eventual result.ack matches on GC.
+            const digest = resultDigest(msg);
+            this.store.updateResult(d.attempt_id, lease, digest, payload);
+            this.send(msg as unknown as Message);
+            log.info("resend_result — resent result (re-stamped lease)", { attempt_id: d.attempt_id });
+          }
+          break;
+        }
+        case "ack_pending": {
+          this.store.deleteResult(d.attempt_id);
+          this.store.deleteAttempt(d.attempt_id);
+          this.registry.remove(d.attempt_id);
+          log.info("ack_pending — GC'd", { attempt_id: d.attempt_id });
+          break;
+        }
+        case "abandon": {
+          // Fence like revoke: suppress any late engine output before GC (a live
+          // run now survives on the daemon-level registry).
+          const state = this.registry.get(d.attempt_id);
+          if (state) {
+            state.fenced = true;
+            this.clearApprovals(state);
+            state.run?.cancel(0);
+            this.registry.remove(d.attempt_id);
+            this.startedAt.delete(d.attempt_id);
+          }
+          this.store.deleteResult(d.attempt_id);
+          this.store.deleteAttempt(d.attempt_id);
+          log.info("abandon — fenced + dropped attempt", { attempt_id: d.attempt_id });
+          break;
+        }
+      }
+    }
   }
 
   private onEvent(state: JobState, ev: EngineEvent): void {
@@ -254,16 +327,11 @@ export class JobManager {
   }
 
   handleStreamAck(msg: StreamAck): void {
-    const lease = this.leaseFor(msg.attempt_id);
-    if (lease === undefined) return; // unknown attempt
-    if (!leaseMatches(lease, msg.lease_id)) {
-      log.warn("stale lease on stream.ack", { attempt_id: msg.attempt_id });
-      return;
-    }
+    const state = this.registry.get(msg.attempt_id);
+    if (!this.leaseOk(state, msg.attempt_id, msg.lease_id)) return; // unknown or stale
     // GC even if the registry entry is already gone (a late ack after terminal),
     // so durable events don't stay pinned against the per-connection byte cap.
     this.store.ackEvents(msg.attempt_id, msg.ack_seq);
-    const state = this.registry.get(msg.attempt_id);
     if (state?.paused && !this.overCap(state)) {
       state.paused = false;
       state.run?.resume();
@@ -273,16 +341,12 @@ export class JobManager {
 
   handleResultAck(msg: JobResultAck): void {
     // Lease-check via the store too: `onDone` removes the registry entry at
-    // terminal, so in the normal flow the registry always misses here — but the
-    // pending result's lease still lives on the durable AttemptRow. A digest is
-    // NOT a capability token, so it must not authorize GC on its own.
-    const lease = this.leaseFor(msg.attempt_id);
-    if (lease === undefined) {
-      log.warn("job.result.ack for unknown attempt", { attempt_id: msg.attempt_id });
-      return;
-    }
-    if (!leaseMatches(lease, msg.lease_id)) {
-      log.warn("stale lease on job.result.ack", { attempt_id: msg.attempt_id });
+    // terminal, so in the normal flow the registry misses here — but the pending
+    // result's lease still lives on the durable AttemptRow. A digest is NOT a
+    // capability token, so it must not authorize GC on its own.
+    const state = this.registry.get(msg.attempt_id);
+    if (!this.leaseOk(state, msg.attempt_id, msg.lease_id)) {
+      log.warn("stale/unknown lease on job.result.ack", { attempt_id: msg.attempt_id });
       return;
     }
     if (this.store.ackResult(msg.attempt_id, msg.result_digest)) {
@@ -295,16 +359,51 @@ export class JobManager {
     }
   }
 
-  /** Current lease for an attempt: the live registry first, then the durable
-   *  store (which retains it post-terminal until result.ack GCs the attempt). */
-  private leaseFor(attemptId: string): string | undefined {
-    return this.registry.get(attemptId)?.lease_id ?? this.store.getAttempt(attemptId)?.lease_id;
+  /** Lease acceptance for an inbound attempt-scoped message. Accepts the current
+   *  lease, OR the previous lease during a `lease.granted` rotation overlap. Post
+   *  terminal (registry miss) falls back to the durable attempt's lease. */
+  private leaseOk(state: JobState | undefined, attemptId: string, incoming: string): boolean {
+    if (state) {
+      if (incoming === state.lease_id) return true;
+      return (
+        state.prevLease !== undefined &&
+        incoming === state.prevLease &&
+        this.now() < (state.leaseOverlapUntil ?? 0)
+      );
+    }
+    return this.store.getAttempt(attemptId)?.lease_id === incoming;
+  }
+
+  /** Adopt a lease (from `lease.granted` or a resume directive) as the current
+   *  generation — durable (attempts row) AND live (JobState) — so both outbound
+   *  and inbound `leaseOk` use it; the prior lease stays valid for the overlap. */
+  private adoptLease(attemptId: string, leaseId: string): void {
+    this.store.setAttemptLease(attemptId, leaseId);
+    const st = this.registry.get(attemptId);
+    if (st && st.lease_id !== leaseId) {
+      st.prevLease = st.lease_id;
+      st.lease_id = leaseId;
+      st.leaseOverlapUntil = this.now() + LIMITS.LEASE_ROTATION_OVERLAP_MS;
+    }
+  }
+
+  /** `lease.granted` rotation: adopt the new lease immediately (outbound uses it),
+   *  and accept the old one on inbound for LEASE_ROTATION_OVERLAP_MS. */
+  handleLeaseGranted(msg: LeaseGranted): void {
+    const state = this.registry.get(msg.attempt_id);
+    if (!state) return;
+    state.prevLease = state.lease_id;
+    state.lease_id = msg.lease_id;
+    state.leaseOverlapUntil = this.now() + LIMITS.LEASE_ROTATION_OVERLAP_MS;
+    // Durable too, so the post-terminal `leaseOk` store-fallback is current-gen.
+    this.store.setAttemptLease(msg.attempt_id, msg.lease_id);
+    log.info("lease rotated", { attempt_id: msg.attempt_id, lease_id: msg.lease_id });
   }
 
   handleCancel(msg: JobCancel): void {
     const state = this.registry.get(msg.attempt_id);
     if (!state) return;
-    if (!leaseMatches(state.lease_id, msg.lease_id)) return;
+    if (!this.leaseOk(state, msg.attempt_id, msg.lease_id)) return;
     state.status = "cancelling";
     this.store.setAttemptStatus(msg.attempt_id, "cancelling");
     this.send(
@@ -321,7 +420,7 @@ export class JobManager {
   handleRevoke(msg: LeaseRevoke): void {
     const state = this.registry.get(msg.attempt_id);
     if (!state) return;
-    if (!leaseMatches(state.lease_id, msg.lease_id)) return; // not our current lease
+    if (!this.leaseOk(state, msg.attempt_id, msg.lease_id)) return; // not our lease
     log.warn("lease revoked — local fence", { attempt_id: msg.attempt_id });
     state.fenced = true;
     this.clearApprovals(state);

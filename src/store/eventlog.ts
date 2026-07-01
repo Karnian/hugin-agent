@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS attempts (
   lease_id     TEXT NOT NULL,
   agent_run_id TEXT NOT NULL,
   status       TEXT NOT NULL,
-  created_at   TEXT NOT NULL
+  created_at   TEXT NOT NULL,
+  last_seq     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
   attempt_id TEXT NOT NULL,
@@ -47,6 +48,17 @@ export interface AttemptRow {
   agent_run_id: string;
   status: string;
   created_at: string;
+  /** Optional on create (DB DEFAULT 0); always present on read. */
+  last_seq?: number;
+}
+
+/** Wire-shaped resume rows for `hello`. */
+export interface ActiveJobRow {
+  job_id: string;
+  attempt_id: string;
+  lease_id: string;
+  status: string;
+  last_emitted_seq: number;
 }
 
 export interface StoredResult {
@@ -91,16 +103,58 @@ export class EventLog {
     this.db.prepare("UPDATE attempts SET status = ? WHERE attempt_id = ?").run(status, attemptId);
   }
 
+  /** Update the durable attempt lease (lease.granted rotation) so the post-terminal
+   *  `leaseOk` fallback reflects the current generation. */
+  setAttemptLease(attemptId: string, leaseId: string): void {
+    this.db.prepare("UPDATE attempts SET lease_id = ? WHERE attempt_id = ?").run(leaseId, attemptId);
+  }
+
+  /** Re-stamp a stored pending result (resend_result across a rotation): the new
+   *  lease changes the digest, so payload + digest + lease must move together to
+   *  keep the eventual result.ack matchable. */
+  updateResult(attemptId: string, leaseId: string, digest: string, payload: string): void {
+    this.db
+      .prepare("UPDATE results SET lease_id = ?, result_digest = ?, payload = ?, result_size = ? WHERE attempt_id = ?")
+      .run(leaseId, digest, payload, Buffer.byteLength(payload, "utf8"), attemptId);
+  }
+
   deleteAttempt(attemptId: string): void {
     this.db.prepare("DELETE FROM attempts WHERE attempt_id = ?").run(attemptId);
     this.db.prepare("DELETE FROM events WHERE attempt_id = ?").run(attemptId);
   }
 
-  /** Persist a stream event BEFORE it is sent (durability + resend on resume). */
+  /** Persist a stream event BEFORE it is sent (durability + resend on resume).
+   *  Also advances the attempt's high-water `last_seq` (survives ack GC of events,
+   *  so `hello.active_jobs.last_emitted_seq` is correct after reconnect). */
   appendEvent(attemptId: string, seq: number, eventId: string, bytes: number, payload: string): void {
     this.db
       .prepare("INSERT INTO events (attempt_id, seq, event_id, bytes, payload) VALUES (?, ?, ?, ?, ?)")
       .run(attemptId, seq, eventId, bytes, payload);
+    this.db.prepare("UPDATE attempts SET last_seq = ? WHERE attempt_id = ? AND last_seq < ?").run(seq, attemptId, seq);
+  }
+
+  /** Durable stream-event payloads with seq > afterSeq, in order (for resume_from). */
+  eventsAfter(attemptId: string, afterSeq: number): string[] {
+    const rows = this.db
+      .prepare("SELECT payload FROM events WHERE attempt_id = ? AND seq > ? ORDER BY seq")
+      .all(attemptId, afterSeq) as Array<{ payload: string }>;
+    return rows.map((r) => r.payload);
+  }
+
+  /** Non-terminal attempts, shaped for `hello.active_jobs`. */
+  activeJobsForResume(): ActiveJobRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT job_id, attempt_id, lease_id, status, last_seq FROM attempts WHERE status IN ('accepted','starting','running','cancelling')",
+      )
+      .all() as Array<{ job_id: string; attempt_id: string; lease_id: string; status: string; last_seq: number }>;
+    return rows.map((r) => ({
+      job_id: r.job_id,
+      attempt_id: r.attempt_id,
+      lease_id: r.lease_id,
+      status: r.status,
+      last_emitted_seq: r.last_seq,
+    }));
   }
 
   /** Cumulative ack → GC every event with seq <= ackSeq (server has it durably). */
@@ -150,6 +204,11 @@ export class EventLog {
     if (!stored || stored.result_digest !== digest) return false;
     this.db.prepare("DELETE FROM results WHERE attempt_id = ?").run(attemptId);
     return true;
+  }
+
+  /** Unconditional result GC (resume ack_pending / abandon). */
+  deleteResult(attemptId: string): void {
+    this.db.prepare("DELETE FROM results WHERE attempt_id = ?").run(attemptId);
   }
 
   activeAttempts(): AttemptRow[] {

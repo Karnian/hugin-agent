@@ -638,8 +638,10 @@ async function scenarioT(): Promise<void> {
     onJobAccept: (m) => accepts.push(m.attempt_id),
     onJobReject: (m) => rejects.push({ attempt: m.attempt_id, code: m.code }),
     onAccept: (ctx) => {
-      relay.assign(ctx.ws, { job_id: "j1", attempt_id: "wr", lease_id: "L1", sandbox: "workspace_write" });
-      relay.assign(ctx.ws, { job_id: "j2", attempt_id: "ro", lease_id: "L1", sandbox: "read_only" });
+      // gated by sandbox (write), by approval_policy (always), and truly-ungated
+      relay.assign(ctx.ws, { job_id: "j1", attempt_id: "wr", lease_id: "L1", sandbox: "workspace_write", approval_policy: "never" });
+      relay.assign(ctx.ws, { job_id: "j2", attempt_id: "ap", lease_id: "L1", sandbox: "read_only", approval_policy: "always" });
+      relay.assign(ctx.ws, { job_id: "j3", attempt_id: "ok", lease_id: "L1", sandbox: "read_only", approval_policy: "never" });
     },
   });
   const port = await relay.start();
@@ -651,12 +653,183 @@ async function scenarioT(): Promise<void> {
     false, // gateAvailable = false
   );
   void daemon.start().catch(() => {});
-  await waitUntil(() => rejects.length >= 1 && accepts.length >= 1, 5000);
+  await waitUntil(() => rejects.length >= 2 && accepts.length >= 1, 5000);
   daemon.stop();
   await relay.stop();
   await sleep(50);
-  check("T1 write job rejected when gate unavailable (policy_violation)", rejects.some((r) => r.attempt === "wr" && r.code === "policy_violation"));
-  check("T2 read-only job still accepted (fail-closed only gates write/exec)", accepts.includes("ro"));
+  check("T1 write/exec job rejected when gate unavailable (policy_violation)", rejects.some((r) => r.attempt === "wr" && r.code === "policy_violation"));
+  check("T2 read_only+approval_policy!=never also rejected (gate needed)", rejects.some((r) => r.attempt === "ap" && r.code === "policy_violation"));
+  check("T3 only read_only+never runs ungated (accepted)", accepts.includes("ok") && !accepts.includes("wr") && !accepts.includes("ap"));
+}
+
+/** Resume (P4): a non-terminal attempt's DURABLE events are resent on reconnect
+ *  via resume_from — engine-independent (survives the connection drop). */
+async function scenarioU(): Promise<void> {
+  let conn = 0;
+  const conn1: number[] = [];
+  const conn2: number[] = [];
+  const relay = new MockRelay({
+    autoAckStream: false, // events stay durable (unacked)
+    resumeFor: (hello) =>
+      hello.active_jobs.map((j) => ({ job_id: j.job_id, attempt_id: j.attempt_id, action: "resume_from" as const, resume_after_seq: 0, lease_id: j.lease_id })),
+    onStreamEvent: (m) => (conn === 1 ? conn1 : conn2).push(m.seq),
+    onAccept: (ctx) => {
+      conn++;
+      if (conn === 1) {
+        relay.assign(ctx.ws, { job_id: "j1", attempt_id: "res", lease_id: "L1" });
+        setTimeout(() => ctx.ws.close(), 300);
+      }
+    },
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({ events: [{ kind: "stdout_chunk" }, { kind: "stdout_chunk" }, { kind: "stdout_chunk" }], hang: true });
+  const daemon = new Daemon(loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-u", dbPath: ":memory:" }), devSigner(), engine);
+  void daemon.start().catch(() => {});
+  const resumed = await waitUntil(() => conn2.length >= 3, 8000);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+  check("U1 conn1 streamed 3 durable (unacked) events", conn1.length === 3);
+  check("U2 reconnect resume_from resent them from the durable store", resumed && conn2.length >= 3);
+}
+
+/** Resume (P4): a completed-but-unacked result is reported in hello.pending_results
+ *  on reconnect and resent via resend_result. */
+async function scenarioV(): Promise<void> {
+  let conn = 0;
+  let resultCount = 0;
+  let pendingReported = 0;
+  const relay = new MockRelay({
+    autoAckResult: false, // result stays pending
+    resumeFor: (hello) => {
+      pendingReported = Math.max(pendingReported, hello.pending_results.length);
+      return hello.pending_results.map((p) => ({ job_id: p.job_id, attempt_id: p.attempt_id, action: "resend_result" as const, lease_id: p.lease_id }));
+    },
+    onResult: () => {
+      resultCount++;
+    },
+    onAccept: (ctx) => {
+      conn++;
+      if (conn === 1) {
+        relay.assign(ctx.ws, { job_id: "j1", attempt_id: "pr", lease_id: "L1" });
+        setTimeout(() => ctx.ws.close(), 300);
+      }
+    },
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({ events: [{ kind: "assistant_text" }], outcome: { status: "success" } });
+  const daemon = new Daemon(loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-v", dbPath: ":memory:" }), devSigner(), engine);
+  void daemon.start().catch(() => {});
+  const resent = await waitUntil(() => resultCount >= 2, 8000);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+  check("V1 unacked result reported in reconnect hello.pending_results", pendingReported >= 1);
+  check("V2 resend_result resent the durable result", resent && resultCount >= 2);
+}
+
+/** Lease rotation overlap (P4, unit): after lease.granted (L1→L2), the OLD lease is
+ *  accepted on inbound until the overlap window elapses, then rejected. */
+async function scenarioW(): Promise<void> {
+  let clock = 1000;
+  const store = new EventLog(":memory:");
+  const engine = new FakeEngine({ events: [{ kind: "stdout_chunk" }, { kind: "stdout_chunk" }], hang: true });
+  const manager = new JobManager(new JobRegistry(2), store, engine, () => {}, { events: 1024, bytes: 8 << 20, conn: 32 << 20 }, true, 300_000, () => clock);
+  const a = parseMessage(fakeAssign("j", "rot", "L1"));
+  if (a.type === "job.assign") manager.handleAssign(a);
+  await sleep(20); // let the 2 events persist
+  check("W0 events persisted (2 unacked)", store.unackedEvents("rot") === 2);
+  const lg = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "lease.granted", job_id: "j", attempt_id: "rot", lease_id: "L2", lease_ttl_ms: 120_000 });
+  if (lg.type === "lease.granted") manager.handleLeaseGranted(lg);
+  const ackOld = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "stream.ack", job_id: "j", attempt_id: "rot", lease_id: "L1", ack_seq: 1 });
+  if (ackOld.type === "stream.ack") manager.handleStreamAck(ackOld);
+  check("W1 OLD lease accepted during overlap (GC'd seq<=1)", store.unackedEvents("rot") === 1);
+  const ackNew = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "stream.ack", job_id: "j", attempt_id: "rot", lease_id: "L2", ack_seq: 2 });
+  if (ackNew.type === "stream.ack") manager.handleStreamAck(ackNew);
+  check("W2 NEW lease accepted", store.unackedEvents("rot") === 0);
+  clock += LIMITS.LEASE_ROTATION_OVERLAP_MS + 1;
+  store.appendEvent("rot", 3, "rot-3", 10, "{}");
+  const ackStale = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "stream.ack", job_id: "j", attempt_id: "rot", lease_id: "L1", ack_seq: 3 });
+  if (ackStale.type === "stream.ack") manager.handleStreamAck(ackStale);
+  check("W3 OLD lease rejected after the overlap window (no GC)", store.unackedEvents("rot") === 1);
+  store.close();
+}
+
+function helloAccepted(resume: Array<Record<string, unknown>>) {
+  return parseMessage({
+    id: "m",
+    ts: "2026-07-01T00:00:00.000Z",
+    type: "hello.accepted",
+    negotiated_version: "1.0.0",
+    connection_epoch: 1,
+    heartbeat_interval_ms: 15_000,
+    resume,
+  });
+}
+
+/** P4 Codex fixes (unit): rotation is durable; resume re-stamps the CURRENT lease
+ *  (stale stored lease would be nacked); abandon fences + drops. */
+async function scenarioX(): Promise<void> {
+  const store = new EventLog(":memory:");
+  const sent: Array<Record<string, unknown>> = [];
+  const engine = new FakeEngine({ events: [{ kind: "stdout_chunk" }], hang: true });
+  const manager = new JobManager(new JobRegistry(4), store, engine, (m) => sent.push(m as unknown as Record<string, unknown>), { events: 1024, bytes: 8 << 20, conn: 32 << 20 });
+
+  const a = parseMessage(fakeAssign("j", "rs", "L1"));
+  if (a.type === "job.assign") manager.handleAssign(a);
+  await sleep(20); // event persisted under L1
+  const lg = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "lease.granted", job_id: "j", attempt_id: "rs", lease_id: "L2", lease_ttl_ms: 120_000 });
+  if (lg.type === "lease.granted") manager.handleLeaseGranted(lg);
+  check("X0 lease rotation persisted to the store (attempt lease = L2)", store.getAttempt("rs")?.lease_id === "L2");
+
+  sent.length = 0;
+  const acc = helloAccepted([{ job_id: "j", attempt_id: "rs", action: "resume_from", resume_after_seq: 0, lease_id: "L2" }]);
+  if (acc.type === "hello.accepted") manager.applyResume(acc.resume);
+  const resent = sent.find((m) => m.type === "stream.event");
+  check("X1 resume_from re-stamps the CURRENT lease (L2, not stored L1)", resent?.lease_id === "L2");
+
+  // resend_result re-stamps lease + recomputes/persists digest
+  const oldPayload = JSON.stringify({ id: "old", ts: "old", type: "job.result", job_id: "j", attempt_id: "rr", lease_id: "L1", final_status: "success", duration_ms: 1, stats: { event_count: 0, bytes: 0 } });
+  store.createAttempt({ attempt_id: "rr", job_id: "j", lease_id: "L1", agent_run_id: "r", status: "completed", created_at: "2026-07-01T00:00:00.000Z" });
+  store.saveResult({ attempt_id: "rr", job_id: "j", lease_id: "L1", final_status: "success", result_digest: "A".repeat(43), result_size: 10, payload: oldPayload, last_emitted_seq: 0 });
+  sent.length = 0;
+  const acc2 = helloAccepted([{ job_id: "j", attempt_id: "rr", action: "resend_result", lease_id: "L2" }]);
+  if (acc2.type === "hello.accepted") manager.applyResume(acc2.resume);
+  const resentResult = sent.find((m) => m.type === "job.result");
+  check(
+    "X2 resend_result re-stamps lease + persists a new digest",
+    resentResult?.lease_id === "L2" && store.getResult("rr")?.lease_id === "L2" && store.getResult("rr")?.result_digest !== "A".repeat(43),
+  );
+  // The ack for the re-stamped result (L2 + new digest) must now be ACCEPTED and
+  // GC the pending result — proves adoptLease updated attempts.lease_id, not just
+  // the outgoing message (the exact gap Codex flagged).
+  const newDigest = store.getResult("rr")?.result_digest ?? "";
+  const rack = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "job.result.ack", job_id: "j", attempt_id: "rr", lease_id: "L2", result_digest: newDigest });
+  if (rack.type === "job.result.ack") manager.handleResultAck(rack);
+  check("X2b ack{L2, new digest} for the resent result is accepted → GC", store.getResult("rr") === undefined);
+
+  // abandon fences + drops a live attempt
+  const a3 = parseMessage(fakeAssign("j", "ab", "L1"));
+  if (a3.type === "job.assign") manager.handleAssign(a3);
+  await sleep(20);
+  const acc3 = helloAccepted([{ job_id: "j", attempt_id: "ab", action: "abandon" }]);
+  if (acc3.type === "hello.accepted") manager.applyResume(acc3.resume);
+  check("X3 abandon drops the attempt (durable + registry)", store.getAttempt("ab") === undefined);
+  store.close();
+}
+
+/** stop() during the pre-auth handshake window must stop the daemon cleanly (the
+ *  in-flight client is closed via sessionClient — it isn't activeClient yet). */
+async function scenarioY(): Promise<void> {
+  const relay = new MockRelay({ stallHandshake: true });
+  const port = await relay.start();
+  const daemon = new Daemon(loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-y", dbPath: ":memory:" }), devSigner(), new FakeEngine({ events: [] }));
+  const startPromise = daemon.start().catch(() => {});
+  await sleep(300); // daemon is mid-handshake (awaiting hello.accepted)
+  daemon.stop();
+  const stopped = await Promise.race([startPromise.then(() => true), sleep(3000).then(() => false)]);
+  await relay.stop();
+  check("Y1 stop() during handshake stops the daemon cleanly (no hang)", stopped === true);
 }
 
 async function main(): Promise<void> {
@@ -698,6 +871,16 @@ async function main(): Promise<void> {
   await scenarioS();
   console.log("\n[scenario T: fail-closed when the gate is unavailable]");
   await scenarioT();
+  console.log("\n[scenario U: reconnect resume_from (durable events)]");
+  await scenarioU();
+  console.log("\n[scenario V: reconnect resend_result (durable result)]");
+  await scenarioV();
+  console.log("\n[scenario W: lease.granted rotation overlap]");
+  await scenarioW();
+  console.log("\n[scenario X: resume lease re-stamp + durable rotation + abandon fence]");
+  await scenarioX();
+  console.log("\n[scenario Y: stop() during the pre-auth handshake]");
+  await scenarioY();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }
