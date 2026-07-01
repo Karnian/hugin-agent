@@ -8,6 +8,7 @@
 import { randomBytes } from "node:crypto";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
 import { LIMITS, type Message, PROTOCOL_VERSION } from "../protocol/v1/index";
+import { resultDigest } from "../protocol/v1/digest";
 import { decodeInbound } from "../src/conn/framing";
 import { messageId } from "../src/util/ids";
 import { log } from "../src/log";
@@ -30,6 +31,21 @@ export interface MockRelayOpts {
   forceEpoch?: number;
   /** Override the challenge nonce (default: a fresh canonical 43-char base64url). */
   nonce?: string;
+  /** Auto-send a cumulative `stream.ack` per `stream.event` (default true). Set
+   *  false to drive acks manually via `sendAck` (backpressure tests). */
+  autoAckStream?: boolean;
+  onJobAccept?: (m: Extract<Message, { type: "job.accept" }>) => void;
+  onStreamEvent?: (m: Extract<Message, { type: "stream.event" }>) => void;
+  onResult?: (m: Extract<Message, { type: "job.result" }>) => void;
+}
+
+export interface AssignSpec {
+  job_id: string;
+  attempt_id: string;
+  lease_id: string;
+  engine?: "claude" | "codex";
+  prompt?: string;
+  repo_root?: string;
 }
 
 function toBuffer(data: RawData): Buffer {
@@ -101,10 +117,78 @@ export class MockRelay {
         this.opts.onAccept?.({ ws, epoch, hello: m });
       } else if (m.type === "heartbeat") {
         this.opts.onHeartbeat?.();
+      } else if (m.type === "job.accept") {
+        this.opts.onJobAccept?.(m);
+      } else if (m.type === "stream.event") {
+        this.opts.onStreamEvent?.(m);
+        if (this.opts.autoAckStream !== false) {
+          this.sendAck(ws, { job_id: m.job_id, attempt_id: m.attempt_id, lease_id: m.lease_id }, m.seq);
+        }
+      } else if (m.type === "job.result") {
+        this.opts.onResult?.(m);
+        this.send(ws, {
+          id: messageId(),
+          ts: new Date().toISOString(),
+          type: "job.result.ack",
+          job_id: m.job_id,
+          attempt_id: m.attempt_id,
+          lease_id: m.lease_id,
+          result_digest: resultDigest(m as unknown as Record<string, unknown>),
+        });
       }
     });
 
     ws.on("error", () => {});
+  }
+
+  /** Send a `job.assign` (all required fields defaulted for tests). */
+  assign(ws: WebSocket, spec: AssignSpec): void {
+    const now = new Date().toISOString();
+    this.send(ws, {
+      id: messageId(),
+      ts: now,
+      type: "job.assign",
+      job_id: spec.job_id,
+      attempt_id: spec.attempt_id,
+      lease_id: spec.lease_id,
+      lease_ttl_ms: LIMITS.LEASE_TTL_MS_DEFAULT,
+      engine: spec.engine ?? "claude",
+      workspace: { repo_root: spec.repo_root ?? "/tmp/repo" },
+      prompt: spec.prompt ?? "do the thing",
+      sandbox: "read_only",
+      approval_policy: "on_write",
+      env_policy: { mode: "whitelist", allow: [] },
+      network_policy: { mode: "off" },
+      limits: { timeout_ms: 600_000, max_output_bytes: 5_000_000 },
+      created_at: now,
+      assignment_start_timeout_ms: 30_000,
+    });
+  }
+
+  /** Send a cumulative `stream.ack` (manual backpressure control). */
+  sendAck(ws: WebSocket, ctx: { job_id: string; attempt_id: string; lease_id: string }, ackSeq: number): void {
+    this.send(ws, {
+      id: messageId(),
+      ts: new Date().toISOString(),
+      type: "stream.ack",
+      job_id: ctx.job_id,
+      attempt_id: ctx.attempt_id,
+      lease_id: ctx.lease_id,
+      ack_seq: ackSeq,
+    });
+  }
+
+  /** Revoke the lease for an attempt (fences the daemon). */
+  revoke(ws: WebSocket, ctx: { job_id: string; attempt_id: string; lease_id: string }, reason = "revoked"): void {
+    this.send(ws, {
+      id: messageId(),
+      ts: new Date().toISOString(),
+      type: "lease.revoke",
+      job_id: ctx.job_id,
+      attempt_id: ctx.attempt_id,
+      lease_id: ctx.lease_id,
+      reason,
+    });
   }
 
   stop(): Promise<void> {

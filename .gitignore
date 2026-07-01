@@ -7,3 +7,4 @@ dist/
 .ao/
 spikes/**/out/
 *.local.json
+.hugind/

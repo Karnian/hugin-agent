@@ -4,6 +4,7 @@
  */
 
 import { z } from "zod";
+import { LIMITS } from "../protocol/v1/index";
 
 /** Matches the wire `AuthId` charset (messages.ts) so a configured `agentId`
  *  can be put on the wire without re-validation. */
@@ -36,6 +37,13 @@ export const Config = z.strictObject({
   maxConcurrent: z.number().int().positive().max(64).default(2),
   /** Engine command override for tests (the fake engine); defaults to `claude`. */
   engineCommand: z.string().optional(),
+  /** SQLite event-log path; `:memory:` for tests. Defaults to
+   *  `<stateDir>/eventlog.db` (computed by the daemon when unset). */
+  dbPath: z.string().optional(),
+  /** Backpressure caps (default: protocol `LIMITS`; overridable for tests). */
+  maxUnackedEventsPerAttempt: z.number().int().positive().default(LIMITS.MAX_UNACKED_EVENTS_PER_ATTEMPT),
+  maxUnackedBytesPerAttempt: z.number().int().positive().default(LIMITS.MAX_UNACKED_BYTES_PER_ATTEMPT),
+  maxUnackedBytesPerConn: z.number().int().positive().default(LIMITS.MAX_UNACKED_BYTES_PER_CONN),
 });
 
 export type Config = z.infer<typeof Config>;

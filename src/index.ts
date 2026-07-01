@@ -13,6 +13,7 @@
 import { type Config, loadConfig } from "./config";
 import { Daemon } from "./daemon";
 import { devSigner } from "./conn/handshake";
+import { FakeEngine } from "./engine/fake-engine";
 import { log } from "./log";
 
 function loadConfigOrExit(): Config {
@@ -41,7 +42,11 @@ function loadConfigOrExit(): Config {
 
 async function main(): Promise<void> {
   const config = loadConfigOrExit();
-  const daemon = new Daemon(config, devSigner(config.keyId));
+  // P2a: the real Claude adapter lands in P2b; until then jobs run a placeholder
+  // fake engine. The transport/handshake/reconnect path above is production-real.
+  log.warn("P2a build: using the FAKE engine — the real Claude adapter lands in P2b");
+  const engine = new FakeEngine({ events: [{ kind: "system_status", note: "fake engine (P2a)" }] });
+  const daemon = new Daemon(config, devSigner(config.keyId), engine);
   const shutdown = () => {
     log.info("signal received — shutting down");
     daemon.stop();

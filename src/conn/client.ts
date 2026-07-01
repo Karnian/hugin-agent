@@ -49,6 +49,11 @@ export class RelayClient {
           log.warn("inbound rejected", { code: res.code, reason: res.reason });
           return;
         }
+        // The phase flip on hello.accepted MUST be synchronous: the relay may send
+        // hello.accepted and job.assign in one read, and ws emits both 'message'
+        // events in the same tick — the job.assign is decoded before any handshake
+        // microtask could set the flag, so flip it here before decoding the next.
+        if (res.msg.type === "hello.accepted") this.authed = true;
         this.deliver(res.msg);
       });
       ws.on("error", (err) => {

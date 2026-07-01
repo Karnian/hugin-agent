@@ -12,12 +12,17 @@
  * daemon's epoch gate is strictly monotonic.
  */
 
-import { LIMITS } from "../protocol/v1/index";
+import type { WebSocket } from "ws";
+import { LIMITS, parseMessage } from "../protocol/v1/index";
 import { loadConfig } from "../src/config";
 import { Daemon } from "../src/daemon";
 import { devSigner } from "../src/conn/handshake";
 import { decodeInbound } from "../src/conn/framing";
 import { RelayClient } from "../src/conn/client";
+import { FakeEngine } from "../src/engine/fake-engine";
+import { JobManager } from "../src/jobs/manager";
+import { JobRegistry } from "../src/jobs/registry";
+import { EventLog } from "../src/store/eventlog";
 import { MockRelay } from "../mock-relay/server";
 
 let failures = 0;
@@ -53,8 +58,9 @@ async function scenarioA(): Promise<void> {
     serverUrl: `ws://127.0.0.1:${port}`,
     agentId: "agent-e2e",
     tenantId: "dev-tenant",
+    dbPath: ":memory:",
   });
-  const daemon = new Daemon(config, devSigner());
+  const daemon = new Daemon(config, devSigner(), new FakeEngine({ events: [] }));
   void daemon.start().catch((e) => console.error("daemon.start threw", e));
 
   const reconnected = await waitUntil(() => accepts >= 2, 8000);
@@ -100,7 +106,11 @@ function scenarioB(): void {
   check("B4 framing rejects invalid JSON", !bad.ok && bad.code === "invalid_message");
 
   // epoch gate: strictly monotonic
-  const d = new Daemon(loadConfig({ serverUrl: "wss://relay.example.com", agentId: "a" }), devSigner());
+  const d = new Daemon(
+    loadConfig({ serverUrl: "wss://relay.example.com", agentId: "a", dbPath: ":memory:" }),
+    devSigner(),
+    new FakeEngine({ events: [] }),
+  );
   check("B5 epoch gate accepts first epoch", d.acceptEpoch(5));
   check("B6 epoch gate rejects equal/older", !d.acceptEpoch(5) && !d.acceptEpoch(4));
   check("B7 epoch gate accepts higher", d.acceptEpoch(6));
@@ -121,7 +131,11 @@ async function scenarioC(): Promise<void> {
     },
   });
   const port = await relay.start();
-  const daemon = new Daemon(loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-epoch" }), devSigner());
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-epoch", dbPath: ":memory:" }),
+    devSigner(),
+    new FakeEngine({ events: [] }),
+  );
   void daemon.start().catch(() => {});
   const rejected = await waitUntil(() => closeCodes.includes(1008), 6000);
   daemon.stop();
@@ -150,8 +164,327 @@ async function scenarioQueueRace(): Promise<void> {
   check("Q1 inbound queue delivers a challenge buffered before waitFor", ok);
 }
 
+/** Full job flow: assign → accept → stream (persist + auto-ack + GC) → result →
+ *  digest-ack → GC. D3 passing proves the daemon and relay compute the SAME
+ *  result_digest (otherwise ackResult never matches and pending never clears). */
+async function scenarioD(): Promise<void> {
+  const streamKinds: string[] = [];
+  let jobAccepts = 0;
+  let resultSeen = false;
+  const relay = new MockRelay({
+    onJobAccept: () => {
+      jobAccepts++;
+    },
+    onStreamEvent: (m) => {
+      streamKinds.push(m.event.kind);
+    },
+    onResult: () => {
+      resultSeen = true;
+    },
+    onAccept: (ctx) => relay.assign(ctx.ws, { job_id: "j1", attempt_id: "a1", lease_id: "L1", prompt: "hi" }),
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({
+    events: [
+      { kind: "assistant_text", text: "hi" },
+      { kind: "tool_use", name: "Bash" },
+      { kind: "usage", tokens: 10 },
+    ],
+    outcome: { status: "success", exitCode: 0 },
+  });
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-d", dbPath: ":memory:" }),
+    devSigner(),
+    engine,
+  );
+  void daemon.start().catch(() => {});
+  const gcd = await waitUntil(
+    () =>
+      resultSeen &&
+      streamKinds.length === 3 &&
+      daemon.pendingResultCount() === 0 &&
+      daemon.activeAttemptCount() === 0,
+    6000,
+  );
+  check("D1 job.accept received", jobAccepts >= 1);
+  check("D2 all 3 stream events received (persisted + acked)", streamKinds.length === 3);
+  check("D3 result digest-acked → GC (pending=0, attempts=0)", gcd && resultSeen);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+}
+
+/** Idempotency: an identical `job.assign` sent twice re-confirms but must NOT
+ *  spawn a second run (2 events from the 2-event script, not 4). */
+async function scenarioE(): Promise<void> {
+  const streamKinds: string[] = [];
+  let jobAccepts = 0;
+  const relay = new MockRelay({
+    onJobAccept: () => {
+      jobAccepts++;
+    },
+    onStreamEvent: (m) => {
+      streamKinds.push(m.event.kind);
+    },
+    onAccept: (ctx) => {
+      relay.assign(ctx.ws, { job_id: "j1", attempt_id: "dup", lease_id: "L1" });
+      relay.assign(ctx.ws, { job_id: "j1", attempt_id: "dup", lease_id: "L1" });
+    },
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({ events: [{ kind: "assistant_text" }, { kind: "usage" }], outcome: { status: "success" } });
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-e", dbPath: ":memory:" }),
+    devSigner(),
+    engine,
+  );
+  void daemon.start().catch(() => {});
+  await waitUntil(() => jobAccepts >= 2, 4000);
+  await sleep(300); // give any erroneous 2nd run time to emit
+  check("E1 duplicate assign re-confirmed (>=2 job.accept)", jobAccepts >= 2);
+  check("E2 duplicate did NOT spawn a 2nd run (2 events, not 4)", streamKinds.length === 2);
+  check("E3 engine.run() called exactly once (direct idempotency proof)", engine.runCount === 1);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+}
+
+function fakeAssign(job_id: string, attempt_id: string, lease_id: string) {
+  const now = "2026-07-01T00:00:00.000Z";
+  return {
+    id: "m",
+    ts: now,
+    type: "job.assign",
+    job_id,
+    attempt_id,
+    lease_id,
+    lease_ttl_ms: 120_000,
+    engine: "claude",
+    workspace: { repo_root: "/tmp/repo" },
+    prompt: "hi",
+    sandbox: "read_only",
+    approval_policy: "on_write",
+    env_policy: { mode: "whitelist", allow: [] },
+    network_policy: { mode: "off" },
+    limits: { timeout_ms: 600_000, max_output_bytes: 5_000_000 },
+    created_at: now,
+    assignment_start_timeout_ms: 30_000,
+  };
+}
+
+/** Cross-session idempotency (the P1 Codex flagged): the durable store already
+ *  holds attempt "x" (accepted on a prior connection) but the registry is fresh
+ *  after reconnect. A re-assign must re-confirm WITHOUT calling engine.run(); a
+ *  re-assign with a different lease must be fenced (stale_lease). */
+function scenarioG(): void {
+  const store = new EventLog(":memory:");
+  store.createAttempt({
+    attempt_id: "x",
+    job_id: "j",
+    lease_id: "L1",
+    agent_run_id: "run-old",
+    status: "running",
+    created_at: "2026-07-01T00:00:00.000Z",
+  });
+  const registry = new JobRegistry(2);
+  const engine = new FakeEngine({ events: [{ kind: "assistant_text" }] });
+  const sent: string[] = [];
+  const manager = new JobManager(registry, store, engine, (m) => sent.push(m.type), {
+    events: 1024,
+    bytes: 8 << 20,
+    conn: 32 << 20,
+  });
+  const a1 = parseMessage(fakeAssign("j", "x", "L1"));
+  if (a1.type === "job.assign") manager.handleAssign(a1);
+  check("G1 cross-session duplicate does NOT re-spawn the engine", engine.runCount === 0);
+  check("G2 cross-session duplicate re-confirms (job.accept)", sent.includes("job.accept"));
+  const a2 = parseMessage(fakeAssign("j", "x", "L2"));
+  if (a2.type === "job.assign") manager.handleAssign(a2);
+  check("G3 duplicate with mismatched lease is fenced (job.reject)", sent.includes("job.reject"));
+  store.close();
+}
+
+/** Lease revoke fences the run: a hanging job is revoked mid-flight; the daemon
+ *  must emit NO terminal result on the revoked lease and free the attempt. */
+async function scenarioH(): Promise<void> {
+  let resultSeen = false;
+  let ctxRef: { job_id: string; attempt_id: string; lease_id: string } | null = null;
+  let wsRef: WebSocket | null = null;
+  const relay = new MockRelay({
+    onResult: () => {
+      resultSeen = true;
+    },
+    onStreamEvent: (m) => {
+      ctxRef = { job_id: m.job_id, attempt_id: m.attempt_id, lease_id: m.lease_id };
+    },
+    onAccept: (ctx) => {
+      wsRef = ctx.ws;
+      relay.assign(ctx.ws, { job_id: "j1", attempt_id: "rev", lease_id: "L1" });
+    },
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({ events: [{ kind: "assistant_text" }], hang: true }); // never completes on its own
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-h", dbPath: ":memory:" }),
+    devSigner(),
+    engine,
+  );
+  void daemon.start().catch(() => {});
+  await waitUntil(() => ctxRef !== null, 4000); // running; first event observed
+  if (wsRef && ctxRef) relay.revoke(wsRef, ctxRef);
+  await sleep(300); // fence must stop it — no result should arrive
+  check("H1 lease.revoke fences the run — no terminal result on revoked lease", resultSeen === false);
+  check("H2 revoked attempt dropped (durable + capacity freed)", daemon.activeAttemptCount() === 0);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+}
+
+/** EventLog unit: cumulative-ack GC and digest-matched result GC directly. */
+function scenarioI(): void {
+  const store = new EventLog(":memory:");
+  store.createAttempt({ attempt_id: "u", job_id: "j", lease_id: "L1", agent_run_id: "r", status: "running", created_at: "2026-07-01T00:00:00.000Z" });
+  store.appendEvent("u", 1, "u-1", 100, "{}");
+  store.appendEvent("u", 2, "u-2", 100, "{}");
+  store.appendEvent("u", 3, "u-3", 100, "{}");
+  check("I1 unacked counters", store.unackedEvents("u") === 3 && store.unackedBytes("u") === 300 && store.connUnackedBytes() === 300);
+  store.ackEvents("u", 2);
+  check("I2 cumulative-ack GC deletes seq<=ack", store.unackedEvents("u") === 1 && store.unackedBytes("u") === 100);
+  store.saveResult({ attempt_id: "u", job_id: "j", lease_id: "L1", final_status: "success", result_digest: "DIGEST", result_size: 10, payload: "{}", last_emitted_seq: 3 });
+  check("I3 ackResult rejects wrong digest (result kept)", store.ackResult("u", "WRONG") === false && store.getResult("u") !== undefined);
+  check("I4 ackResult accepts matching digest (result GC'd)", store.ackResult("u", "DIGEST") === true && store.getResult("u") === undefined);
+  store.close();
+}
+
+/** Per-connection byte cap engages backpressure (the cap D/E/F never exercised). */
+async function scenarioJ(): Promise<void> {
+  const seqs: number[] = [];
+  const relay = new MockRelay({
+    autoAckStream: false,
+    onStreamEvent: (m) => {
+      seqs.push(m.seq);
+    },
+    onAccept: (ctx) => relay.assign(ctx.ws, { job_id: "j1", attempt_id: "cc", lease_id: "L1" }),
+  });
+  const port = await relay.start();
+  const big = "x".repeat(2000);
+  const engine = new FakeEngine({
+    events: Array.from({ length: 10 }, () => ({ kind: "stdout_chunk", data: big })),
+    outcome: { status: "success" },
+  });
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-j", dbPath: ":memory:", maxUnackedBytesPerConn: 3000 }),
+    devSigner(),
+    engine,
+  );
+  void daemon.start().catch(() => {});
+  await waitUntil(() => seqs.length >= 1, 3000);
+  await sleep(200);
+  check("J1 per-connection byte cap engages backpressure (pauses early)", seqs.length >= 1 && seqs.length <= 3);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+}
+
+/** Backpressure: with acks withheld and a per-attempt cap of 3, the daemon must
+ *  pause after 3 unacked events and resume once an ack clears them. */
+async function scenarioF(): Promise<void> {
+  const seqs: number[] = [];
+  let ackCtx: { job_id: string; attempt_id: string; lease_id: string } | null = null;
+  let ackWs: WebSocket | null = null;
+  const cap = 3;
+  const relay = new MockRelay({
+    autoAckStream: false,
+    onStreamEvent: (m) => {
+      seqs.push(m.seq);
+      ackCtx = { job_id: m.job_id, attempt_id: m.attempt_id, lease_id: m.lease_id };
+    },
+    onAccept: (ctx) => {
+      ackWs = ctx.ws;
+      relay.assign(ctx.ws, { job_id: "j1", attempt_id: "bp", lease_id: "L1" });
+    },
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({
+    events: Array.from({ length: 10 }, (_, i) => ({ kind: "stdout_chunk", n: i })),
+    outcome: { status: "success" },
+  });
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-f", dbPath: ":memory:", maxUnackedEventsPerAttempt: cap }),
+    devSigner(),
+    engine,
+  );
+  void daemon.start().catch(() => {});
+  await waitUntil(() => seqs.length >= cap, 3000);
+  await sleep(200); // if not paused, more events would arrive here
+  const pausedAt = seqs.length;
+  check("F1 backpressure pauses at cap (unacked never exceeds cap)", pausedAt === cap);
+  if (ackWs && ackCtx) relay.sendAck(ackWs, ackCtx, cap);
+  const resumed = await waitUntil(() => seqs.length > pausedAt, 3000);
+  check("F2 backpressure resumes after ack", resumed);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+}
+
+function fakeRevoke(job_id: string, attempt_id: string, lease_id: string) {
+  return { id: "m", ts: "2026-07-01T00:00:00.000Z", type: "lease.revoke", job_id, attempt_id, lease_id, reason: "revoked" };
+}
+
+/** Stale-callback race (async cancel, P2b/P3): revoke fences attempt "z" and
+ *  clears its state; a re-assign with a NEW lease creates a fresh run under the
+ *  same id BEFORE the old run's (deferred) onDone fires. The stale fenced onDone
+ *  must NOT evict the replacement — identity-gated cleanup in onDone. */
+async function scenarioL(): Promise<void> {
+  const store = new EventLog(":memory:");
+  const registry = new JobRegistry(4);
+  const engine = new FakeEngine({ events: [{ kind: "assistant_text" }], hang: true, cancelAsync: true });
+  const manager = new JobManager(registry, store, engine, () => {}, { events: 1024, bytes: 8 << 20, conn: 32 << 20 });
+
+  const a1 = parseMessage(fakeAssign("j", "z", "L1"));
+  if (a1.type === "job.assign") manager.handleAssign(a1);
+  const oldState = registry.get("z");
+
+  const rev = parseMessage(fakeRevoke("j", "z", "L1"));
+  if (rev.type === "lease.revoke") manager.handleRevoke(rev); // fences; cancel() deferred
+
+  const a2 = parseMessage(fakeAssign("j", "z", "L2"));
+  if (a2.type === "job.assign") manager.handleAssign(a2); // fresh run, same id, new lease
+  const newState = registry.get("z");
+  check(
+    "L1 re-assign after revoke creates a fresh live attempt",
+    newState !== undefined && newState !== oldState && newState?.lease_id === "L2",
+  );
+
+  await sleep(30); // old fenced run's deferred onDone fires here
+  check("L2 stale fenced onDone does not evict the re-assigned live attempt", registry.get("z") === newState);
+  store.close();
+}
+
+/** job.result.ack MUST be lease-checked even after terminal cleanup removes the
+ *  registry entry (the pending result's lease lives on the durable AttemptRow).
+ *  A mismatched-lease ack must NOT GC the pending result; the correct lease must. */
+function scenarioK(): void {
+  const DIGEST = "A".repeat(43); // valid SHA-256 base64url length
+  const store = new EventLog(":memory:");
+  store.createAttempt({ attempt_id: "r", job_id: "j", lease_id: "L1", agent_run_id: "run", status: "completed", created_at: "2026-07-01T00:00:00.000Z" });
+  store.saveResult({ attempt_id: "r", job_id: "j", lease_id: "L1", final_status: "success", result_digest: DIGEST, result_size: 1, payload: "{}", last_emitted_seq: 0 });
+  const manager = new JobManager(new JobRegistry(2), store, new FakeEngine({ events: [] }), () => {}, {
+    events: 1024,
+    bytes: 8 << 20,
+    conn: 32 << 20,
+  });
+  const wrong = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "job.result.ack", job_id: "j", attempt_id: "r", lease_id: "WRONG", result_digest: DIGEST });
+  if (wrong.type === "job.result.ack") manager.handleResultAck(wrong);
+  check("K1 result.ack with mismatched lease rejected (pending result kept)", store.getResult("r") !== undefined);
+  const right = parseMessage({ id: "m", ts: "2026-07-01T00:00:00.000Z", type: "job.result.ack", job_id: "j", attempt_id: "r", lease_id: "L1", result_digest: DIGEST });
+  if (right.type === "job.result.ack") manager.handleResultAck(right);
+  check("K2 result.ack with correct lease GCs the pending result", store.getResult("r") === undefined);
+  store.close();
+}
+
 async function main(): Promise<void> {
-  console.log("=== hugind P1 e2e ===\n[scenario A: live handshake + heartbeat + reconnect]");
+  console.log("=== hugind P1+P2a e2e ===\n[scenario A: live handshake + heartbeat + reconnect]");
   await scenarioA();
   console.log("\n[scenario B: framing + epoch gate]");
   scenarioB();
@@ -159,6 +492,24 @@ async function main(): Promise<void> {
   await scenarioC();
   console.log("\n[scenario Q: inbound-queue race]");
   await scenarioQueueRace();
+  console.log("\n[scenario D: full job flow → digest-ack → GC]");
+  await scenarioD();
+  console.log("\n[scenario E: duplicate-assign idempotency]");
+  await scenarioE();
+  console.log("\n[scenario F: stream backpressure]");
+  await scenarioF();
+  console.log("\n[scenario G: cross-session duplicate idempotency + lease fence]");
+  scenarioG();
+  console.log("\n[scenario H: lease.revoke local fence]");
+  await scenarioH();
+  console.log("\n[scenario I: EventLog GC + digest-ack (unit)]");
+  scenarioI();
+  console.log("\n[scenario J: per-connection byte-cap backpressure]");
+  await scenarioJ();
+  console.log("\n[scenario K: result.ack lease-check after terminal cleanup]");
+  scenarioK();
+  console.log("\n[scenario L: stale-callback race on async cancel + re-assign]");
+  await scenarioL();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }
