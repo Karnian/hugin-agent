@@ -35,8 +35,15 @@ export interface MockRelayOpts {
    *  false to drive acks manually via `sendAck` (backpressure tests). */
   autoAckStream?: boolean;
   onJobAccept?: (m: Extract<Message, { type: "job.accept" }>) => void;
+  onJobReject?: (m: Extract<Message, { type: "job.reject" }>) => void;
   onStreamEvent?: (m: Extract<Message, { type: "stream.event" }>) => void;
   onResult?: (m: Extract<Message, { type: "job.result" }>) => void;
+  onApprovalRequest?: (m: Extract<Message, { type: "approval.request" }>) => void;
+  /** Auto-respond to `approval.request` (default true). Set false to test the
+   *  daemon's approval timeout / auto-deny. */
+  autoApprove?: boolean;
+  /** Decision for the auto-response (default "allow"). */
+  approvalDecision?: "allow" | "deny";
 }
 
 export interface AssignSpec {
@@ -46,6 +53,7 @@ export interface AssignSpec {
   engine?: "claude" | "codex";
   prompt?: string;
   repo_root?: string;
+  sandbox?: "read_only" | "workspace_write" | "full";
 }
 
 function toBuffer(data: RawData): Buffer {
@@ -119,6 +127,8 @@ export class MockRelay {
         this.opts.onHeartbeat?.();
       } else if (m.type === "job.accept") {
         this.opts.onJobAccept?.(m);
+      } else if (m.type === "job.reject") {
+        this.opts.onJobReject?.(m);
       } else if (m.type === "stream.event") {
         this.opts.onStreamEvent?.(m);
         if (this.opts.autoAckStream !== false) {
@@ -135,6 +145,21 @@ export class MockRelay {
           lease_id: m.lease_id,
           result_digest: resultDigest(m as unknown as Record<string, unknown>),
         });
+      } else if (m.type === "approval.request") {
+        this.opts.onApprovalRequest?.(m);
+        if (this.opts.autoApprove !== false) {
+          this.send(ws, {
+            id: messageId(),
+            ts: new Date().toISOString(),
+            type: "approval.response",
+            job_id: m.job_id,
+            attempt_id: m.attempt_id,
+            lease_id: m.lease_id,
+            request_id: m.request_id,
+            decision: this.opts.approvalDecision ?? "allow",
+            decided_by: "remote_user",
+          });
+        }
       }
     });
 
@@ -155,7 +180,7 @@ export class MockRelay {
       engine: spec.engine ?? "claude",
       workspace: { repo_root: spec.repo_root ?? "/tmp/repo" },
       prompt: spec.prompt ?? "do the thing",
-      sandbox: "read_only",
+      sandbox: spec.sandbox ?? "read_only",
       approval_policy: "on_write",
       env_policy: { mode: "whitelist", allow: [] },
       network_policy: { mode: "off" },

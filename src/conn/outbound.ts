@@ -89,3 +89,31 @@ export function jobResultMsg(ctx: AttemptCtx, f: JobResultFields): Message {
     head_sha: f.head_sha,
   };
 }
+
+const INPUT_SUMMARY_MAX = 8_000;
+
+export function approvalRequestMsg(
+  ctx: AttemptCtx,
+  args: {
+    requestId: string;
+    toolName: string;
+    inputSummary: string;
+    risk: "low" | "medium" | "high";
+    approvalTimeoutMs: number;
+  },
+): Message {
+  const truncated = args.inputSummary.length > INPUT_SUMMARY_MAX;
+  const summary = truncated ? args.inputSummary.slice(0, INPUT_SUMMARY_MAX) : args.inputSummary;
+  return {
+    ...envelope(),
+    type: "approval.request",
+    ...ctx,
+    request_id: args.requestId,
+    tool_name: args.toolName,
+    input_summary: summary,
+    // v1: no field-level redaction yet; truncation is signaled for the operator.
+    redaction: { applied: false, truncated, byte_count: Buffer.byteLength(args.inputSummary, "utf8") },
+    risk: args.risk,
+    approval_timeout_ms: args.approvalTimeoutMs,
+  };
+}

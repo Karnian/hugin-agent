@@ -28,6 +28,9 @@ export class Daemon {
     private readonly config: Config,
     private readonly signer: Signer,
     private readonly engine: Engine,
+    /** Whether the approval gate is usable (startup isolation self-check). When
+     *  false, gated (write/exec) jobs are rejected — fail closed. */
+    private readonly gateAvailable = true,
   ) {
     this.store = new EventLog(config.dbPath ?? join(config.stateDir, "eventlog.db"));
   }
@@ -99,11 +102,19 @@ export class Daemon {
           log.warn("send failed", { err: String(e) });
         }
       };
-      const manager = new JobManager(registry, this.store, this.engine, safeSend, {
-        events: this.config.maxUnackedEventsPerAttempt,
-        bytes: this.config.maxUnackedBytesPerAttempt,
-        conn: this.config.maxUnackedBytesPerConn,
-      });
+      const manager = new JobManager(
+        registry,
+        this.store,
+        this.engine,
+        safeSend,
+        {
+          events: this.config.maxUnackedEventsPerAttempt,
+          bytes: this.config.maxUnackedBytesPerAttempt,
+          conn: this.config.maxUnackedBytesPerConn,
+        },
+        this.gateAvailable,
+        this.config.approvalTimeoutMs,
+      );
       client.onMessage((m) => {
         switch (m.type) {
           case "job.assign":
@@ -117,6 +128,9 @@ export class Daemon {
             break;
           case "job.cancel":
             manager.handleCancel(m);
+            break;
+          case "approval.response":
+            manager.handleApprovalResponse(m);
             break;
           case "lease.revoke":
             manager.handleRevoke(m);

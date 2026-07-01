@@ -29,6 +29,8 @@ export interface JobState {
   paused: boolean;
   /** Set on lease revoke/loss — suppresses the terminal result (local fence). */
   fenced: boolean;
+  /** In-flight approvals: request_id → auto-deny timer (approval_timeout). */
+  approvalTimers: Map<string, ReturnType<typeof setTimeout>>;
 }
 
 export class JobRegistry {

@@ -8,6 +8,13 @@
  * but then the host allow-list (`allow:["Bash(*)",…]` + `dontAsk`) DISABLES the
  * approval gate — so the daemon MUST fail closed on gated (write/exec) jobs.
  * `selfCheckLogin` lets the daemon detect the drop at startup and decide.
+ *
+ * FUTURE (unblocks the real deny→blocked gate under isolation): Claude Code also
+ * honors env-based auth — `ANTHROPIC_API_KEY` (always used in non-interactive `-p`
+ * mode when set) and `CLAUDE_CODE_OAUTH_TOKEN`. Injecting one into the isolated
+ * child env should survive both `config-dir` and `home-swap` (it isn't
+ * keychain/default-path bound), giving {isolated gate + logged in} on this host.
+ * Left for P3 (approval bridge) where the gate is actually exercised.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";

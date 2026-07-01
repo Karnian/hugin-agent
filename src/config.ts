@@ -44,6 +44,8 @@ export const Config = z.strictObject({
   maxUnackedEventsPerAttempt: z.number().int().positive().default(LIMITS.MAX_UNACKED_EVENTS_PER_ATTEMPT),
   maxUnackedBytesPerAttempt: z.number().int().positive().default(LIMITS.MAX_UNACKED_BYTES_PER_ATTEMPT),
   maxUnackedBytesPerConn: z.number().int().positive().default(LIMITS.MAX_UNACKED_BYTES_PER_CONN),
+  /** Approval-gate timeout before auto-deny (default: protocol LIMITS). */
+  approvalTimeoutMs: z.number().int().positive().default(LIMITS.APPROVAL_TIMEOUT_MS_DEFAULT),
 });
 
 export type Config = z.infer<typeof Config>;

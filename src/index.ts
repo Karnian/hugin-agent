@@ -50,17 +50,21 @@ async function main(): Promise<void> {
   // must fail closed (P3 wires the enforcement + the prompt bridge).
   const iso = buildIsolation(config.isolation, config.stateDir);
   let engineEnv = iso.env;
+  // The approval gate is usable only when isolation is active (empty-allow settings
+  // → the prompt fires) AND the login survived it. Otherwise fail closed.
+  let gateAvailable = false;
   if (iso.mode !== "none") {
     const login = await selfCheckLogin(iso.env, config.engineCommand);
     if (login.loggedIn) {
-      log.info("permission isolation active + login preserved", { mode: iso.mode });
+      gateAvailable = true;
+      log.info("permission isolation active + login preserved — approval gate AVAILABLE", { mode: iso.mode });
     } else {
-      log.warn("isolation dropped the login — falling back to host config; approval gate UNAVAILABLE (gated jobs must fail closed, P3)", { mode: iso.mode, detail: login.detail });
+      log.warn("isolation dropped the login — falling back to host config; approval gate UNAVAILABLE (gated jobs fail closed)", { mode: iso.mode, detail: login.detail });
       iso.cleanup();
       engineEnv = {};
     }
   } else {
-    log.warn("isolation=none — under host config; approval gate disabled if the host allow-list is permissive (P3 fail-closed)");
+    log.warn("isolation=none — approval gate UNAVAILABLE if the host allow-list is permissive; gated jobs fail closed");
   }
 
   const engine = new ClaudeEngine({
@@ -70,7 +74,7 @@ async function main(): Promise<void> {
     stateDir: config.stateDir,
     timeoutMs: 3_600_000,
   });
-  const daemon = new Daemon(config, devSigner(config.keyId), engine);
+  const daemon = new Daemon(config, devSigner(config.keyId), engine, gateAvailable);
   const shutdown = () => {
     log.info("signal received — shutting down");
     daemon.stop();

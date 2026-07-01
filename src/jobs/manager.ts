@@ -7,14 +7,15 @@
  * a second run. Lease is validated on every inbound attempt-scoped message.
  */
 
-import type { Message } from "../../protocol/v1/index";
+import { LIMITS, type Message } from "../../protocol/v1/index";
 import { resultDigest } from "../../protocol/v1/digest";
-import type { Engine, EngineEvent, EngineOutcome, EngineSpec } from "../engine/types";
+import type { ApprovalRequest, Engine, EngineEvent, EngineOutcome, EngineSpec } from "../engine/types";
 import type { EventLog } from "../store/eventlog";
 import { JobRegistry, type JobState } from "./registry";
 import { leaseMatches } from "./lease";
 import {
   type AttemptCtx,
+  approvalRequestMsg,
   jobAccept,
   jobReject,
   jobResultMsg,
@@ -29,6 +30,7 @@ type StreamAck = Extract<Message, { type: "stream.ack" }>;
 type JobResultAck = Extract<Message, { type: "job.result.ack" }>;
 type JobCancel = Extract<Message, { type: "job.cancel" }>;
 type LeaseRevoke = Extract<Message, { type: "lease.revoke" }>;
+type ApprovalResponse = Extract<Message, { type: "approval.response" }>;
 
 export interface Caps {
   events: number;
@@ -45,6 +47,10 @@ export class JobManager {
     private readonly engine: Engine,
     private readonly send: (m: Message) => void,
     private readonly caps: Caps,
+    /** Whether the approval gate is usable (startup isolation self-check). When
+     *  false, the daemon fails closed on write/exec jobs. */
+    private readonly gateAvailable = true,
+    private readonly approvalTimeoutMs: number = LIMITS.APPROVAL_TIMEOUT_MS_DEFAULT,
     private readonly now: () => number = () => Date.now(),
   ) {}
 
@@ -89,6 +95,13 @@ export class JobManager {
       return;
     }
 
+    // Fail closed: without a usable approval gate (startup isolation self-check),
+    // refuse jobs that could write/execute — no ungated mutation on the host.
+    if (!this.gateAvailable && msg.sandbox !== "read_only") {
+      this.send(jobReject(ctx, "policy_violation", "approval gate unavailable — daemon fails closed on write/exec jobs"));
+      return;
+    }
+
     const runId = agentRunId();
     this.store.createAttempt({
       attempt_id: msg.attempt_id,
@@ -109,6 +122,7 @@ export class JobManager {
       run: null,
       paused: false,
       fenced: false,
+      approvalTimers: new Map(),
     };
     this.registry.add(state);
     this.send(jobAccept(ctx, runId));
@@ -122,6 +136,51 @@ export class JobManager {
     state.run = run;
     run.onEvent((ev) => this.onEvent(state, ev));
     run.onDone((outcome) => this.onDone(state, outcome));
+    run.onApprovalRequest?.((req) => this.onApprovalRequest(state, req));
+  }
+
+  /** Engine needs approval for a tool → forward as approval.request; auto-deny on
+   *  timeout (late responses are then ignored). */
+  private onApprovalRequest(state: JobState, req: ApprovalRequest): void {
+    const ctx: AttemptCtx = { job_id: state.job_id, attempt_id: state.attempt_id, lease_id: state.lease_id };
+    this.send(
+      approvalRequestMsg(ctx, {
+        requestId: req.requestId,
+        toolName: req.toolName,
+        inputSummary: typeof req.input === "string" ? req.input : JSON.stringify(req.input ?? {}),
+        risk: req.risk ?? "medium",
+        approvalTimeoutMs: this.approvalTimeoutMs,
+      }),
+    );
+    const timer = setTimeout(() => {
+      state.approvalTimers.delete(req.requestId);
+      log.warn("approval timed out — auto-deny", { attempt_id: state.attempt_id, request_id: req.requestId });
+      state.run?.resolveApproval?.(req.requestId, "deny", "approval timeout");
+    }, this.approvalTimeoutMs);
+    timer.unref?.();
+    state.approvalTimers.set(req.requestId, timer);
+  }
+
+  handleApprovalResponse(msg: ApprovalResponse): void {
+    const state = this.registry.get(msg.attempt_id);
+    if (!state) return;
+    if (!leaseMatches(state.lease_id, msg.lease_id)) {
+      log.warn("stale lease on approval.response", { attempt_id: msg.attempt_id });
+      return;
+    }
+    const timer = state.approvalTimers.get(msg.request_id);
+    if (!timer) {
+      log.warn("approval.response for an unknown/expired request — ignored", { request_id: msg.request_id });
+      return;
+    }
+    clearTimeout(timer);
+    state.approvalTimers.delete(msg.request_id);
+    state.run?.resolveApproval?.(msg.request_id, msg.decision, msg.reason);
+  }
+
+  private clearApprovals(state: JobState): void {
+    for (const t of state.approvalTimers.values()) clearTimeout(t);
+    state.approvalTimers.clear();
   }
 
   private onEvent(state: JobState, ev: EngineEvent): void {
@@ -155,6 +214,7 @@ export class JobManager {
     const current = this.registry.get(state.attempt_id) === state;
     if (current) this.startedAt.delete(state.attempt_id);
     state.run = null;
+    this.clearApprovals(state);
 
     // Fenced (lease revoked/lost): emit NOTHING on the revoked lease; drop state.
     if (state.fenced) {
@@ -264,6 +324,7 @@ export class JobManager {
     if (!leaseMatches(state.lease_id, msg.lease_id)) return; // not our current lease
     log.warn("lease revoked — local fence", { attempt_id: msg.attempt_id });
     state.fenced = true;
+    this.clearApprovals(state);
     state.run?.cancel(0); // → onDone (fenced): no emit, registry.remove
     this.registry.remove(msg.attempt_id); // ensure removal even if run was already null
     this.startedAt.delete(msg.attempt_id);

@@ -29,14 +29,29 @@ export interface EngineSpec {
   cwd?: string;
 }
 
+/** A tool the engine wants to run that needs remote approval (P3). */
+export interface ApprovalRequest {
+  requestId: string;
+  toolName: string;
+  input: unknown;
+  risk?: "low" | "medium" | "high";
+}
+
+export type ApprovalDecision = "allow" | "deny";
+
 export interface EngineRun {
   onEvent(cb: (ev: EngineEvent) => void): void;
   onDone(cb: (outcome: EngineOutcome) => void): void;
+  /** Fired when the engine needs approval for a tool (P3). The manager forwards
+   *  it as `approval.request` and later calls `resolveApproval`. */
+  onApprovalRequest?(cb: (req: ApprovalRequest) => void): void;
+  /** Deliver the remote decision for a prior `onApprovalRequest`. */
+  resolveApproval?(requestId: string, decision: ApprovalDecision, reason?: string): void;
   /** Backpressure: stop emitting events until `resume()`. */
   pause(): void;
   resume(): void;
   /** Cancel: terminate the run; `onDone` fires with `{status:"cancelled"}`.
-   *  `graceMs` is the SIGTERM→SIGKILL window for the real adapter (P3). */
+   *  `graceMs` is the SIGTERM→SIGKILL window for the real adapter. */
   cancel(graceMs: number): void;
 }
 

@@ -550,6 +550,115 @@ function scenarioN(): void {
   store.close();
 }
 
+/** Approval round-trip (P3): fake engine requests approval after its events; the
+ *  relay auto-responds allow/deny; the daemon routes the decision back. */
+async function approvalRun(decision: "allow" | "deny"): Promise<{ approvalReq: boolean; events: Array<Record<string, unknown>>; resultSeen: boolean }> {
+  const events: Array<Record<string, unknown>> = [];
+  let approvalReq = false;
+  let resultSeen = false;
+  const relay = new MockRelay({
+    approvalDecision: decision,
+    onApprovalRequest: () => {
+      approvalReq = true;
+    },
+    onStreamEvent: (m) => events.push(m.event as Record<string, unknown>),
+    onResult: () => {
+      resultSeen = true;
+    },
+    onAccept: (ctx) => relay.assign(ctx.ws, { job_id: "j1", attempt_id: `appr-${decision}`, lease_id: "L1" }),
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({
+    events: [{ kind: "assistant_text", text: "plan" }],
+    approval: { toolName: "Bash", input: "cmd", risk: "high", onAllow: [{ kind: "tool_result", allowed: true }], onDeny: [{ kind: "tool_result", denied: true }] },
+    outcome: { status: "success" },
+  });
+  const daemon = new Daemon(loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: `agent-${decision}`, dbPath: ":memory:" }), devSigner(), engine);
+  void daemon.start().catch(() => {});
+  await waitUntil(() => resultSeen, 5000);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+  return { approvalReq, events, resultSeen };
+}
+
+async function scenarioP(): Promise<void> {
+  const r = await approvalRun("allow");
+  check("P1 approval.request forwarded to relay", r.approvalReq);
+  check("P2 allow → onAllow tool_result emitted", r.events.some((e) => e.kind === "tool_result" && e.allowed === true));
+  check("P3 job completed after approval", r.resultSeen);
+}
+
+async function scenarioR(): Promise<void> {
+  const r = await approvalRun("deny");
+  check("R1 approval.request forwarded", r.approvalReq);
+  check("R2 deny → onDeny tool_result (blocked)", r.events.some((e) => e.kind === "tool_result" && e.denied === true));
+  check("R3 no allow path taken on deny", !r.events.some((e) => e.allowed === true));
+}
+
+/** Approval timeout → auto-deny: the relay withholds its response; the daemon
+ *  must auto-deny after approvalTimeoutMs and take the onDeny path. */
+async function scenarioS(): Promise<void> {
+  const events: Array<Record<string, unknown>> = [];
+  let resultSeen = false;
+  const relay = new MockRelay({
+    autoApprove: false,
+    onStreamEvent: (m) => events.push(m.event as Record<string, unknown>),
+    onResult: () => {
+      resultSeen = true;
+    },
+    onAccept: (ctx) => relay.assign(ctx.ws, { job_id: "j1", attempt_id: "appr-to", lease_id: "L1" }),
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({
+    events: [{ kind: "assistant_text" }],
+    approval: { toolName: "Bash", input: "cmd", onAllow: [{ kind: "tool_result", allowed: true }], onDeny: [{ kind: "tool_result", denied: true }] },
+    outcome: { status: "success" },
+  });
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-to", dbPath: ":memory:", approvalTimeoutMs: 200 }),
+    devSigner(),
+    engine,
+  );
+  void daemon.start().catch(() => {});
+  const done = await waitUntil(() => resultSeen, 5000);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+  check("S1 approval timeout auto-denies (onDeny path, no relay response)", done && events.some((e) => e.denied === true));
+  check("S2 no allow path on timeout", !events.some((e) => e.allowed === true));
+}
+
+/** Fail-closed: with the approval gate unavailable, a write/exec job is rejected
+ *  (policy_violation); a read-only job is still accepted. */
+async function scenarioT(): Promise<void> {
+  const rejects: Array<{ attempt: string; code: string }> = [];
+  const accepts: string[] = [];
+  const relay = new MockRelay({
+    onJobAccept: (m) => accepts.push(m.attempt_id),
+    onJobReject: (m) => rejects.push({ attempt: m.attempt_id, code: m.code }),
+    onAccept: (ctx) => {
+      relay.assign(ctx.ws, { job_id: "j1", attempt_id: "wr", lease_id: "L1", sandbox: "workspace_write" });
+      relay.assign(ctx.ws, { job_id: "j2", attempt_id: "ro", lease_id: "L1", sandbox: "read_only" });
+    },
+  });
+  const port = await relay.start();
+  const engine = new FakeEngine({ events: [{ kind: "assistant_text" }] });
+  const daemon = new Daemon(
+    loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-t", dbPath: ":memory:" }),
+    devSigner(),
+    engine,
+    false, // gateAvailable = false
+  );
+  void daemon.start().catch(() => {});
+  await waitUntil(() => rejects.length >= 1 && accepts.length >= 1, 5000);
+  daemon.stop();
+  await relay.stop();
+  await sleep(50);
+  check("T1 write job rejected when gate unavailable (policy_violation)", rejects.some((r) => r.attempt === "wr" && r.code === "policy_violation"));
+  check("T2 read-only job still accepted (fail-closed only gates write/exec)", accepts.includes("ro"));
+}
+
 async function main(): Promise<void> {
   console.log("=== hugind P1+P2a e2e ===\n[scenario A: live handshake + heartbeat + reconnect]");
   await scenarioA();
@@ -581,6 +690,14 @@ async function main(): Promise<void> {
   scenarioM();
   console.log("\n[scenario N: workspace-invalid job → job.reject pre-accept]");
   scenarioN();
+  console.log("\n[scenario P: approval round-trip — allow]");
+  await scenarioP();
+  console.log("\n[scenario R: approval round-trip — deny]");
+  await scenarioR();
+  console.log("\n[scenario S: approval timeout → auto-deny]");
+  await scenarioS();
+  console.log("\n[scenario T: fail-closed when the gate is unavailable]");
+  await scenarioT();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }
