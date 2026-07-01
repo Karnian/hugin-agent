@@ -89,6 +89,7 @@ export class JobManager {
       repoRoot: msg.workspace.repo_root,
       baseSha: msg.workspace.base_sha,
       cwd: msg.workspace.cwd,
+      sandbox: msg.sandbox, // ClaudeEngine ENFORCES read_only (disallow write/exec)
     };
     // Pre-accept workspace/policy validation (allowlist, git, path safety) → reject
     // BEFORE accept/spawn (plan §5.10). The fake engine omits validate → skipped.

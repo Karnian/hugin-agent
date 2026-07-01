@@ -20,7 +20,7 @@ import { loadConfig } from "../src/config";
 import { Daemon } from "../src/daemon";
 import { devSigner } from "../src/conn/handshake";
 import { ClaudeEngine } from "../src/engine/claude";
-import { buildIsolation, selfCheckLogin } from "../src/engine/isolate";
+import { buildIsolation, selfCheckGate, selfCheckLogin } from "../src/engine/isolate";
 import { MockRelay } from "../mock-relay/server";
 
 const SCRATCH = "/private/tmp/claude-501/-Users-k-Desktop-sub-project-hugin-agent/500bdae6-f9cf-45b3-9e5b-a2819e8bcd4b/scratchpad/e2e-claude";
@@ -109,6 +109,61 @@ async function main(): Promise<void> {
   daemon.stop();
   await relay.stop();
   await sleep(100);
+
+  // --- Track B: live approval gate (guarded — validated only where it fires) ---
+  console.log("\n[Track B] approval-gate live check");
+  const gateStateDir = join(SCRATCH, "gate-state");
+  rmSync(gateStateDir, { recursive: true, force: true });
+  const gateIso = buildIsolation("config-dir", gateStateDir);
+  const gate = await selfCheckGate(gateIso.env);
+  console.log(`  [finding] gate self-check → ${gate.gateFires ? "LIVE" : "UNAVAILABLE"} (${gate.detail})`);
+  if (!gate.gateFires) {
+    gateIso.cleanup();
+    console.log("  gate not reachable on this host (isolation drops the keychain login + no env-auth).");
+    console.log("  → set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN (auth-spec §9) and re-run to validate deny→blocked.");
+  } else {
+    // A real write job, relay DENIES: the Write tool must route through the LIVE
+    // bridge and be blocked. The manager accepts it because gateAvailable=true.
+    let approvalTool: string | null = null;
+    let gateResultSeen = false;
+    const relayB = new MockRelay({
+      approvalDecision: "deny",
+      onApprovalRequest: (m) => {
+        approvalTool = m.tool_name;
+      },
+      onResult: () => {
+        gateResultSeen = true;
+      },
+      onAccept: (ctx) =>
+        relayB.assign(ctx.ws, {
+          job_id: "jg",
+          attempt_id: "gate1",
+          lease_id: "L1",
+          prompt: "Use the Write tool to create a file named gate-test.txt containing HELLO.",
+          repo_root: repo,
+          sandbox: "workspace_write",
+          approval_policy: "on_write",
+        }),
+    });
+    const portB = await relayB.start();
+    const engineB = new ClaudeEngine({ env: gateIso.env, allowlist: [repo], stateDir: gateStateDir, timeoutMs: 120_000 });
+    const daemonB = new Daemon(
+      loadConfig({ serverUrl: `ws://127.0.0.1:${portB}`, agentId: "agent-gate", dbPath: ":memory:", projectRoots: [repo] }),
+      devSigner(),
+      engineB,
+      true, // gateAvailable — the self-check just passed
+    );
+    void daemonB.start().catch((e) => console.error("daemonB", e));
+    await waitUntil(() => gateResultSeen, 120_000);
+    check("B1 real claude routed a tool through the LIVE approval bridge (approval.request forwarded)", approvalTool !== null);
+    check("B2 denied gated job reached a terminal result (deny handled, not hung)", gateResultSeen);
+    console.log(`  routed tool: ${approvalTool ?? "(none)"} — manual: confirm gate-test.txt was NOT written to the attempt worktree.`);
+    daemonB.stop();
+    await relayB.stop();
+    gateIso.cleanup();
+    await sleep(100);
+  }
+
   console.log(`\n${failures === 0 ? "ALL REAL-CLI CHECKS PASS" : `${failures} failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }

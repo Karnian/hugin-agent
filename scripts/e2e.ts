@@ -13,9 +13,12 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import type { WebSocket } from "ws";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { LIMITS, PROTOCOL_VERSION, parseMessage } from "../protocol/v1/index";
 import { canonicalizeServerOrigin } from "../protocol/v1/origin";
 import { buildTranscript } from "../protocol/v1/transcript";
@@ -29,7 +32,10 @@ import { keychainSeedStore, keychainSigner, memorySeedStore, newDeviceKey } from
 import { decodeInbound } from "../src/conn/framing";
 import { RelayClient } from "../src/conn/client";
 import { FakeEngine } from "../src/engine/fake-engine";
-import type { Engine } from "../src/engine/types";
+import { ClaudeEngine } from "../src/engine/claude";
+import { ApprovalBridge, permissionServerLaunch } from "../src/engine/permission";
+import { buildIsolation, selfCheckGate } from "../src/engine/isolate";
+import type { ApprovalRequest, Engine } from "../src/engine/types";
 import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
@@ -1146,8 +1152,193 @@ async function scenarioAG(): Promise<void> {
   check("AG1 premature hello.accepted discarded — handshake used the post-hello accept", hs.connectionEpoch === 1);
 }
 
+// ---------------------------------------------------------------------------
+// Track B — real approval bridge (CI-safe: an MCP client stands in for claude).
+// ---------------------------------------------------------------------------
+
+/** An MCP Client spawns the REAL permission.ts subprocess and calls
+ *  `permission_prompt` exactly as claude's `--permission-prompt-tool` would —
+ *  proving the whole round-trip (MCP stdio + unix-socket IPC + onApprovalRequest/
+ *  resolve) with NO real claude or env-auth. */
+async function approvalBridgeRoundTrip(decision: "allow" | "deny"): Promise<{ req: ApprovalRequest | null; payload: Record<string, unknown> }> {
+  const sockPath = join(tmpdir(), `hg-e2e-appr-${process.pid}-${decision}.sock`);
+  const bridge = new ApprovalBridge(sockPath);
+  await bridge.start();
+  let req: ApprovalRequest | null = null;
+  bridge.onRequest((r) => {
+    req = r;
+    bridge.resolve(r.requestId, decision, decision === "deny" ? "blocked by e2e" : undefined);
+  });
+  const launch = permissionServerLaunch();
+  const childEnv: Record<string, string> = { ...(process.env as Record<string, string>), HUGIN_APPROVAL_SOCK: sockPath };
+  const transport = new StdioClientTransport({ command: launch.command, args: launch.args, env: childEnv });
+  const client = new Client({ name: "e2e-claude-standin", version: "1.0.0" });
+  let payload: Record<string, unknown> = {};
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: "permission_prompt", arguments: { tool_name: "Bash", input: { command: "ls -la" } } });
+    const content = (result.content as Array<{ type: string; text?: string }> | undefined) ?? [];
+    payload = JSON.parse(content.find((c) => c.type === "text")?.text ?? "{}") as Record<string, unknown>;
+  } finally {
+    await client.close().catch(() => {});
+    await bridge.close();
+  }
+  return { req, payload };
+}
+
+async function scenarioAH(): Promise<void> {
+  const allow = await approvalBridgeRoundTrip("allow");
+  check(
+    "AH1 bridge relays the tool prompt (toolName + input) to onApprovalRequest",
+    allow.req?.toolName === "Bash" && JSON.stringify(allow.req?.input) === JSON.stringify({ command: "ls -la" }),
+  );
+  check(
+    "AH2 allow → {behavior:allow, updatedInput:<cached input>}",
+    allow.payload.behavior === "allow" && (allow.payload.updatedInput as { command?: string } | undefined)?.command === "ls -la",
+  );
+
+  const deny = await approvalBridgeRoundTrip("deny");
+  check("AH3 deny → {behavior:deny, message} (fail-closed shape)", deny.payload.behavior === "deny" && typeof deny.payload.message === "string");
+}
+
+/** Track B wiring (CI-safe): ClaudeEngine spawns a FAKE claude that dumps its
+ *  argv + the --mcp-config it was handed. Proves the daemon passes the
+ *  permission-prompt-tool + strict-mcp-config wiring correctly — without real
+ *  claude. (The live gate itself is validated on a suitable host via e2e:claude.) */
+async function scenarioAI(): Promise<void> {
+  const base = join(SCRATCH, "wiring");
+  rmSync(base, { recursive: true, force: true });
+  const repo = join(base, "repo");
+  mkdirSync(repo, { recursive: true });
+  const git = (...a: string[]) => execFileSync("git", ["-C", repo, ...a], { stdio: "pipe" });
+  git("init", "-q");
+  git("config", "user.email", "e2e@test.local");
+  git("config", "user.name", "e2e");
+  writeFileSync(join(repo, "f.txt"), "x\n");
+  git("add", "-A");
+  git("commit", "-qm", "init");
+
+  const argvOut = join(base, "argv.json");
+  const mcpOut = join(base, "mcp.json");
+  const fakeClaude = join(base, "fake-claude.js");
+  writeFileSync(
+    fakeClaude,
+    `#!/usr/bin/env node
+const fs = require('fs');
+const argv = process.argv.slice(2);
+fs.writeFileSync(process.env.HG_ARGV_OUT, JSON.stringify(argv));
+const i = argv.indexOf('--mcp-config');
+if (i >= 0) fs.writeFileSync(process.env.HG_MCP_OUT, fs.readFileSync(argv[i + 1], 'utf8'));
+process.exit(0);
+`,
+  );
+  chmodSync(fakeClaude, 0o755);
+
+  const engine = new ClaudeEngine({ command: fakeClaude, env: { HG_ARGV_OUT: argvOut, HG_MCP_OUT: mcpOut }, allowlist: [repo], stateDir: base, timeoutMs: 30_000 });
+  const run = engine.run({ engine: "claude", prompt: "hi", attemptId: "wire1", repoRoot: repo });
+  await new Promise<void>((res) => run.onDone(() => res()));
+  await sleep(50);
+
+  const argv = JSON.parse(readFileSync(argvOut, "utf8")) as string[];
+  check("AI1 claude args route the gate through mcp__hugin__permission_prompt", argv.includes("--permission-prompt-tool") && argv.includes("mcp__hugin__permission_prompt"));
+  check("AI2 claude args include --mcp-config + --strict-mcp-config", argv.includes("--mcp-config") && argv.includes("--strict-mcp-config"));
+  check("AI3 claude args keep --permission-mode default (gate can fire)", argv.includes("--permission-mode") && argv[argv.indexOf("--permission-mode") + 1] === "default");
+  const mcp = JSON.parse(readFileSync(mcpOut, "utf8")) as { mcpServers?: { hugin?: { type?: string; command?: string; env?: { HUGIN_APPROVAL_SOCK?: string } } } };
+  const hugin = mcp.mcpServers?.hugin;
+  check(
+    "AI4 mcp-config declares the hugin stdio server + HUGIN_APPROVAL_SOCK",
+    hugin?.type === "stdio" && hugin.command === permissionServerLaunch().command && typeof hugin.env?.HUGIN_APPROVAL_SOCK === "string",
+  );
+  // read_only (default) must DISALLOW the write/exec tools (enforced sandbox).
+  check(
+    "AI5 read_only enforced: --disallowedTools includes Write/Edit/Bash",
+    argv.includes("--disallowedTools") && argv.includes("Write") && argv.includes("Edit") && argv.includes("Bash"),
+  );
+
+  // workspace_write must NOT disallow those tools (they run, gated by the bridge).
+  const wwArgvOut = join(base, "argv-ww.json");
+  const engineWW = new ClaudeEngine({ command: fakeClaude, env: { HG_ARGV_OUT: wwArgvOut }, allowlist: [repo], stateDir: base, timeoutMs: 30_000 });
+  const runWW = engineWW.run({ engine: "claude", prompt: "hi", attemptId: "wire2", repoRoot: repo, sandbox: "workspace_write" });
+  await new Promise<void>((res) => runWW.onDone(() => res()));
+  await sleep(50);
+  const wwArgv = JSON.parse(readFileSync(wwArgvOut, "utf8")) as string[];
+  check("AI6 workspace_write leaves write tools enabled (no --disallowedTools)", !wwArgv.includes("--disallowedTools"));
+  rmSync(base, { recursive: true, force: true });
+}
+
+/** Track B gate self-check (CI-safe): selfCheckGate asks a FAKE claude to WRITE a
+ *  sentinel, DENIES it, and requires the write to have been BLOCKED. Proves the
+ *  gate is "live" only when a dangerous tool both routes through the prompt AND is
+ *  actually stopped by a deny — not merely that the prompt was called. */
+async function scenarioAJ(): Promise<void> {
+  const base = join(SCRATCH, "gatecheck");
+  rmSync(base, { recursive: true, force: true });
+  mkdirSync(base, { recursive: true });
+  const mk = (name: string, body: string): string => {
+    const p = join(base, name);
+    writeFileSync(p, `#!/usr/bin/env node\n${body}`);
+    chmodSync(p, 0o755);
+    return p;
+  };
+  // Connect to the bridge (via the --mcp-config socket) and raise a Write prompt.
+  const CONNECT = `const fs=require('fs'),net=require('net');
+const a=process.argv.slice(2);
+const cfg=JSON.parse(fs.readFileSync(a[a.indexOf('--mcp-config')+1],'utf8'));
+const c=net.connect(cfg.mcpServers.hugin.env.HUGIN_APPROVAL_SOCK);
+let b='';
+c.on('error',()=>process.exit(1));
+c.on('connect',()=>c.write(JSON.stringify({t:'req',id:'p',tool_name:'Write',input:{file_path:process.env.HUGIN_GATE_SENTINEL,content:'X'}})+'\\n'));`;
+  const fires = mk("claude-fires.js", `${CONNECT}
+c.on('data',(d)=>{b+=d;if(b.includes('"decision"')){c.end();process.exit(0);}});`); // honors deny → no write
+  const ignores = mk("claude-ignores.js", `${CONNECT}
+c.on('data',(d)=>{b+=d;if(b.includes('"decision"')){fs.writeFileSync(process.env.HUGIN_GATE_SENTINEL,'X');c.end();process.exit(0);}});`); // ignores deny → writes
+  const preapproved = mk("claude-preapproved.js", "require('fs').writeFileSync(process.env.HUGIN_GATE_SENTINEL,'X');process.exit(0);"); // never prompts → writes
+
+  const firesR = await selfCheckGate({}, fires, 8000);
+  check("AJ1 gate LIVE: prompt fired AND deny blocked the write → gateFires", firesR.gateFires === true);
+  const ignoresR = await selfCheckGate({}, ignores, 8000);
+  check("AJ2 deny NOT honored (write despite prompt) → gate unavailable (fail closed)", ignoresR.gateFires === false);
+  const preR = await selfCheckGate({}, preapproved, 5000);
+  check("AJ3 tool pre-approved (no prompt, write happened) → gate unavailable (fail closed)", preR.gateFires === false);
+  rmSync(base, { recursive: true, force: true });
+}
+
+/** Track B env-auth injection (CI-safe): buildIsolation folds ANTHROPIC_API_KEY /
+ *  CLAUDE_CODE_OAUTH_TOKEN into the isolated child env (the isolation-finding
+ *  unblock), and injects nothing when neither is set. */
+function scenarioAK(): void {
+  const base = join(SCRATCH, "envauth");
+  rmSync(base, { recursive: true, force: true });
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  const prevTok = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  try {
+    process.env.ANTHROPIC_API_KEY = "sk-ant-e2e-fake";
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const iso = buildIsolation("home-swap", base);
+    check(
+      "AK1 env-auth (ANTHROPIC_API_KEY) injected into the isolated child env",
+      iso.env.ANTHROPIC_API_KEY === "sk-ant-e2e-fake" && iso.env.HOME === join(base, "isolation", "home-swap"),
+    );
+    iso.cleanup();
+
+    delete process.env.ANTHROPIC_API_KEY;
+    const iso2 = buildIsolation("config-dir", base);
+    check(
+      "AK2 no env-auth set → none injected (child relies on host login)",
+      iso2.env.ANTHROPIC_API_KEY === undefined && iso2.env.CLAUDE_CODE_OAUTH_TOKEN === undefined,
+    );
+    iso2.cleanup();
+  } finally {
+    if (prevKey !== undefined) process.env.ANTHROPIC_API_KEY = prevKey;
+    else delete process.env.ANTHROPIC_API_KEY;
+    if (prevTok !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = prevTok;
+    else delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<void> {
-  console.log("=== hugind e2e (P1–P5 + Track A auth) ===\n[scenario A: live handshake + heartbeat + reconnect]");
+  console.log("=== hugind e2e (P1–P5 + Track A auth + Track B approval) ===\n[scenario A: live handshake + heartbeat + reconnect]");
   await scenarioA();
   console.log("\n[scenario B: framing + epoch gate]");
   scenarioB();
@@ -1211,6 +1402,14 @@ async function main(): Promise<void> {
   await scenarioAF();
   console.log("\n[scenario AG: Track A premature hello.accepted discarded]");
   await scenarioAG();
+  console.log("\n[scenario AH: Track B approval bridge round-trip (MCP client stand-in)]");
+  await scenarioAH();
+  console.log("\n[scenario AI: Track B ClaudeEngine permission-prompt-tool wiring (fake claude)]");
+  await scenarioAI();
+  console.log("\n[scenario AJ: Track B gate self-check drives gateAvailable (fake claude)]");
+  await scenarioAJ();
+  console.log("\n[scenario AK: Track B env-auth injection into isolation]");
+  scenarioAK();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }

@@ -12,9 +12,13 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { RejectCode } from "../conn/outbound";
 import type { Engine, EngineEvent, EngineOutcome, EngineRun, EngineSpec } from "./types";
 import { normalizeClaudeLine } from "./normalize";
+import { ApprovalBridge, PERMISSION_PROMPT_TOOL, approvalRunDir, permissionMcpServers } from "./permission";
+import { scrubbedChildEnv } from "./isolate";
 import { createWorktree, validateWorkspace, type WorktreeError, type WorktreeHandle } from "../workspace/worktree";
 import { log } from "../log";
 
@@ -24,6 +28,11 @@ export interface ClaudeEngineOpts {
   allowlist: string[];
   stateDir: string;
   timeoutMs?: number;
+  /** Wire the real approval bridge (Track B): spawn claude with an in-process
+   *  `--permission-prompt-tool` MCP server so tool prompts route through
+   *  onApprovalRequest/resolveApproval. Default ON; disable for tests that don't
+   *  want an MCP subprocess. */
+  approvalBridge?: boolean;
 }
 
 export class ClaudeEngine implements Engine {
@@ -58,6 +67,11 @@ export class ClaudeEngine implements Engine {
     let stdoutBuf = "";
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
     let killTimer: ReturnType<typeof setTimeout> | null = null;
+    // Track B: per-run approval bridge in a 0700 dir (unix socket + mcp-config;
+    // no TCP port, owner-only). Its lifetime is the run's; onApprovalRequest/
+    // resolveApproval delegate to it.
+    const runDir = this.opts.approvalBridge === false ? null : approvalRunDir();
+    const bridge = runDir ? new ApprovalBridge(join(runDir, "s.sock")) : null;
 
     const emit = (e: EngineEvent) => {
       for (const cb of eventCbs) cb(e);
@@ -68,6 +82,14 @@ export class ClaudeEngine implements Engine {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       wt?.cleanup();
+      void bridge?.close();
+      if (runDir) {
+        try {
+          rmSync(runDir, { recursive: true, force: true });
+        } catch {
+          /* best effort */
+        }
+      }
       for (const cb of doneCbs) cb(o);
     };
 
@@ -92,7 +114,7 @@ export class ClaudeEngine implements Engine {
     };
 
     // Defer worktree + spawn so the caller registers onEvent/onDone first.
-    queueMicrotask(() => {
+    queueMicrotask(async () => {
       if (finished) return;
       try {
         wt = createWorktree({
@@ -111,9 +133,41 @@ export class ClaudeEngine implements Engine {
       }
 
       const args = ["-p", spec.prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "default"];
+      // Enforce the sandbox at the engine: read_only physically DISALLOWS the
+      // write/exec tools, so a read_only job cannot write or exec even under a
+      // permissive host permission config or when the approval gate is unavailable
+      // (defense-in-depth on the manager's fail-closed admission). Absent ⇒
+      // read_only (safest). workspace_write / full leave the tools enabled, gated
+      // by the approval bridge below.
+      if ((spec.sandbox ?? "read_only") === "read_only") {
+        args.push("--disallowedTools", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash");
+      }
+      // Track B: bring up the approval bridge + write the permission-prompt MCP
+      // config so every tool prompt routes through onApprovalRequest. Fail-closed:
+      // any bridge/config error ends the run rather than running it ungated.
+      if (bridge) {
+        try {
+          await bridge.start();
+        } catch (e) {
+          emit({ kind: "engine_error", error: `approval bridge failed: ${String((e as Error).message)}` });
+          finish({ status: "error", errorKind: "approval_bridge" });
+          return;
+        }
+        if (finished) return; // cancelled while the bridge was starting
+        const mcpConfigPath = join(runDir!, "mcp.json"); // runDir is set whenever bridge is
+        try {
+          writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers: permissionMcpServers(bridge.socketPath) }), { mode: 0o600 });
+        } catch (e) {
+          emit({ kind: "engine_error", error: `mcp-config write failed: ${String((e as Error).message)}` });
+          finish({ status: "error", errorKind: "approval_bridge" });
+          return;
+        }
+        args.push("--mcp-config", mcpConfigPath, "--strict-mcp-config", "--permission-prompt-tool", PERMISSION_PROMPT_TOOL);
+      }
+
       child = spawn(this.opts.command ?? "claude", args, {
         cwd: wt.dir,
-        env: { ...process.env, ...this.opts.env },
+        env: scrubbedChildEnv(this.opts.env), // allowlist only (auth-spec §9); no full-env leak
         stdio: ["ignore", "pipe", "pipe"], // prompt via -p, NOT stdin (spike finding)
         detached: true, // own process group for cancel
       });
@@ -147,6 +201,8 @@ export class ClaudeEngine implements Engine {
     return {
       onEvent: (cb) => eventCbs.push(cb),
       onDone: (cb) => doneCbs.push(cb),
+      onApprovalRequest: bridge ? (cb) => bridge.onRequest(cb) : undefined,
+      resolveApproval: bridge ? (id, decision, reason) => bridge.resolve(id, decision, reason) : undefined,
       pause: () => {
         paused = true;
         child?.stdout?.pause();

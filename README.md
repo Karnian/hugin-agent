@@ -22,8 +22,9 @@ ever opened.**
   The **real Claude adapter** streams a job end-to-end on the real CLI
   (`npm run e2e:claude`, allow / read-only path). The **approval round-trip +
   fail-closed policy** are implemented and tested at the manager/protocol level
-  with a fake engine — the **live Claude permission bridge is deferred**, so the
-  daemon currently **fails closed** on write/exec jobs (see below).
+  with a fake engine; the **live Claude permission bridge is built** (Track B,
+  below). On a host where the isolated gate can't reach a login (no env-auth) the
+  daemon **fails closed** on write/exec jobs.
 - **Production auth (Track A) — built + tested.** A real Ed25519 device key in the
   OS keychain (`@napi-rs/keyring`) signs the frozen handshake transcript
   (`keychainSigner`, drop-in for the dev stub); `hugin-agent connect` runs a
@@ -31,10 +32,18 @@ ever opened.**
   **public** key — the private key never leaves the host. The mock relay now
   **verifies** the Ed25519 possession proof (`npm run e2e` scenarios AA–AE).
   Security surface: [`docs/auth-pairing-spec.md`](docs/auth-pairing-spec.md).
-- **Deferred** (each explicitly scoped): the real MCP permission bridge for the
-  live approval gate (needs env-based CLI auth under isolation — see
-  [`src/engine/isolate.ts`](src/engine/isolate.ts)); cloud integration against the
-  real relay; P5 service packaging is a skeleton under [`service/`](service/README.md).
+- **Approval bridge (Track B) — built + tested.** The real Claude
+  `--permission-prompt-tool` is wired to `onApprovalRequest` via an in-process
+  `ApprovalBridge` (a per-run UNIX socket — no inbound TCP port) + a stdio MCP
+  subprocess ([`src/engine/permission.ts`](src/engine/permission.ts)); a tool
+  prompt blocks on the remote decision (fail-closed: a broken channel denies).
+  Startup `selfCheckGate` drives `gateAvailable` (a forced tool must actually route
+  through the prompt), and env-auth is injected into the isolated child. Bridge +
+  wiring + gate-check are CI-tested (`npm run e2e` AH–AK, no real claude); the live
+  deny→blocked gate is guarded in `npm run e2e:claude` (needs env-auth or a clean
+  login — see the isolation finding in [`src/engine/isolate.ts`](src/engine/isolate.ts)).
+- **Deferred** (each explicitly scoped): cloud integration against the real relay
+  (Track C); P5 service packaging is a skeleton under [`service/`](service/README.md).
 
 ## Architecture
 

@@ -27,6 +27,10 @@ export interface EngineSpec {
   baseSha?: string;
   /** Optional working subdir within the repo. */
   cwd?: string;
+  /** Job sandbox. ClaudeEngine ENFORCES `read_only` (disallow write/exec tools),
+   *  so a read_only job cannot write/exec even under a permissive host permission
+   *  config or an unavailable gate. Absent ⇒ treated as `read_only` (safest). */
+  sandbox?: "read_only" | "workspace_write" | "full";
 }
 
 /** A tool the engine wants to run that needs remote approval (P3). */

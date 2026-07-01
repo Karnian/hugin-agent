@@ -4,6 +4,38 @@ The daemon, built against the frozen wire protocol `v1.0.0` + a mock relay, phas
 by phase ([hugind-mvp-plan.md](hugind-mvp-plan.md) §6). Each phase gated on
 `npm run typecheck` + `npm run e2e` + a Codex cross-review (looped to zero issues).
 
+## Track B — real MCP approval bridge (permission-prompt-tool → onApprovalRequest)
+Wires Claude Code's `--permission-prompt-tool` to the daemon's remote-approval seam
+(brief §4B). `src/engine/permission.ts` — an `ApprovalBridge` (daemon-side
+UNIX-socket server, NO TCP port, so the no-inbound-port invariant holds) + the
+stdio MCP permission subprocess claude spawns via `--mcp-config`: on a tool prompt
+it caches the input, relays over the socket, BLOCKS for the decision, and returns
+`{behavior:allow,updatedInput}` / `{behavior:deny,message}` — fail-closed (a broken
+channel ⇒ deny). `ClaudeEngine.run` starts the bridge, writes the mcp-config, and
+spawns claude with `--strict-mcp-config --permission-prompt-tool
+mcp__hugin__permission_prompt --permission-mode default`; `onApprovalRequest` /
+`resolveApproval` delegate to the bridge (the P3 manager round-trip is unchanged).
+`isolate.ts` scrubs the child env to an allowlist (auth-spec §9 — no full-env
+leak, no stray `CLAUDE_CONFIG_DIR`), injects env-auth
+(`ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`) into the isolated child (the
+isolation-finding unblock), and adds `selfCheckGate` — a startup probe that asks
+claude to WRITE a sentinel, DENIES it, and requires the prompt to fire AND the
+write to be BLOCKED AND claude to exit (login surviving / a prompt firing alone are
+not sufficient). Two fail-open holes are closed: read_only jobs are ENFORCED at the
+engine (`--disallowedTools Write/Edit/…/Bash`), so a read_only job can't write/exec
+even under a permissive host config; and `index.ts` marks `gateAvailable` LIVE only
+under the ISOLATED empty-allow config (where every tool uniformly prompts) — the
+host-fallback / `none` path fails closed, so a gated job never runs where a host
+allow-list could pre-approve Bash. The claude-facing request/response shape is the
+community/de-facto contract (Anthropic hasn't published it — CC 2.1.170); the
+daemon-side bridge is fully unit-tested. Wire unchanged (`v1.0.0` frozen; Track B
+touches no protocol file). CI-safe e2e (no real claude/env-auth): AH (bridge
+round-trip via an MCP-client stand-in) / AI1–6 (arg + mcp-config wiring + read_only
+`--disallowedTools`) / AJ1–3 (`selfCheckGate`: fired+blocked→live, deny-ignored→off,
+pre-approved→off) / AK (env-auth injection). The LIVE deny→blocked gate is guarded
+in `e2e:claude` — it needs env-auth or a clean login (this host has neither, per
+the isolation finding). Codex cross-reviewed (4 rounds) → CLEAN.
+
 ## Track A — production auth (device-key signer + pairing + relay verify)
 Real Ed25519 device key replaces the dev stub signer, security surface per
 [auth-pairing-spec.md](auth-pairing-spec.md). `protocol/v1/ed25519.ts` — shared

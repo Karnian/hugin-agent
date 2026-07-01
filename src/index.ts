@@ -17,7 +17,7 @@ import { keychainSigner } from "./auth/keystore";
 import { readPairingConfig } from "./auth/config-file";
 import { configFilePath } from "./auth/paths";
 import { ClaudeEngine } from "./engine/claude";
-import { buildIsolation, selfCheckLogin } from "./engine/isolate";
+import { buildIsolation, selfCheckGate, selfCheckLogin } from "./engine/isolate";
 import { log } from "./log";
 
 function loadConfigOrExit(): Config {
@@ -52,31 +52,39 @@ async function main(): Promise<void> {
   const config = loadConfigOrExit();
 
   // Permission isolation + startup login self-check (plan §5.6). If isolation
-  // drops the login (macOS keychain hosts — see isolate.ts), fall back to the
-  // host config; the approval gate is then UNAVAILABLE and gated write/exec jobs
-  // must fail closed (P3 wires the enforcement + the prompt bridge).
+  // drops the login (macOS keychain hosts — see isolate.ts) and no env-auth was
+  // injected, fall back to the host config so read_only jobs can still run.
   const iso = buildIsolation(config.isolation, config.stateDir);
   let engineEnv = iso.env;
-  // Isolation-readiness diagnostic: does isolation preserve the login? (A login
-  // probe is necessary-but-not-sufficient — it does NOT prove the permission
-  // prompt fires; that needs the real MCP bridge, deferred.)
+  let isolatedConfig = false; // running under the ISOLATED empty-allow config?
   if (iso.mode !== "none") {
     const login = await selfCheckLogin(iso.env, config.engineCommand);
     if (login.loggedIn) {
       log.info("isolation preserves login", { mode: iso.mode });
+      isolatedConfig = true;
     } else {
       log.warn("isolation dropped the login — using host config", { mode: iso.mode, detail: login.detail });
       iso.cleanup();
       engineEnv = {};
     }
   }
-  // The real approval-prompt bridge (claude --permission-prompt-tool ->
-  // onApprovalRequest) is NOT wired to ClaudeEngine yet (deferred with the
-  // isolation solve), so there is no LIVE gate for the real engine. Fail closed:
-  // gated jobs (write/exec or approval_policy != never) are rejected until the
-  // bridge lands. A login probe passing is not proof the gate fires.
-  const gateAvailable = false;
-  log.warn("approval gate not yet wired (real MCP bridge deferred) — gated jobs are rejected (fail closed); read_only+never jobs run");
+  // Track B: the approval gate is LIVE only when BOTH hold — (1) we run under the
+  // ISOLATED empty-allow config, where EVERY tool uniformly prompts (a host
+  // allow-list or `none` could pre-approve some tool like Bash and let it bypass
+  // the bridge — so gated jobs must NOT run there), and (2) a forced Write is
+  // actually gated AND a deny BLOCKS it. Under empty-allow, the Write probe
+  // passing implies all dangerous tools are gated the same way. Anywhere else →
+  // fail closed: gated (write/exec or approval_policy != never) jobs are rejected;
+  // read_only jobs still run with their write/exec tools disallowed at the engine.
+  let gateAvailable = false;
+  if (isolatedConfig) {
+    const gate = await selfCheckGate(engineEnv, config.engineCommand);
+    gateAvailable = gate.gateFires;
+    if (gateAvailable) log.info("approval gate LIVE — gated jobs run with remote approval", { detail: gate.detail });
+    else log.warn("approval gate unavailable — gated jobs rejected (fail closed); read_only runs", { detail: gate.detail });
+  } else {
+    log.warn("no isolated permission config (host-fallback or none) — approval gate unavailable; gated jobs rejected (fail closed), read_only runs");
+  }
 
   const engine = new ClaudeEngine({
     command: config.engineCommand,
