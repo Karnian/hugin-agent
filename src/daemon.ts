@@ -9,6 +9,7 @@ import type { Config } from "./config";
 import type { Message } from "../protocol/v1/index";
 import type { Engine } from "./engine/types";
 import { RelayClient } from "./conn/client";
+import { agentDrainingMsg } from "./conn/outbound";
 import { performHandshake, type ResumeState, type Signer } from "./conn/handshake";
 import { startHeartbeat } from "./conn/heartbeat";
 import { backoffDelay, sleep } from "./conn/reconnect";
@@ -196,6 +197,14 @@ export class Daemon {
   stop(): void {
     this.running = false;
     this.abort.abort();
+    // Graceful drain notice before we disconnect (best-effort; only if authed).
+    if (this.activeClient) {
+      try {
+        this.activeClient.send(agentDrainingMsg("shutdown"));
+      } catch {
+        /* socket already gone */
+      }
+    }
     // Close whichever client this session holds — in-flight (pre-auth) or active —
     // so a stop() during the handshake doesn't leave the loop awaiting close.
     (this.sessionClient ?? this.activeClient)?.close();

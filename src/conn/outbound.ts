@@ -17,6 +17,11 @@ export function heartbeatMsg(): Message {
   return { ...envelope(), type: "heartbeat" };
 }
 
+/** Graceful drain notice sent before the daemon disconnects (P5). */
+export function agentDrainingMsg(reason: "shutdown" | "update" | "idle_timeout", etaMs?: number): Message {
+  return { ...envelope(), type: "agent.draining", reason, eta_ms: etaMs };
+}
+
 // ---- Attempt-scoped builders: every one stamps `lease_id` via `ctx` (A3) ----
 
 export interface AttemptCtx {

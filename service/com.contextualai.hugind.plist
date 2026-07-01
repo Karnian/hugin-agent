@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd agent for hugind (macOS). Template — fill REPLACE_ME + paths, then:
+       cp service/com.contextualai.hugind.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.contextualai.hugind.plist
+     A LaunchAgent (not Daemon) so it runs in your login session — the macOS
+     keychain Claude login is per-user and needs that session. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.contextualai.hugind</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>cd /opt/hugin-agent &amp;&amp; exec npx tsx src/index.ts</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HUGIND_SERVER_URL</key><string>wss://relay.example.com</string>
+    <key>HUGIND_AGENT_ID</key><string>REPLACE_ME</string>
+    <key>HUGIND_TENANT_ID</key><string>REPLACE_ME</string>
+    <key>HUGIND_AGENT_VERSION</key><string>0.0.0</string>
+    <key>HUGIND_PROJECT_ROOTS</key><string>/Users/you/code</string>
+    <key>HUGIND_STATE_DIR</key><string>/Users/you/Library/Application Support/hugind</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/you/Library/Logs/hugind.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/Library/Logs/hugind.err.log</string>
+</dict>
+</plist>

@@ -832,6 +832,29 @@ async function scenarioY(): Promise<void> {
   check("Y1 stop() during handshake stops the daemon cleanly (no hang)", stopped === true);
 }
 
+/** Graceful drain (P5): stop() sends agent.draining before disconnecting. */
+async function scenarioZ(): Promise<void> {
+  let accepted = false;
+  let drained = false;
+  const relay = new MockRelay({
+    onAccept: () => {
+      accepted = true;
+    },
+    onDraining: () => {
+      drained = true;
+    },
+  });
+  const port = await relay.start();
+  const daemon = new Daemon(loadConfig({ serverUrl: `ws://127.0.0.1:${port}`, agentId: "agent-z", dbPath: ":memory:" }), devSigner(), new FakeEngine({ events: [] }));
+  void daemon.start().catch(() => {});
+  await waitUntil(() => accepted, 5000);
+  daemon.stop();
+  const sawDrain = await waitUntil(() => drained, 2000);
+  await relay.stop();
+  await sleep(50);
+  check("Z1 graceful stop() sends agent.draining before disconnect", sawDrain);
+}
+
 async function main(): Promise<void> {
   console.log("=== hugind P1+P2a e2e ===\n[scenario A: live handshake + heartbeat + reconnect]");
   await scenarioA();
@@ -881,6 +904,8 @@ async function main(): Promise<void> {
   await scenarioX();
   console.log("\n[scenario Y: stop() during the pre-auth handshake]");
   await scenarioY();
+  console.log("\n[scenario Z: graceful drain on stop]");
+  await scenarioZ();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }

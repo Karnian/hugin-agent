@@ -39,6 +39,8 @@ export interface MockRelayOpts {
   onStreamEvent?: (m: Extract<Message, { type: "stream.event" }>) => void;
   onResult?: (m: Extract<Message, { type: "job.result" }>) => void;
   onApprovalRequest?: (m: Extract<Message, { type: "approval.request" }>) => void;
+  onJobStatus?: (m: Extract<Message, { type: "job.status" }>) => void;
+  onDraining?: (m: Extract<Message, { type: "agent.draining" }>) => void;
   /** Auto-respond to `approval.request` (default true). Set false to test the
    *  daemon's approval timeout / auto-deny. */
   autoApprove?: boolean;
@@ -141,6 +143,10 @@ export class MockRelay {
         this.opts.onJobAccept?.(m);
       } else if (m.type === "job.reject") {
         this.opts.onJobReject?.(m);
+      } else if (m.type === "job.status") {
+        this.opts.onJobStatus?.(m);
+      } else if (m.type === "agent.draining") {
+        this.opts.onDraining?.(m);
       } else if (m.type === "stream.event") {
         this.opts.onStreamEvent?.(m);
         if (this.opts.autoAckStream !== false) {

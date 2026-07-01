@@ -1,0 +1,29 @@
+# systemd unit for hugind (Linux). Template — fill the REPLACE_ME values, then:
+#   cp service/hugind.service ~/.config/systemd/user/hugind.service
+#   systemctl --user daemon-reload && systemctl --user enable --now hugind
+# (user service so the daemon runs as you, with your Claude CLI login.)
+
+[Unit]
+Description=Hugin Agent — outbound-only cloud bridge daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hugin-agent
+ExecStart=/usr/bin/env npx tsx src/index.ts
+Restart=on-failure
+RestartSec=5
+# Config (see src/config.ts). serverUrl + agentId are required.
+Environment=HUGIND_SERVER_URL=wss://relay.example.com
+Environment=HUGIND_AGENT_ID=REPLACE_ME
+Environment=HUGIND_TENANT_ID=REPLACE_ME
+Environment=HUGIND_AGENT_VERSION=0.0.0
+Environment=HUGIND_PROJECT_ROOTS=%h/code
+Environment=HUGIND_STATE_DIR=%h/.local/state/hugind
+# Hardening — the daemon spawns the coding CLI; keep the service constrained.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
