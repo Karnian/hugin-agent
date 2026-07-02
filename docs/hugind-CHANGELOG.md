@@ -4,6 +4,32 @@ The daemon, built against the frozen wire protocol `v1.0.0` + a mock relay, phas
 by phase ([hugind-mvp-plan.md](hugind-mvp-plan.md) §6). Each phase gated on
 `npm run typecheck` + `npm run e2e` + a Codex cross-review (looped to zero issues).
 
+## Track C — Python C2 integration (pairing ceremony rev2 + reference verifier)
+Vendors the frozen auth/handshake contract to the Python C2 without requiring it
+to import the TS package: `protocol/v1/py/` is a Python reference verifier for the
+frozen `v1.0.0` handshake transcript/signature, matching the TS vectors and
+canonicalization rules. `protocol/v1/pairing.ts` adds the rev2 pairing PoP
+contract helpers (`buildPairingTranscript`, `keyFingerprint`, `validateB64u32`,
+`REJECTED_TEST_PUBLIC_HEX`), with `protocol/v1/gen-pairing-vectors.ts`,
+`protocol/v1/pairing-selftest.ts`, and `protocol/v1/pairing-test-vectors.json`
+pinning the cross-language ceremony bytes. The LOCKED rev2 pairing ceremony is
+browser-initiated: an authenticated C2 session mints an `hpk1.<base64url(json)>`
+paste token, the daemon validates the frozen canonical origin, scheme-swaps
+`wss`→`https`, posts `/pair/complete` with `{secret, public_key, pop_signature}`,
+then polls `/pair/status`; activation is mandatory browser fingerprint
+confirmation over the server-stored winning public key. The C2 contract is
+linearizable CAS (`issued`→`pending`→`active|rejected|expired|burned`), refuses
+bad b64u32/low-order/test keys before strict Ed25519 PoP, preserves a single
+generic unauth-ingress failure class, and supports bounded same-winner
+idempotent re-complete including the post-active short-TTL recovery corner. The
+wire is unchanged (`v1.0.0` frozen; pairing PoP is off-wire). Verification:
+`npm run pairing:check` green (TS 53/53), `protocol/v1/py/selftest.py` green
+(Python 84/84), and `npm run protocol:check` + `npm run e2e` still green. The
+daemon-side rev2 implementation (`src/auth/connect.ts` rewrite, mock
+pairing-server migration, e2e coverage) is QUEUED, not yet built; the committed
+daemon still uses the old daemon-initiated device-code pairing. Cross-reviewed
+(Claude + Codex, 3 rounds each side) → LOCKED.
+
 ## Track B — real MCP approval bridge (permission-prompt-tool → onApprovalRequest)
 Wires Claude Code's `--permission-prompt-tool` to the daemon's remote-approval seam
 (brief §4B). `src/engine/permission.ts` — an `ApprovalBridge` (daemon-side

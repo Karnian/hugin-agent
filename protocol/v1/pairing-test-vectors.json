@@ -1,0 +1,196 @@
+{
+  "_comment": "Pairing PoP test vectors (ceremony rev2 §8). DO NOT EDIT BY HAND — regenerate with: tsx protocol/v1/gen-pairing-vectors.ts. Verified by protocol/v1/pairing-selftest.ts (npm run pairing:check). The seed is a fixed PUBLIC test constant; /pair/complete MUST refuse to register its public key.",
+  "schema": 1,
+  "domain_tag": "hugin-pair-pop-v1",
+  "alg": "ed25519",
+  "protocol_version": "1.0.0",
+  "secret_hash_rule": "sha256 over the exact UTF-8 secret STRING (the 43-char canonical unpadded base64url text, NOT the decoded bytes); non-canonical aliases are rejected at the input gate",
+  "rejected_test_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+  "positives": [
+    {
+      "label": "baseline",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "secret_raw_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "secret_sha256_hex": "f45dc82a7523d14974cea050e3028e8bf06a8ee855a9d63034ebb4fb9ecc2305",
+      "public_key_base64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+      "ed25519_seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "domain_tag_lp_hex": "00000011687567696e2d706169722d706f702d7631",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_FoyCxHXR3WjoUkSx7c0vilO3Jk66bUFIQZmNhRakhsFAA",
+      "fingerprint_base64url": "ZbYGc9btiEvwHCwiLYKtoHQPKawzVdapJcgfF_R6J7g"
+    },
+    {
+      "label": "non-default-port",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "secret_raw_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "secret_sha256_hex": "f45dc82a7523d14974cea050e3028e8bf06a8ee855a9d63034ebb4fb9ecc2305",
+      "public_key_base64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+      "ed25519_seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "canonical_server_origin": "wss://relay.example.com:8443",
+      "protocol_version": "1.0.0",
+      "domain_tag_lp_hex": "00000011687567696e2d706169722d706f702d7631",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496640000001c7773733a2f2f72656c61792e6578616d706c652e636f6d3a3834343300000005312e302e30",
+      "expected_pop_signature_base64url": "Cp7aW-Illzg8ugQUFojlLb5iiy3z2lZg4YfR1d3tSOQo_7UNBjItOl_GDMnyBNd7LxBS0ADajvsbs6PMIQ44BA",
+      "fingerprint_base64url": "ZbYGc9btiEvwHCwiLYKtoHQPKawzVdapJcgfF_R6J7g"
+    },
+    {
+      "label": "loopback-dev-ws",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "secret_raw_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "secret_sha256_hex": "f45dc82a7523d14974cea050e3028e8bf06a8ee855a9d63034ebb4fb9ecc2305",
+      "public_key_base64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+      "ed25519_seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "canonical_server_origin": "ws://localhost:8080",
+      "protocol_version": "1.0.0",
+      "domain_tag_lp_hex": "00000011687567696e2d706169722d706f702d7631",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496640000001377733a2f2f6c6f63616c686f73743a3830383000000005312e302e30",
+      "expected_pop_signature_base64url": "T-kRc3OM7fYi5YZ3927g7LZqcxVDdYBn_Oqdh8Zh0GMHLmqZMvviHdZlhHQgojB5NCQ6JatDs0qNRTR9YSr6Cw",
+      "fingerprint_base64url": "ZbYGc9btiEvwHCwiLYKtoHQPKawzVdapJcgfF_R6J7g"
+    }
+  ],
+  "negatives": [
+    {
+      "label": "secret-42-chars",
+      "reason": "secret shorter than 43 chars",
+      "failure_mode": "parse",
+      "field": "secret",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "label": "secret-noncanonical-padbits",
+      "reason": "43-char base64url with non-zero trailing pad bits (alias of another string)",
+      "failure_mode": "parse",
+      "field": "secret",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
+    },
+    {
+      "label": "pubkey-noncanonical-padbits",
+      "reason": "public_key base64url must round-trip decode→re-encode (canonical)",
+      "failure_mode": "parse",
+      "field": "public_key",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
+    },
+    {
+      "label": "pop-wrong-secret",
+      "reason": "PoP signed over a different secret (transcript binds the invite)",
+      "failure_mode": "signature",
+      "secret": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b594746695932526c5a6d646f615770726247317562334278636e4e3064585a3365486c3665337839666e3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_FoyCxHXR3WjoUkSx7c0vilO3Jk66bUFIQZmNhRakhsFAA"
+    },
+    {
+      "label": "pop-wrong-origin",
+      "reason": "PoP signed over a different origin (anti-relay binding)",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://evil.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000167773733a2f2f6576696c2e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_FoyCxHXR3WjoUkSx7c0vilO3Jk66bUFIQZmNhRakhsFAA"
+    },
+    {
+      "label": "pop-wrong-protocol-version",
+      "reason": "PoP signed over a different protocol_version",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.1.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e312e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_FoyCxHXR3WjoUkSx7c0vilO3Jk66bUFIQZmNhRakhsFAA"
+    },
+    {
+      "label": "pop-tampered-pubkey",
+      "reason": "transcript/verify use a key the signer does not control",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f0",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c38e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f0000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_FoyCxHXR3WjoUkSx7c0vilO3Jk66bUFIQZmNhRakhsFAA"
+    },
+    {
+      "label": "pop-wrong-domain-tag",
+      "reason": "signature computed under the HANDSHAKE domain tag (cross-protocol replay MUST fail)",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "0Beja9pXnKvXYFPzNK2x0tly-vLpFKF0_1FXXbmxk97G2wTT_mqg2RAqONL1KkkuYQLkdDPdizXkx-6MJL6sBg"
+    },
+    {
+      "label": "pop-lp-pubkey-mistake",
+      "reason": "porting mistake: public key length-prefixed instead of raw 32 bytes",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "BgRZUniu2RuMAgVQvEFFa-X43LWWqfWHKsonFV6NCvnoF1IG-IS06zCPKRpbLh2ZXI6gzfWu5afJMbJ-7NI0DQ"
+    },
+    {
+      "label": "pop-decoded-secret-mistake",
+      "reason": "porting mistake: secret decoded to raw bytes instead of signed as the UTF-8 string",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "LG45XUVcHUkG9y4OI5YFLV-df_AOVqxmhP6kQfFLlMxeu6p7grb4R6LUNcbqJcj5XsG6ZDkWRGzvRq-01BEEAw"
+    },
+    {
+      "label": "pop-signature-wrong-length",
+      "reason": "signature is not 64 bytes",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_FoyCxHXR3WjoUkSx7c0vilO3Jk66bUFIQZmNhRakhsF"
+    },
+    {
+      "label": "pop-signature-non-canonical-s",
+      "reason": "S >= group order L; strict verifier MUST reject",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c3879b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_Fof3wY0Yti1-R-vvloTuAhj3Jk66bUFIQZmNhRakhsFEA"
+    },
+    {
+      "label": "pop-signature-low-order-pubkey",
+      "reason": "public key is a low-order point (identity); strict verifier MUST reject",
+      "failure_mode": "signature",
+      "secret": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "canonical_server_origin": "wss://relay.example.com",
+      "protocol_version": "1.0.0",
+      "ed25519_public_hex": "0100000000000000000000000000000000000000000000000000000000000000",
+      "transcript_hex": "00000011687567696e2d706169722d706f702d76310000002b5145464351305246526b64495355704c5445314f54314252556c4e5556565a5857466c6157317864586c380100000000000000000000000000000000000000000000000000000000000000000000177773733a2f2f72656c61792e6578616d706c652e636f6d00000005312e302e30",
+      "expected_pop_signature_base64url": "ZNgr8J-cDJzgMgJ-A0E208310S7R4NaiqKxAt6sG_FoyCxHXR3WjoUkSx7c0vilO3Jk66bUFIQZmNhRakhsFAA"
+    },
+    {
+      "label": "test-key-registration-refused",
+      "reason": "the published test key's seed is public — /pair/complete MUST refuse to register it even with a valid PoP",
+      "failure_mode": "policy",
+      "ed25519_public_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "public_key_base64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
+    }
+  ]
+}

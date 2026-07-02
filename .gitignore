@@ -8,3 +8,5 @@ dist/
 spikes/**/out/
 *.local.json
 .hugind/
+__pycache__/
+*.pyc

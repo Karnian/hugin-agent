@@ -10,6 +10,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "protocol:check": "tsx protocol/v1/selftest.ts",
+    "pairing:check": "tsx protocol/v1/pairing-selftest.ts",
+    "pairing:gen": "tsx protocol/v1/gen-pairing-vectors.ts",
     "spike:approval": "tsx spikes/approval-prompt-tool/run.ts",
     "hugind": "tsx src/index.ts",
     "connect": "tsx src/connect.ts",

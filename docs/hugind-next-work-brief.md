@@ -135,8 +135,21 @@ engine. Missing: wire the **real** claude permission prompt to `onApprovalReques
 
 ### Track C — Cloud integration
 
-- Publish the shared package `@contextualai/hugin-agent/protocol` (v1.0.0) — it's
-  the single import for both `hugind` and the cloud relay (no codegen drift).
+- The C2 is Python. Integration is now **vendor-the-contract**: no git/npm coupling
+  for the C2, and the protocol remains frozen at `v1.0.0`. The Python reference
+  verifier is delivered in `protocol/v1/py/`, so the C2 can verify the frozen
+  handshake without importing TS.
+- Pairing is **LOCKED as rev2**: browser-initiated paste token + Ed25519 PoP +
+  mandatory browser fingerprint activation, with PoP vectors delivered in
+  `protocol/v1/pairing-test-vectors.json`. The daemon-side rev2 implementation
+  (`src/auth/connect.ts` rewrite, mock pairing-server migration, e2e) is QUEUED,
+  not yet built; see `docs/auth-pairing-spec.md` §3/§5c and the review trail in
+  `docs/pairing-ceremony-review-reply.md`,
+  `docs/pairing-ceremony-rev2-reply.md`, and
+  `docs/pairing-lock-gate-reply.md`.
+- Publish the shared package `@contextualai/hugin-agent/protocol` (v1.0.0) for TS
+  consumers — keep it as the single import for `hugind` and any TS relay/client
+  code (no codegen drift).
 - Send `docs/PROPOSAL.md` (freeze record) + `protocol/v1/test-vectors.json` +
   this repo to the cloud team; run `hugind` against the **real** relay in place of
   `mock-relay/`. Cloud-side commitments (their §D): linearizable nonce/epoch/lease

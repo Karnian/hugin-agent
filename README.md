@@ -32,6 +32,13 @@ ever opened.**
   **public** key — the private key never leaves the host. The mock relay now
   **verifies** the Ed25519 possession proof (`npm run e2e` scenarios AA–AE).
   Security surface: [`docs/auth-pairing-spec.md`](docs/auth-pairing-spec.md).
+  > **Pairing ceremony redesigned → rev2 (LOCKED, off-wire).** Track C (Python
+  > C2 integration) replaces the daemon-initiated device-code sketch with a
+  > browser-initiated `hpk1` paste token + Ed25519 proof-of-possession + a
+  > mandatory browser fingerprint activation (auth-spec §3/§5c; PoP vectors in
+  > `protocol/v1/pairing-test-vectors.json`, `npm run pairing:check`). The
+  > **daemon-side implementation of rev2 is queued** — the `connect` command
+  > below still runs the built device-code flow.
 - **Approval bridge (Track B) — built + tested.** The real Claude
   `--permission-prompt-tool` is wired to `onApprovalRequest` via an in-process
   `ApprovalBridge` (a per-run UNIX socket — no inbound TCP port) + a stdio MCP
