@@ -19,8 +19,10 @@ import {
 } from "../protocol/v1/pairing";
 import { b64u, verifyTranscript } from "../protocol/v1/ed25519";
 import { canonicalizeServerOrigin } from "../protocol/v1/origin";
+import { SIMPLE_PAIRING_CAPABILITY_RESPONSE } from "../src/auth/simple-pairing-capability";
 
 const PROTOCOL_VERSION = "1.0.0";
+const CAPABILITY_SUFFIX = "/api/v1/hugin-agents/capability";
 const COMPLETE_SUFFIX = "/api/v1/hugin-agents/pair/complete";
 const STATUS_SUFFIX = "/api/v1/hugin-agents/pair/status";
 const DEFAULT_BODY_LIMIT_BYTES = 4096;
@@ -58,6 +60,12 @@ export interface MockPairingOpts {
   relayUrl?: string;
   intervalMs?: number;
   expiresInMs?: number;
+  /** Opt into the simple pairing variant on /pair/complete. Default stays rev2. */
+  simplePairing?: boolean;
+  /* test-only */ capabilityStatus?: number;
+  /* test-only */ capabilityBody?: unknown;
+  /* test-only */ simpleCompleteStatus?: number;
+  /* test-only */ simpleCompleteBody?: unknown;
 }
 
 export interface MintOptions {
@@ -176,6 +184,7 @@ export class MockPairingServer {
   private readonly rowsByPollTokenHash = new Map<string, PairingRow>();
   private readonly activeDeviceCounts = new Map<string, number>();
   private readonly semanticFailures: string[] = [];
+  private readonly simpleDeviceCodes = new Set<string>();
   private forcedValidStatus404s = 0;
   private nextPairingId = 1;
 
@@ -246,6 +255,11 @@ export class MockPairingServer {
     return `hpk1.${b64u(Buffer.from(JSON.stringify({ v: PROTOCOL_VERSION, origin, secret, exp }), "utf8"))}`;
   }
 
+  mintSimpleDeviceCode(deviceCode = randomB64u32()): string {
+    this.simpleDeviceCodes.add(deviceCode);
+    return deviceCode;
+  }
+
   confirm(): ConfirmResult | null {
     const row = this.firstPendingRow();
     if (!row) return null;
@@ -271,13 +285,57 @@ export class MockPairingServer {
     }
     this.requestBodies.push(raw);
 
+    if (req.method === "GET" && pathEndsWith(req.url, CAPABILITY_SUFFIX)) {
+      return this.handleCapability(res);
+    }
     if (req.method === "POST" && pathEndsWith(req.url, COMPLETE_SUFFIX)) {
+      if (this.opts.simplePairing) return this.handleSimpleComplete(raw, res);
       return this.handleComplete(raw, res);
     }
     if (req.method === "POST" && pathEndsWith(req.url, STATUS_SUFFIX)) {
       return this.handleStatus(raw, res);
     }
     return this.send(res, 404, { error: "not_found" });
+  }
+
+  private handleCapability(res: ServerResponse): void {
+    const status = this.opts.capabilityStatus ?? (this.opts.simplePairing ? 200 : 404);
+    const body = this.opts.capabilityBody ?? (status === 200 ? SIMPLE_PAIRING_CAPABILITY_RESPONSE : { error: "not_found" });
+    this.send(res, status, body);
+  }
+
+  private handleSimpleComplete(raw: string, res: ServerResponse): void {
+    if (this.opts.simpleCompleteStatus !== undefined) {
+      return this.send(res, this.opts.simpleCompleteStatus, this.opts.simpleCompleteBody ?? {});
+    }
+
+    const body = parseJsonObject(raw);
+    if (!body) return this.failComplete(res, "bad_json");
+
+    const keys = Object.keys(body).sort();
+    const deviceCode = body.device_code;
+    const publicKey = body.public_key;
+    if (
+      keys.length !== 2 ||
+      keys[0] !== "device_code" ||
+      keys[1] !== "public_key" ||
+      typeof deviceCode !== "string" ||
+      typeof publicKey !== "string" ||
+      deviceCode.length === 0 ||
+      deviceCode.length > 1024 ||
+      !validateB64u32(publicKey) ||
+      !this.simpleDeviceCodes.has(deviceCode)
+    ) {
+      return this.failComplete(res, "simple_schema_or_code_gate");
+    }
+
+    this.simpleDeviceCodes.delete(deviceCode);
+    this.registeredPublicKeys.push(publicKey);
+    return this.send(res, 200, {
+      agent_id: this.opts.agentId ?? "agent-123",
+      key_id: this.opts.keyId ?? "key-123",
+      tenant_id: this.opts.tenantId ?? "acme",
+    });
   }
 
   private handleComplete(raw: string, res: ServerResponse): void {

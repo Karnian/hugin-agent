@@ -16,13 +16,29 @@ import { configFilePath } from "./paths";
 import { writePairingConfig } from "./config-file";
 import { keychainSeedStore, newDeviceKey, type SeedStore } from "./keystore";
 import { parsePairingToken } from "./pairing-token";
+import { SIMPLE_PAIRING_CAPABILITY_FIELD, SIMPLE_PAIRING_CAPABILITY_VALUE } from "./simple-pairing-capability";
 
 const AuthId = z.string().regex(/^[A-Za-z0-9._-]{1,128}$/);
+const TenantId = AuthId;
 
 const CompleteResponse = z.strictObject({
   status: z.literal("pending"),
   fingerprint: z.string().regex(PAIRING_SECRET_RE),
   poll_token: z.string().min(1).max(1024),
+});
+
+// Accepted C2 capability marker: `simple_pairing` must be exactly boolean true.
+// Fail-closed on the VALUE (rejects truthy strings, enum-shaped responses, and a
+// missing marker), but tolerant of other capability fields C2 may add over time —
+// a discovery endpoint must stay forward-compatible, so this is z.object not strict.
+const SimpleCapabilityResponse = z.object({
+  [SIMPLE_PAIRING_CAPABILITY_FIELD]: z.literal(SIMPLE_PAIRING_CAPABILITY_VALUE),
+});
+
+const SimpleCompleteResponse = z.strictObject({
+  agent_id: AuthId,
+  key_id: AuthId,
+  tenant_id: TenantId,
 });
 
 const StatusResponse = z.discriminatedUnion("status", [
@@ -50,6 +66,16 @@ export interface ConnectOptions {
   pollDeadlineMs?: number;
 }
 
+export interface ConnectSimpleOptions {
+  /** The pasted simple-mode device code. */
+  deviceCode: string;
+  /** Operator-provided ws(s):// relay origin. */
+  serverUrl: string;
+  seedStore?: SeedStore;
+  configPath?: string;
+  fetchImpl?: typeof fetch;
+}
+
 export interface PairingResult {
   agentId: string;
   keyId: string;
@@ -65,6 +91,11 @@ interface PairingEndpoints {
   status: string;
 }
 
+interface SimplePairingEndpoints {
+  capability: string;
+  complete: string;
+}
+
 function pairingEndpoints(canonicalOrigin: string): PairingEndpoints {
   const url = new URL(canonicalOrigin);
   const scheme = url.protocol === "wss:" ? "https" : "http";
@@ -72,6 +103,16 @@ function pairingEndpoints(canonicalOrigin: string): PairingEndpoints {
   return {
     complete: `${base}/complete`,
     status: `${base}/status`,
+  };
+}
+
+function simplePairingEndpoints(canonicalOrigin: string): SimplePairingEndpoints {
+  const url = new URL(canonicalOrigin);
+  const scheme = url.protocol === "wss:" ? "https" : "http";
+  const base = `${scheme}://${url.host}/api/v1/hugin-agents`;
+  return {
+    capability: `${base}/capability`,
+    complete: `${base}/pair/complete`,
   };
 }
 
@@ -96,11 +137,29 @@ async function postJson(fetchImpl: typeof fetch, url: string, body: unknown): Pr
   });
 }
 
+async function getJson(fetchImpl: typeof fetch, url: string): Promise<Response> {
+  return fetchImpl(url, {
+    method: "GET",
+    headers: {
+      accept: "application/json",
+      "cache-control": "no-store",
+    },
+  });
+}
+
 async function readJson(res: Response, message: string): Promise<unknown> {
   try {
     return await res.json();
   } catch {
     throw new Error(message);
+  }
+}
+
+async function tryReadJson(res: Response): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
+    return null;
   }
 }
 
@@ -112,12 +171,85 @@ function parseCompleteResponse(value: unknown): z.infer<typeof CompleteResponse>
   }
 }
 
+function parseSimpleCapabilityResponse(value: unknown): z.infer<typeof SimpleCapabilityResponse> {
+  try {
+    return SimpleCapabilityResponse.parse(value);
+  } catch {
+    throw new Error("this relay does not support simple pairing");
+  }
+}
+
+function parseSimpleCompleteResponse(value: unknown): z.infer<typeof SimpleCompleteResponse> {
+  try {
+    return SimpleCompleteResponse.parse(value);
+  } catch {
+    throw new Error("simple pairing server returned an invalid completion response; re-pair this device");
+  }
+}
+
 function parseStatusResponse(value: unknown): z.infer<typeof StatusResponse> {
   try {
     return StatusResponse.parse(value);
   } catch {
     throw new Error("pairing server returned an invalid status response; re-pair this device");
   }
+}
+
+function trimAsciiBoundaryWhitespace(value: string): string {
+  return value.replace(/^[\u0009-\u000d\u0020]+|[\u0009-\u000d\u0020]+$/g, "");
+}
+
+function validateSimpleDeviceCode(deviceCode: string): string {
+  if (deviceCode.length === 0) {
+    throw new Error("simple pairing device code is empty; re-copy the device code");
+  }
+  if (trimAsciiBoundaryWhitespace(deviceCode).startsWith("hpk1.")) {
+    throw new Error("simple pairing expected a device code, but received a rev2 hpk1 token");
+  }
+  return deviceCode;
+}
+
+async function probeSimplePairingCapability(fetchImpl: typeof fetch, capabilityUrl: string): Promise<void> {
+  const res = await getJson(fetchImpl, capabilityUrl);
+  if (res.status !== 200) {
+    throw new Error("this relay does not support simple pairing");
+  }
+  parseSimpleCapabilityResponse(await readJson(res, "this relay does not support simple pairing"));
+}
+
+function isRev2CompleteShape(value: unknown): boolean {
+  return (
+    Boolean(value) &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).status === "pending" &&
+    typeof (value as Record<string, unknown>).poll_token === "string"
+  );
+}
+
+export async function completeSimplePairing(opts: {
+  fetchImpl?: typeof fetch;
+  completeUrl: string;
+  deviceCode: string;
+  publicKey: string;
+}): Promise<z.infer<typeof SimpleCompleteResponse>> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const res = await postJson(fetchImpl, opts.completeUrl, {
+    device_code: opts.deviceCode,
+    public_key: opts.publicKey,
+  });
+
+  if (res.status !== 200) {
+    const body = await tryReadJson(res);
+    if (res.status === 202 && isRev2CompleteShape(body)) {
+      throw new Error("simple pairing refused a rev2 completion response; check relay pairing mode");
+    }
+    throw new Error("simple pairing completion failed; relay did not return HTTP 200");
+  }
+
+  return parseSimpleCompleteResponse(
+    await readJson(res, "simple pairing server returned an invalid completion response; re-pair this device"),
+  );
 }
 
 export async function connect(opts: ConnectOptions): Promise<PairingResult> {
@@ -215,6 +347,48 @@ export async function connect(opts: ConnectOptions): Promise<PairingResult> {
       };
     }
     throw new Error("pairing timed out; re-pair this device");
+  } finally {
+    dk.seed.fill(0); // scrub the in-memory seed on every path (the store has its own copy)
+  }
+}
+
+export async function connectSimple(opts: ConnectSimpleOptions): Promise<PairingResult> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const seedStore = opts.seedStore ?? keychainSeedStore();
+  const configPath = opts.configPath ?? configFilePath();
+
+  const canonicalOrigin = canonicalizeServerOrigin(opts.serverUrl);
+  if (canonicalOrigin === null) {
+    throw new Error("simple pairing --url is invalid; provide a canonical ws(s):// relay origin");
+  }
+
+  const deviceCode = validateSimpleDeviceCode(opts.deviceCode);
+  const endpoints = simplePairingEndpoints(canonicalOrigin);
+  await probeSimplePairingCapability(fetchImpl, endpoints.capability);
+
+  const dk = newDeviceKey();
+  try {
+    const complete = await completeSimplePairing({
+      fetchImpl,
+      completeUrl: endpoints.complete,
+      deviceCode,
+      publicKey: b64u(dk.publicRaw),
+    });
+
+    await seedStore.set(complete.key_id, dk.seed);
+    writePairingConfig(configPath, {
+      serverUrl: canonicalOrigin,
+      agentId: complete.agent_id,
+      keyId: complete.key_id,
+      tenantId: complete.tenant_id,
+    });
+    return {
+      agentId: complete.agent_id,
+      keyId: complete.key_id,
+      tenantId: complete.tenant_id,
+      serverUrl: canonicalOrigin,
+      configPath,
+    };
   } finally {
     dk.seed.fill(0); // scrub the in-memory seed on every path (the store has its own copy)
   }

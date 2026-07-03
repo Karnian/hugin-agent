@@ -12,10 +12,11 @@
  * daemon's epoch gate is strictly monotonic.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -25,12 +26,12 @@ import { buildTranscript } from "../protocol/v1/transcript";
 import { b64u, deriveKeypairFromSeed, signTranscript, verifyTranscript } from "../protocol/v1/ed25519";
 import { buildPairingTranscript, keyFingerprint, REJECTED_TEST_PUBLIC_HEX, validateB64u32 } from "../protocol/v1/pairing";
 import { loadConfig } from "../src/config";
-import { connect } from "../src/auth/connect";
+import { connect, connectSimple } from "../src/auth/connect";
 import { readPairingConfig } from "../src/auth/config-file";
 import { parsePairingToken, type ParsedPairingToken } from "../src/auth/pairing-token";
 import { Daemon } from "../src/daemon";
 import { devSigner, performHandshake } from "../src/conn/handshake";
-import { keychainSeedStore, keychainSigner, memorySeedStore, newDeviceKey } from "../src/auth/keystore";
+import { keychainSeedStore, keychainSigner, memorySeedStore, newDeviceKey, type SeedStore } from "../src/auth/keystore";
 import { decodeInbound } from "../src/conn/framing";
 import { RelayClient } from "../src/conn/client";
 import { FakeEngine } from "../src/engine/fake-engine";
@@ -1064,6 +1065,27 @@ interface PairStatusBody extends Record<string, unknown> {
   poll_token: string;
 }
 
+interface SimpleCompleteBody extends Record<string, unknown> {
+  device_code: string;
+  public_key: string;
+}
+
+function trackingSeedStore(): { store: SeedStore; setKeys: string[] } {
+  const inner = memorySeedStore();
+  const setKeys: string[] = [];
+  return {
+    setKeys,
+    store: {
+      async set(keyId, seed) {
+        setKeys.push(keyId);
+        await inner.set(keyId, seed);
+      },
+      get: inner.get,
+      delete: inner.delete,
+    },
+  };
+}
+
 function makeAdvancingNow(start = Date.now()): () => number {
   let now = start;
   return () => {
@@ -1101,6 +1123,12 @@ function completeBodies(pairing: MockPairingServer): PairCompleteBody[] {
 
 function statusBodies(pairing: MockPairingServer): PairStatusBody[] {
   return requestJsonBodies(pairing).filter((body): body is PairStatusBody => typeof body.poll_token === "string");
+}
+
+function simpleCompleteBodies(pairing: MockPairingServer): SimpleCompleteBody[] {
+  return requestJsonBodies(pairing).filter((body): body is SimpleCompleteBody =>
+    typeof body.device_code === "string" && typeof body.public_key === "string",
+  );
 }
 
 function bodyString(body: unknown, field: string): string | null {
@@ -1183,6 +1211,83 @@ async function postRawPairComplete(baseUrl: string, body: Record<string, unknown
     parsed = null;
   }
   return { status: res.status, body: parsed };
+}
+
+async function expectConnectSimpleReject(
+  label: string,
+  cfgPath: string,
+  store: ReturnType<typeof trackingSeedStore>,
+  opts: Parameters<typeof connectSimple>[0],
+  expectedError: string,
+): Promise<string> {
+  let message = "";
+  try {
+    await connectSimple({ ...opts, seedStore: store.store, configPath: cfgPath });
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+  check(label, message === expectedError && readPairingConfig(cfgPath) === null && store.setKeys.length === 0);
+  return message;
+}
+
+async function runConnectCli(opts: {
+  cfgDir: string;
+  configPath: string;
+  args: string[];
+  input?: string;
+  env?: Record<string, string | undefined>;
+}): Promise<{ status: number | null; stdout: string; stderr: string; argv: string[] }> {
+  mkdirSync(opts.cfgDir, { recursive: true });
+  const wrapperPath = join(opts.cfgDir, `connect-argv-hook-${Date.now()}-${Math.random().toString(16).slice(2)}.mjs`);
+  const argvOut = join(opts.cfgDir, `argv-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  writeFileSync(
+    wrapperPath,
+    `import { writeFileSync } from "node:fs";\n` +
+      `writeFileSync(process.env.HG_ARGV_OUT ?? "", JSON.stringify(process.argv.slice(2)));\n`,
+  );
+  const child = spawn(process.execPath, ["--import", "tsx", "--import", pathToFileURL(wrapperPath).href, resolve("src/connect.ts"), ...opts.args], {
+    env: { ...(process.env as Record<string, string>), ...opts.env, HG_ARGV_OUT: argvOut },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  let spawnError = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdin.end(opts.input ?? "");
+  const status = await new Promise<number | null>((resolveStatus) => {
+    const timer = setTimeout(() => {
+      spawnError = "connect child timed out";
+      child.kill("SIGKILL");
+    }, 15_000);
+    child.on("error", (err) => {
+      spawnError = err.message;
+      clearTimeout(timer);
+      resolveStatus(null);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolveStatus(code);
+    });
+  });
+  let argv: string[] = [];
+  try {
+    argv = JSON.parse(readFileSync(argvOut, "utf8")) as string[];
+  } catch {
+    argv = [];
+  }
+  return {
+    status,
+    stdout,
+    stderr: `${stderr}${spawnError}`,
+    argv,
+  };
 }
 
 async function postPairStatus(baseUrl: string, pollToken: string): Promise<{ status: number; body: unknown }> {
@@ -1618,6 +1723,313 @@ async function scenarioAE(): Promise<void> {
   }
 }
 
+async function scenarioALHappyPath(cfgDir: string): Promise<void> {
+  const cfgPath = join(cfgDir, "al1-config.json");
+  const pairing = new MockPairingServer({
+    simplePairing: true,
+    tenantId: "acme",
+    agentId: "agent-al1",
+    keyId: "key-al1",
+  });
+  const port = await pairing.start();
+  const serverUrl = `ws://127.0.0.1:${port}`;
+  const deviceCode = pairing.mintSimpleDeviceCode("device-code-al1");
+  const tracked = trackingSeedStore();
+  let publicKeyHex = "";
+  try {
+    const res = await connectSimple({
+      deviceCode,
+      serverUrl,
+      seedStore: tracked.store,
+      configPath: cfgPath,
+    });
+    const cfg = readPairingConfig(cfgPath);
+    const seed = await tracked.store.get("key-al1");
+    const publicRaw = seed ? deriveKeypairFromSeed(seed).publicRaw : Buffer.alloc(0);
+    publicKeyHex = publicRaw.toString("hex");
+    const publicKeyB64u = seed ? b64u(publicRaw) : "NO_PUBLIC_KEY";
+    const complete = simpleCompleteBodies(pairing);
+    const seedEncodings = seed
+      ? [b64u(seed), seed.toString("base64"), seed.toString("hex"), seed.toString("hex").toUpperCase(), JSON.stringify(Array.from(seed))]
+      : [];
+    const seedLeaked = pairing.requestBodies.some((body) => seedEncodings.some((encoding) => body.includes(encoding)));
+    check(
+      "AL1 simple happy path persists canonical --url, returned ids, seed under key_id, and keeps seed off-wire",
+      cfg?.agentId === "agent-al1" &&
+        cfg?.keyId === "key-al1" &&
+        cfg?.tenantId === "acme" &&
+        cfg?.serverUrl === serverUrl &&
+        res.agentId === "agent-al1" &&
+        res.keyId === "key-al1" &&
+        res.tenantId === "acme" &&
+        res.serverUrl === serverUrl &&
+        tracked.setKeys.length === 1 &&
+        tracked.setKeys[0] === "key-al1" &&
+        seed?.length === 32 &&
+        complete.length === 1 &&
+        complete[0]?.device_code === deviceCode &&
+        complete[0]?.public_key === publicKeyB64u &&
+        pairing.registeredPublicKeys.length === 1 &&
+        pairing.registeredPublicKeys[0] === publicKeyB64u &&
+        !seedLeaked,
+    );
+  } finally {
+    await pairing.stop();
+  }
+
+  const relay = new MockRelay();
+  relay.setVerifyAuth({
+    agentId: "agent-al1",
+    keyId: "key-al1",
+    publicKeyHex,
+    tenantId: "acme",
+    serverOrigin: serverUrl,
+  });
+  const relayPort = await relay.start(port);
+  const client = new RelayClient();
+  try {
+    const cfg = readPairingConfig(cfgPath);
+    if (!cfg) throw new Error("AL1 config missing before handshake");
+    await client.connect(serverUrl);
+    const signer = await keychainSigner("key-al1", tracked.store);
+    const hs = await performHandshake(
+      client,
+      loadConfig({
+        serverUrl: cfg.serverUrl,
+        agentId: cfg.agentId,
+        keyId: cfg.keyId,
+        tenantId: cfg.tenantId,
+        dbPath: ":memory:",
+      }),
+      signer,
+      { activeJobs: [], pendingResults: [] },
+    );
+    check("AL1b simple pair-then-WSS handshake reaches hello.accepted on the same --url origin", relayPort === port && hs.connectionEpoch === 1);
+  } finally {
+    client.close();
+    await relay.stop();
+  }
+}
+
+async function scenarioALCliGate(cfgDir: string): Promise<void> {
+  const pairing = new MockPairingServer({ simplePairing: true });
+  await pairing.start();
+  try {
+    const cfgPath = join(cfgDir, "al2-config.json");
+    const res = await runConnectCli({
+      cfgDir,
+      configPath: cfgPath,
+      args: ["--config", cfgPath, "--url", `ws://127.0.0.1:${pairing.port}`],
+      env: { HUGIN_SIMPLE_PAIRING: "" },
+    });
+    const output = `${res.stdout}\n${res.stderr}`;
+    check(
+      "AL2 --url without HUGIN_SIMPLE_PAIRING rejects before stdin/network/config",
+      res.status !== 0 &&
+        output.includes("simple pairing is disabled; set HUGIN_SIMPLE_PAIRING=1 for dev, or omit --url for rev2") &&
+        pairing.requestBodies.length === 0 &&
+        readPairingConfig(cfgPath) === null,
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
+
+async function scenarioALNonCanonicalUrl(cfgDir: string): Promise<void> {
+  await expectConnectSimpleReject(
+    "AL3 non-canonical --url rejects without seed/config",
+    join(cfgDir, "al3-config.json"),
+    trackingSeedStore(),
+    { deviceCode: "device-code-al3", serverUrl: "ws://relay.example.com/path" },
+    "simple pairing --url is invalid; provide a canonical ws(s):// relay origin",
+  );
+}
+
+async function scenarioALCapabilityRejects(cfgDir: string): Promise<void> {
+  const wrongShapes: unknown[] = [{ simple_pairing: "yes" }, { pairing_mode: "simple" }];
+  for (let i = 0; i < wrongShapes.length; i++) {
+    const pairing = new MockPairingServer({
+      simplePairing: true,
+      capabilityBody: wrongShapes[i],
+    });
+    await pairing.start();
+    try {
+      const code = pairing.mintSimpleDeviceCode(`device-code-al4-${i}`);
+      await expectConnectSimpleReject(
+        i === 0
+          ? "AL4 capability rejects truthy-but-non-true marker without seed/config"
+          : "AL4b capability rejects enum-shaped marker without seed/config",
+        join(cfgDir, `al4-${i}-config.json`),
+        trackingSeedStore(),
+        { deviceCode: code, serverUrl: `ws://127.0.0.1:${pairing.port}` },
+        "this relay does not support simple pairing",
+      );
+      check(`AL4${i === 0 ? "" : "b"} capability rejection stops before /pair/complete`, simpleCompleteBodies(pairing).length === 0);
+    } finally {
+      await pairing.stop();
+    }
+  }
+}
+
+async function scenarioALCapabilityForwardCompat(cfgDir: string): Promise<void> {
+  // A /capability discovery endpoint may grow fields over time; the daemon must
+  // still pair as long as `simple_pairing: true` is present (fail-closed on the
+  // marker VALUE only, not the whole object shape).
+  const pairing = new MockPairingServer({
+    simplePairing: true,
+    capabilityBody: { simple_pairing: true, protocol_version: "1.0.0", max_devices: 10 },
+    agentId: "agent-al4c",
+    keyId: "key-al4c",
+    tenantId: "acme",
+  });
+  await pairing.start();
+  const cfgPath = join(cfgDir, "al4c-config.json");
+  const tracked = trackingSeedStore();
+  try {
+    const code = pairing.mintSimpleDeviceCode("device-code-al4c");
+    const res = await connectSimple({
+      deviceCode: code,
+      serverUrl: `ws://127.0.0.1:${pairing.port}`,
+      seedStore: tracked.store,
+      configPath: cfgPath,
+    });
+    const cfg = readPairingConfig(cfgPath);
+    check(
+      "AL4c capability with extra fields alongside simple_pairing:true is accepted (forward-compatible)",
+      res.agentId === "agent-al4c" &&
+        res.keyId === "key-al4c" &&
+        cfg?.agentId === "agent-al4c" &&
+        cfg?.keyId === "key-al4c" &&
+        tracked.setKeys.length === 1 &&
+        simpleCompleteBodies(pairing).length === 1,
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
+
+async function scenarioALMixedModeGuard(cfgDir: string): Promise<void> {
+  const pairing = new MockPairingServer({ simplePairing: true });
+  await pairing.start();
+  try {
+    await expectConnectSimpleReject(
+      "AL5 hpk1-prefixed payload under --url rejects without seed/config",
+      join(cfgDir, "al5-config.json"),
+      trackingSeedStore(),
+      { deviceCode: "hpk1.not-a-device-code", serverUrl: `ws://127.0.0.1:${pairing.port}` },
+      "simple pairing expected a device code, but received a rev2 hpk1 token",
+    );
+    await expectConnectSimpleReject(
+      "AL5b leading-whitespace hpk1 payload under --url rejects without seed/config",
+      join(cfgDir, "al5b-config.json"),
+      trackingSeedStore(),
+      { deviceCode: "  hpk1.not-a-device-code", serverUrl: `ws://127.0.0.1:${pairing.port}` },
+      "simple pairing expected a device code, but received a rev2 hpk1 token",
+    );
+    check("AL5c mixed-mode guard fires before capability probe", pairing.requestBodies.length === 0);
+  } finally {
+    await pairing.stop();
+  }
+}
+
+async function scenarioALCompletionRejects(cfgDir: string): Promise<void> {
+  const cases: Array<{ label: string; file: string; status: number; body: unknown; error: string }> = [
+    {
+      label: "AL6 simple /pair/complete non-200 rejects without seed/config",
+      file: "al6-config.json",
+      status: 500,
+      body: { error: "boom" },
+      error: "simple pairing completion failed; relay did not return HTTP 200",
+    },
+    {
+      label: "AL7 simple /pair/complete rev2-shaped 202 rejects without seed/config",
+      file: "al7-config.json",
+      status: 202,
+      body: { status: "pending", fingerprint: "A".repeat(43), poll_token: "poll-token" },
+      error: "simple pairing refused a rev2 completion response; check relay pairing mode",
+    },
+    {
+      label: "AL8 simple /pair/complete malformed 200 rejects without seed/config",
+      file: "al8-config.json",
+      status: 200,
+      body: { agent_id: "agent-al8", key_id: "bad key", tenant_id: "acme" },
+      error: "simple pairing server returned an invalid completion response; re-pair this device",
+    },
+  ];
+
+  for (let i = 0; i < cases.length; i++) {
+    const c = cases[i]!;
+    const pairing = new MockPairingServer({
+      simplePairing: true,
+      simpleCompleteStatus: c.status,
+      simpleCompleteBody: c.body,
+    });
+    await pairing.start();
+    try {
+      const code = pairing.mintSimpleDeviceCode(`device-code-${c.file}`);
+      await expectConnectSimpleReject(
+        c.label,
+        join(cfgDir, c.file),
+        trackingSeedStore(),
+        { deviceCode: code, serverUrl: `ws://127.0.0.1:${pairing.port}` },
+        c.error,
+      );
+      check(`AL${6 + i} rejection still sent device_code only in the POST body`, simpleCompleteBodies(pairing).some((body) => body.device_code === code));
+    } finally {
+      await pairing.stop();
+    }
+  }
+}
+
+async function scenarioALDeviceCodeNotArgv(cfgDir: string): Promise<void> {
+  const pairing = new MockPairingServer({
+    simplePairing: true,
+    simpleCompleteStatus: 500,
+    simpleCompleteBody: { error: "intentional" },
+  });
+  await pairing.start();
+  try {
+    const cfgPath = join(cfgDir, "al9-config.json");
+    const deviceCode = pairing.mintSimpleDeviceCode("device-code-al9-secret");
+    const res = await runConnectCli({
+      cfgDir,
+      configPath: cfgPath,
+      args: ["--config", cfgPath, "--url", `ws://127.0.0.1:${pairing.port}`],
+      input: `${deviceCode}\n`,
+      env: { HUGIN_SIMPLE_PAIRING: "1" },
+    });
+    const output = `${res.stdout}\n${res.stderr}`;
+    check(
+      "AL9 device_code is read from stdin and absent from the connect child argv",
+      res.status !== 0 &&
+        simpleCompleteBodies(pairing).some((body) => body.device_code === deviceCode) &&
+        !res.argv.some((arg) => arg.includes(deviceCode)) &&
+        !output.includes(deviceCode) &&
+        readPairingConfig(cfgPath) === null,
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
+
+async function scenarioAL(): Promise<void> {
+  const cfgDir = join(SCRATCH, "pairing-simple");
+  rmSync(cfgDir, { recursive: true, force: true });
+  mkdirSync(cfgDir, { recursive: true });
+  try {
+    await scenarioALHappyPath(cfgDir);
+    await scenarioALCliGate(cfgDir);
+    await scenarioALNonCanonicalUrl(cfgDir);
+    await scenarioALCapabilityRejects(cfgDir);
+    await scenarioALCapabilityForwardCompat(cfgDir);
+    await scenarioALMixedModeGuard(cfgDir);
+    await scenarioALCompletionRejects(cfgDir);
+    await scenarioALDeviceCodeNotArgv(cfgDir);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+}
+
 /** Track A robustness (Codex re-review): a duplicate `hello` on an ALREADY-
  *  authenticated connection is ignored — no re-verify, no second hello.accepted.
  *  (`validateInbound` permits handshake types post-auth, so the relay guards it;
@@ -1915,6 +2327,8 @@ async function main(): Promise<void> {
   await scenarioAD();
   console.log("\n[scenario AE: Track A rev2 device pairing — AE1–AE9]");
   await scenarioAE();
+  console.log("\n[scenario AL: simple pairing mode — gate, strict 200, and WSS handshake]");
+  await scenarioAL();
   console.log("\n[scenario AF: Track A duplicate post-auth hello ignored]");
   await scenarioAF();
   console.log("\n[scenario AG: Track A premature hello.accepted discarded]");
