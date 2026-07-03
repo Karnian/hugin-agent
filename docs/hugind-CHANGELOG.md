@@ -4,6 +4,43 @@ The daemon, built against the frozen wire protocol `v1.0.0` + a mock relay, phas
 by phase ([hugind-mvp-plan.md](hugind-mvp-plan.md) §6). Each phase gated on
 `npm run typecheck` + `npm run e2e` + a Codex cross-review (looped to zero issues).
 
+## Track C — dev simple pairing mode (`device_code` + `--url`, alongside rev2)
+A dev/local-only alternative to the rev2 ceremony (issue #1, PR #2, merged
+`2f004ef`), for multi-machine testing where C2's advertised origin
+(`HUGIN_PUBLIC_WSS_ORIGIN`) differs from the actually-reachable address (Tailscale,
+k8s ingress) — the daemon names the dial origin itself via `--url`. rev2
+(browser hpk1 token + PoP + fingerprint) stays the production path, byte-for-byte
+unchanged. The mode is chosen by LOCAL input, never the server: `connect` runs
+simple ONLY when the daemon env gate `HUGIN_SIMPLE_PAIRING=1` AND `--url` are both
+present (the gate is checked before any stdin read or network call — a stray
+`--url` on a production install hard-rejects). `GET
+/api/v1/hugin-agents/capability` is a fail-closed cross-check ONLY (`simple_pairing`
+must be exactly boolean `true`; extra fields tolerated for forward-compat) — it
+never decides whether PoP is sent, so a network/MITM attacker can't force the
+weaker bearer flow onto a rev2 pairing. The daemon reads the `device_code` (a
+bearer credential, rev1-level) from hidden stdin (never argv), canonicalizes
+`--url` with the frozen `canonicalizeServerOrigin`, guards against a pasted
+`hpk1.` token (after CRLF/whitespace trim), then `POST /pair/complete
+{device_code, public_key}` expecting EXACTLY HTTP 200 with a strict
+`{agent_id,key_id,tenant_id}` body — no seed/config is persisted until that parse
+succeeds (a rev2-shaped `202/pending`, a non-200, or a malformed 200 is refused,
+not reinterpreted); the device seed is scrubbed on every exit path. New:
+`src/auth/connect.ts` (`connectSimple`/`completeSimplePairing` + strict schemas;
+the rev2 `connect()` untouched), `src/auth/simple-pairing-capability.ts` (isolated
+capability marker constant); `src/connect.ts` gains `--url` + the gate;
+`mock-relay/pairing-server.ts` adds `GET /capability` + an opt-in strict-200 simple
+`/pair/complete` (rev2 endpoints unchanged); `scripts/mock-pairing.ts` gains
+`--simple`. Wire unchanged (`v1.0.0` frozen; only the pairing HTTP exchange
+branches — the WSS `/connect` handshake is identical). e2e AL1–AL9 cover the happy
+path (AL1b: an integrated pair → WSS `hello.accepted`), the
+gate/canonicalization/mixed-mode/capability rejections, strict-200 refusals,
+`device_code`-not-in-argv, and AL4c (capability forward-compat). Trigger policy:
+[pairing-simple-mode-trigger-policy.md](pairing-simple-mode-trigger-policy.md).
+Codex reviewed the policy (APPROVE-WITH-CHANGES → 6 folded) and implemented; Claude
+cross-reviewed the diff and relaxed the capability parse to `z.object`. Green:
+`typecheck` + `protocol:check` (23) + `pairing:check` (53) + `e2e` (ALL, AE1–AE9
+preserved).
+
 ## Track C — Python C2 integration (pairing ceremony rev2 + reference verifier)
 Vendors the frozen auth/handshake contract to the Python C2 without requiring it
 to import the TS package: `protocol/v1/py/` is a Python reference verifier for the
