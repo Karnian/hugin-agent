@@ -41,6 +41,19 @@ cross-reviewed the diff and relaxed the capability parse to `z.object`. Green:
 `typecheck` + `protocol:check` (23) + `pairing:check` (53) + `e2e` (ALL, AE1–AE9
 preserved).
 
+**Revision 2 (interactive UX + dev-origin relaxation):** the simple-mode trigger is
+now the `HUGIN_SIMPLE_PAIRING` env gate alone; `--url` is optional and, when omitted
+in a TTY, `connect` prompts for the relay URL (visible) then the device code (hidden)
+— two clear steps instead of a flag+env+hidden-paste line. A new env-gated dev origin
+validator (`src/simple-pairing-dev.ts` `canonicalizeDevOrigin`) also allows `ws://`
+and raw non-loopback IPs (for Tailscale/tailnet dev) at BOTH pairing (`connectSimple`)
+and the daemon handshake (`Config.allowDevOrigin`, set from the gate in `index.ts`) —
+so a raw tailnet IP works in dev. The frozen `canonicalizeServerOrigin` is UNTOUCHED
+and remains the only validator on rev2/production, which stays strict + fail-closed
+with no gate (`ws://` is unencrypted, so the relaxation is justified only on a trusted
+WireGuard/Tailscale network). e2e AM1–AM6 (dev-origin accept/reject, frozen still
+rejects raw IP, handshake gate both ways, non-TTY needs `--url`).
+
 ## Track C — Python C2 integration (pairing ceremony rev2 + reference verifier)
 Vendors the frozen auth/handshake contract to the Python C2 without requiring it
 to import the TS package: `protocol/v1/py/` is a Python reference verifier for the

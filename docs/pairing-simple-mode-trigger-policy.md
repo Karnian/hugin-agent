@@ -158,6 +158,74 @@ origin ([src/config.ts](../src/config.ts)) — **no config-schema change**.
 
 ---
 
+## Revision 2 — interactive UX + dev-origin relaxation (2026-07-03)
+
+Two follow-ups from first hands-on use: the `env + --url flag + hidden-paste` line
+was error-prone (a device code pasted as a `--flag`, missing `--`, etc.), and a raw
+Tailscale IP (`ws://100.x.y.z:port`) — the mode's stated motivation — is rejected by
+the frozen origin. rev2 (production) is UNCHANGED by both.
+
+### 2a. Trigger = the env gate; `--url` becomes optional (interactive prompts)
+
+- **Simple mode ⇔ `HUGIN_SIMPLE_PAIRING` gate set** (was: gate AND `--url`). The gate
+  alone is the local "I want simple pairing" signal — still downgrade-safe (a
+  network attacker can't set a local env var; the capability response still never
+  triggers the mode).
+- In simple mode the relay URL comes from `--url` if given, else an **interactive
+  visible prompt** (`Relay URL (ws(s)://host[:port]): `); the `device_code` is then
+  read from the **hidden** prompt. Two clear steps — no flag / `--` / paste confusion.
+  Validate the entered URL immediately (see 2b) and re-prompt (bounded) on error,
+  BEFORE asking for the code.
+- `--url` present **without** the gate → still a hard reject (unchanged).
+- **Non-TTY (piped/CI) without `--url` → clear error** ("needs --url when input is
+  not a terminal"). Scripts/e2e always pass `--url` and pipe only the code, so the
+  existing CLI e2e path is unchanged.
+
+### 2b. Dev-mode origin relaxation (env-gated; frozen function untouched)
+
+The frozen `canonicalizeServerOrigin` is production policy — non-loopback must be
+`wss://` + a DNS name; raw IPs and `ws://` are loopback-only. That (correctly for
+prod) rejects a raw tailnet IP, which is a legitimate DEV target over a
+WireGuard-encrypted Tailscale link.
+
+- Add a SEPARATE `canonicalizeDevOrigin` in a new leaf module (`src/simple-pairing-dev.ts`)
+  that allows `ws://` and `wss://` to **any** host including non-loopback IPv4/IPv6,
+  but keeps EVERY other guard identical to the frozen one: ws(s) only, no
+  userinfo/path/query/fragment, no port 0, no trailing-dot/percent host, DNS-label
+  check for non-IP hosts, IPv4 octets ≤ 255, and **input must already be canonical**
+  (reject-not-normalize). `protocol/v1/origin.ts` is **NOT** modified.
+- `connectSimple` uses `canonicalizeDevOrigin` (it is only ever the dev path). rev2
+  `connect()` keeps the frozen `canonicalizeServerOrigin`.
+- The daemon handshake honors the SAME gate: add `Config.allowDevOrigin`
+  (default **false**); `performHandshake` selects `canonicalizeDevOrigin` when it is
+  true, else the frozen one (the throw on `null` is unchanged). `index.ts` sets
+  `allowDevOrigin` from `process.env.HUGIN_SIMPLE_PAIRING` (shared
+  `simplePairingGateEnabled` helper, reused by the CLI). So the operator runs BOTH
+  `connect` and `hugind` with the gate for a raw-IP dev target.
+- **Production stays strict + fail-closed:** with no gate, `allowDevOrigin` is false
+  and the handshake rejects a raw-IP `serverUrl` exactly as today. The frozen
+  validator is the only path on rev2/production.
+- **Security note:** `ws://` is unencrypted; this relaxation is justified only on a
+  trusted network (Tailscale/WireGuard) and is env-gated dev-only, never production.
+
+### Acceptance additions (Rev 2)
+
+- `canonicalizeDevOrigin` unit checks: ACCEPT `ws://100.120.25.112:5173`,
+  `wss://host.tailnet.ts.net`, `ws://localhost:8787`; REJECT userinfo/path/query/
+  fragment/port-0/non-canonical/`999.1.1.1`. Assert the FROZEN
+  `canonicalizeServerOrigin` still REJECTS `ws://100.120.25.112:5173` (relaxation is
+  real + frozen untouched).
+- Handshake: with `allowDevOrigin:true`, `performHandshake` builds a transcript for a
+  raw-IP `config.serverUrl` and reaches `hello.accepted` (decouple the dial — connect
+  the client to the loopback mock, set `serverUrl` to the raw-IP origin for the
+  transcript, mock in non-auth accept mode). With `allowDevOrigin:false`, the same
+  raw-IP `serverUrl` throws `non-canonical serverUrl`.
+- CLI: gate set + no `--url` + non-TTY → the "needs --url" error. `--url` without the
+  gate → the existing disabled error. rev2 (no gate) unchanged; AE1–AE9 + AL1–AL9 +
+  AL4c stay green (update AL3's expected message to the new dev-origin wording).
+
+---
+
 ## Review history
 
 - **Codex cross-review (2026-07-03):** verdict **APPROVE-WITH-CHANGES**. Core

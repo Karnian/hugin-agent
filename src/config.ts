@@ -17,6 +17,9 @@ export const Config = z.strictObject({
   serverUrl: z
     .string()
     .refine((u) => u.startsWith("wss://") || u.startsWith("ws://"), "serverUrl must be ws(s)://"),
+  /** Dev-only simple-pairing relaxation for handshake origin validation. False
+   *  keeps production on the frozen protocol/v1 canonicalizer. */
+  allowDevOrigin: z.boolean().default(false),
   /** Per-device agent id (server-minted at pairing). */
   agentId: AuthId,
   /** Device key id selecting the signing key (a stub key in the non-auth MVP). */

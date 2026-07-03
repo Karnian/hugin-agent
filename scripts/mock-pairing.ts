@@ -9,8 +9,10 @@
  *
  * Simple mode:
  *   1)  npm run mock-pairing -- --simple
- *   2)  HUGIN_SIMPLE_PAIRING=1 npm run connect -- --url ws://127.0.0.1:8787
- *       # paste the printed device code when prompted
+ *   2)  HUGIN_SIMPLE_PAIRING=1 npm run connect
+ *       # answer the visible relay URL prompt with ws://127.0.0.1:8787
+ *       # then paste the printed device code when the hidden prompt appears
+ *       # --url ws://127.0.0.1:8787 is still accepted for scripts/CI
  *
  * The mock auto-confirms activation after the client's first status poll
  * (confirmAfterStatusPolls: 1) — this stands in for the human browser
@@ -48,8 +50,10 @@ async function main(): Promise<void> {
   console.log(`\n  mock pairing server: ${server.baseUrl()}  (dev stand-in for the Python C2 — NOT production)\n`);
   if (simpleMode) {
     console.log(`  Simple pairing capability is enabled.`);
-    console.log(`  Run: HUGIN_SIMPLE_PAIRING=1 npm run connect -- --url ws://127.0.0.1:${port}`);
-    console.log(`  Paste this device code when prompted (input is hidden — paste, then press Enter):\n`);
+    console.log(`  Run: HUGIN_SIMPLE_PAIRING=1 npm run connect`);
+    console.log(`  Relay URL prompt: ws://127.0.0.1:${port}`);
+    console.log(`  Or for scripts/CI: HUGIN_SIMPLE_PAIRING=1 npm run connect -- --url ws://127.0.0.1:${port}`);
+    console.log(`  Paste this device code at the hidden prompt (paste, then press Enter):\n`);
     console.log(`      ${deviceCode}\n`);
   } else {
     console.log(`  Paste this token into \`npm run connect\` (input is hidden — paste, then press Enter):\n`);

@@ -12,6 +12,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import { type Message, PROTOCOL_VERSION } from "../../protocol/v1/index";
 import { buildTranscript } from "../../protocol/v1/transcript";
 import { canonicalizeServerOrigin } from "../../protocol/v1/origin";
+import { canonicalizeDevOrigin } from "../simple-pairing-dev";
 import type { Config } from "../config";
 import { envelope } from "./outbound";
 import type { RelayClient } from "./client";
@@ -66,7 +67,8 @@ export async function performHandshake(
     { type: "auth.challenge" }
   >;
 
-  const origin = canonicalizeServerOrigin(config.serverUrl);
+  const canonicalizeOrigin = config.allowDevOrigin ? canonicalizeDevOrigin : canonicalizeServerOrigin;
+  const origin = canonicalizeOrigin(config.serverUrl);
   if (origin === null) throw new Error(`non-canonical serverUrl: ${config.serverUrl}`);
 
   const transcript = buildTranscript({
