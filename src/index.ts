@@ -19,6 +19,7 @@ import { configFilePath } from "./auth/paths";
 import { ClaudeEngine } from "./engine/claude";
 import { buildIsolation, selfCheckGate, selfCheckLogin } from "./engine/isolate";
 import { log } from "./log";
+import { simplePairingGateEnabled } from "./simple-pairing-dev";
 
 function loadConfigOrExit(): Config {
   const roots =
@@ -36,6 +37,7 @@ function loadConfigOrExit(): Config {
       keyId: process.env.HUGIND_KEY_ID ?? paired?.keyId,
       tenantId: process.env.HUGIND_TENANT_ID ?? paired?.tenantId,
       agentVersion: process.env.HUGIND_AGENT_VERSION,
+      allowDevOrigin: simplePairingGateEnabled(process.env.HUGIN_SIMPLE_PAIRING),
       projectRoots: roots,
       stateDir: process.env.HUGIND_STATE_DIR,
       engineCommand: process.env.HUGIND_ENGINE_CMD,

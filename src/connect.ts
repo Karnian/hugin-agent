@@ -8,9 +8,13 @@
 
 import { connect, connectSimple } from "./auth/connect";
 import { log } from "./log";
+import { canonicalizeDevOrigin, simplePairingGateEnabled } from "./simple-pairing-dev";
 
 const MAX_TOKEN_BYTES = 1024;
+const MAX_RELAY_URL_PROMPTS = 3;
 const SIMPLE_PAIRING_DISABLED_ERROR = "simple pairing is disabled; set HUGIN_SIMPLE_PAIRING=1 for dev, or omit --url for rev2";
+const SIMPLE_PAIRING_NEEDS_URL_NON_TTY_ERROR = "simple pairing needs --url when input is not a terminal";
+const SIMPLE_PAIRING_URL_ERROR = "simple pairing relay URL is invalid; provide a canonical dev ws(s):// relay origin";
 
 interface Args {
   config?: string;
@@ -52,11 +56,13 @@ const USAGE = `hugin-agent connect — pair this device with a Hugin relay
 
   --config, -c   Config-file path override (default: ~/.config/hugin-agent/config.json
                  or $HUGIND_CONFIG / $HUGIND_CONFIG_DIR / $XDG_CONFIG_HOME).
-  --url          Dev-only simple pairing origin. Requires HUGIN_SIMPLE_PAIRING=1.
+  --url          Dev-only simple pairing origin. Optional when HUGIN_SIMPLE_PAIRING=1
+                 and stdin is an interactive terminal.
   --help,   -h   Show this help.
 
 Paste the hpk1 pairing token from your browser when prompted. Input is hidden.
-With HUGIN_SIMPLE_PAIRING=1 and --url, paste the simple device code instead.`;
+With HUGIN_SIMPLE_PAIRING=1, provide the relay URL first, then paste the simple
+device code when prompted.`;
 
 function stripOneTrailingLineEnding(s: string): string {
   if (s.endsWith("\r\n")) return s.slice(0, -2);
@@ -82,7 +88,11 @@ async function readPipedToken(): Promise<string> {
   return stripOneTrailingLineEnding(Buffer.concat(chunks).toString("utf8"));
 }
 
-async function readHiddenToken(prompt = "Paste pairing token: "): Promise<string> {
+function canPromptInteractively(): boolean {
+  return Boolean(process.stdin.isTTY && typeof process.stdin.setRawMode === "function");
+}
+
+async function readPromptedInput(prompt: string, opts: { echo: boolean }): Promise<string> {
   if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
     return readPipedToken();
   }
@@ -122,6 +132,7 @@ async function readHiddenToken(prompt = "Paste pairing token: "): Promise<string
       }
       token += ch;
       bytes = nextBytes;
+      if (opts.echo) process.stderr.write(ch);
     };
     const onData = (chunk: Buffer) => {
       for (const byte of chunk) {
@@ -138,6 +149,7 @@ async function readHiddenToken(prompt = "Paste pairing token: "): Promise<string
             const removed = token.at(-1) ?? "";
             token = token.slice(0, -1);
             bytes -= Buffer.byteLength(removed, "utf8");
+            if (opts.echo) process.stderr.write("\b \b");
           }
           continue;
         }
@@ -152,9 +164,33 @@ async function readHiddenToken(prompt = "Paste pairing token: "): Promise<string
   });
 }
 
-function simplePairingEnabled(): boolean {
-  const value = process.env.HUGIN_SIMPLE_PAIRING;
-  return value === "1" || value?.toLowerCase() === "true";
+async function readHiddenToken(prompt = "Paste pairing token: "): Promise<string> {
+  return readPromptedInput(prompt, { echo: false });
+}
+
+async function promptForRelayUrl(): Promise<string> {
+  if (!canPromptInteractively()) {
+    throw new Error(SIMPLE_PAIRING_NEEDS_URL_NON_TTY_ERROR);
+  }
+
+  for (let attempt = 1; attempt <= MAX_RELAY_URL_PROMPTS; attempt++) {
+    const entered = await readPromptedInput("Relay URL (ws(s)://host[:port]): ", { echo: true });
+    const canonical = canonicalizeDevOrigin(entered);
+    if (canonical !== null) return canonical;
+    if (attempt < MAX_RELAY_URL_PROMPTS) {
+      process.stderr.write(`${SIMPLE_PAIRING_URL_ERROR}\n`);
+    }
+  }
+  throw new Error(SIMPLE_PAIRING_URL_ERROR);
+}
+
+async function resolveSimpleRelayUrl(argUrl: string | undefined): Promise<string> {
+  if (argUrl !== undefined) {
+    const canonical = canonicalizeDevOrigin(argUrl);
+    if (canonical === null) throw new Error(SIMPLE_PAIRING_URL_ERROR);
+    return canonical;
+  }
+  return promptForRelayUrl();
 }
 
 async function main(): Promise<void> {
@@ -165,16 +201,17 @@ async function main(): Promise<void> {
   }
 
   try {
-    const simpleMode = args.url !== undefined;
-    if (simpleMode && !simplePairingEnabled()) {
+    const simpleMode = simplePairingGateEnabled(process.env.HUGIN_SIMPLE_PAIRING);
+    if (args.url !== undefined && !simpleMode) {
       throw new Error(SIMPLE_PAIRING_DISABLED_ERROR);
     }
 
+    const serverUrl = simpleMode ? await resolveSimpleRelayUrl(args.url) : "";
     const hidden = await readHiddenToken(simpleMode ? "Paste device code: " : "Paste pairing token: ");
     const res = simpleMode
       ? await connectSimple({
           deviceCode: hidden,
-          serverUrl: args.url ?? "",
+          serverUrl,
           configPath: args.config,
         })
       : await connect({

@@ -17,6 +17,7 @@ import { writePairingConfig } from "./config-file";
 import { keychainSeedStore, newDeviceKey, type SeedStore } from "./keystore";
 import { parsePairingToken } from "./pairing-token";
 import { SIMPLE_PAIRING_CAPABILITY_FIELD, SIMPLE_PAIRING_CAPABILITY_VALUE } from "./simple-pairing-capability";
+import { canonicalizeDevOrigin } from "../simple-pairing-dev";
 
 const AuthId = z.string().regex(/^[A-Za-z0-9._-]{1,128}$/);
 const TenantId = AuthId;
@@ -357,9 +358,9 @@ export async function connectSimple(opts: ConnectSimpleOptions): Promise<Pairing
   const seedStore = opts.seedStore ?? keychainSeedStore();
   const configPath = opts.configPath ?? configFilePath();
 
-  const canonicalOrigin = canonicalizeServerOrigin(opts.serverUrl);
+  const canonicalOrigin = canonicalizeDevOrigin(opts.serverUrl);
   if (canonicalOrigin === null) {
-    throw new Error("simple pairing --url is invalid; provide a canonical ws(s):// relay origin");
+    throw new Error("simple pairing relay URL is invalid; provide a canonical dev ws(s):// relay origin");
   }
 
   const deviceCode = validateSimpleDeviceCode(opts.deviceCode);

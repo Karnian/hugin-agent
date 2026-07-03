@@ -29,6 +29,7 @@ import { loadConfig } from "../src/config";
 import { connect, connectSimple } from "../src/auth/connect";
 import { readPairingConfig } from "../src/auth/config-file";
 import { parsePairingToken, type ParsedPairingToken } from "../src/auth/pairing-token";
+import { canonicalizeDevOrigin } from "../src/simple-pairing-dev";
 import { Daemon } from "../src/daemon";
 import { devSigner, performHandshake } from "../src/conn/handshake";
 import { keychainSeedStore, keychainSigner, memorySeedStore, newDeviceKey, type SeedStore } from "../src/auth/keystore";
@@ -1841,7 +1842,7 @@ async function scenarioALNonCanonicalUrl(cfgDir: string): Promise<void> {
     join(cfgDir, "al3-config.json"),
     trackingSeedStore(),
     { deviceCode: "device-code-al3", serverUrl: "ws://relay.example.com/path" },
-    "simple pairing --url is invalid; provide a canonical ws(s):// relay origin",
+    "simple pairing relay URL is invalid; provide a canonical dev ws(s):// relay origin",
   );
 }
 
@@ -2025,6 +2026,99 @@ async function scenarioAL(): Promise<void> {
     await scenarioALMixedModeGuard(cfgDir);
     await scenarioALCompletionRejects(cfgDir);
     await scenarioALDeviceCodeNotArgv(cfgDir);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+}
+
+function scenarioAMCanonicalizeDevOrigin(): void {
+  const accepted = [
+    "ws://100.120.25.112:5173",
+    "wss://host.tailnet.ts.net",
+    "ws://localhost:8787",
+    "ws://127.0.0.1:8787",
+  ];
+  const rejected = [
+    "ws://relay.example.com/path",
+    "ws://user@relay.example.com:8787",
+    "ws://relay.example.com:8787?x=1",
+    "ws://relay.example.com:8787#frag",
+    "ws://relay.example.com:0",
+    "wss://Host.tailnet.ts.net",
+    "ws://999.1.1.1:80",
+  ];
+  check("AM1 canonicalizeDevOrigin accepts ws/wss dev origins including raw IPs", accepted.every((origin) => canonicalizeDevOrigin(origin) === origin));
+  check("AM2 canonicalizeDevOrigin rejects path/userinfo/query/fragment/port0/non-canonical/bad IPv4", rejected.every((origin) => canonicalizeDevOrigin(origin) === null));
+  check("AM3 frozen canonicalizeServerOrigin still rejects non-loopback raw ws IP", canonicalizeServerOrigin("ws://100.120.25.112:5173") === null);
+}
+
+async function scenarioAMHandshakeDevOrigin(): Promise<void> {
+  const rawDevOrigin = "ws://100.120.25.112:5173";
+
+  const acceptingRelay = new MockRelay();
+  const acceptingPort = await acceptingRelay.start();
+  const acceptingClient = new RelayClient();
+  try {
+    await acceptingClient.connect(`ws://127.0.0.1:${acceptingPort}`);
+    const hs = await performHandshake(
+      acceptingClient,
+      loadConfig({ serverUrl: rawDevOrigin, allowDevOrigin: true, agentId: "agent-am-dev", dbPath: ":memory:" }),
+      devSigner("key-am-dev"),
+      { activeJobs: [], pendingResults: [] },
+    );
+    check("AM4 allowDevOrigin:true permits raw-IP dev origin transcript and reaches hello.accepted", hs.connectionEpoch === 1);
+  } finally {
+    acceptingClient.close();
+    await acceptingRelay.stop();
+  }
+
+  const strictRelay = new MockRelay();
+  const strictPort = await strictRelay.start();
+  const strictClient = new RelayClient();
+  let message = "";
+  try {
+    await strictClient.connect(`ws://127.0.0.1:${strictPort}`);
+    await performHandshake(
+      strictClient,
+      loadConfig({ serverUrl: rawDevOrigin, allowDevOrigin: false, agentId: "agent-am-strict", dbPath: ":memory:" }),
+      devSigner("key-am-strict"),
+      { activeJobs: [], pendingResults: [] },
+    );
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  } finally {
+    strictClient.close();
+    await strictRelay.stop();
+  }
+  check("AM5 allowDevOrigin:false keeps raw-IP dev origin fail-closed", message === `non-canonical serverUrl: ${rawDevOrigin}`);
+}
+
+async function scenarioAMCliNonTtyNeedsUrl(cfgDir: string): Promise<void> {
+  const cfgPath = join(cfgDir, "am6-config.json");
+  const res = await runConnectCli({
+    cfgDir,
+    configPath: cfgPath,
+    args: ["--config", cfgPath],
+    input: "device-code-am6\n",
+    env: { HUGIN_SIMPLE_PAIRING: "1" },
+  });
+  const output = `${res.stdout}\n${res.stderr}`;
+  check(
+    "AM6 gate set + no --url + non-TTY rejects with needs --url and persists nothing",
+    res.status !== 0 &&
+      output.includes("simple pairing needs --url when input is not a terminal") &&
+      readPairingConfig(cfgPath) === null,
+  );
+}
+
+async function scenarioAM(): Promise<void> {
+  const cfgDir = join(SCRATCH, "pairing-simple-rev2");
+  rmSync(cfgDir, { recursive: true, force: true });
+  mkdirSync(cfgDir, { recursive: true });
+  try {
+    scenarioAMCanonicalizeDevOrigin();
+    await scenarioAMHandshakeDevOrigin();
+    await scenarioAMCliNonTtyNeedsUrl(cfgDir);
   } finally {
     rmSync(cfgDir, { recursive: true, force: true });
   }
@@ -2329,6 +2423,8 @@ async function main(): Promise<void> {
   await scenarioAE();
   console.log("\n[scenario AL: simple pairing mode — gate, strict 200, and WSS handshake]");
   await scenarioAL();
+  console.log("\n[scenario AM: simple pairing Rev 2 — interactive UX + dev-origin relaxation]");
+  await scenarioAM();
   console.log("\n[scenario AF: Track A duplicate post-auth hello ignored]");
   await scenarioAF();
   console.log("\n[scenario AG: Track A premature hello.accepted discarded]");
