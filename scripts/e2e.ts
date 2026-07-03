@@ -45,7 +45,7 @@ import { validateWorkspace } from "../src/workspace/worktree";
 import { MockRelay, verifyHello, type PairingRecord } from "../mock-relay/server";
 import { MockPairingServer } from "../mock-relay/pairing-server";
 
-const SCRATCH = "/private/tmp/claude-501/-Users-k-Desktop-sub-project-hugin-agent/500bdae6-f9cf-45b3-9e5b-a2819e8bcd4b/scratchpad/e2e-worktree";
+const SCRATCH = join(tmpdir(), "hugind-e2e-worktree");
 
 let failures = 0;
 function check(label: string, cond: boolean): void {

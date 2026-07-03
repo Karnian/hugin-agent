@@ -15,6 +15,7 @@
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config";
 import { Daemon } from "../src/daemon";
@@ -23,7 +24,7 @@ import { ClaudeEngine } from "../src/engine/claude";
 import { buildIsolation, selfCheckGate, selfCheckLogin } from "../src/engine/isolate";
 import { MockRelay } from "../mock-relay/server";
 
-const SCRATCH = "/private/tmp/claude-501/-Users-k-Desktop-sub-project-hugin-agent/500bdae6-f9cf-45b3-9e5b-a2819e8bcd4b/scratchpad/e2e-claude";
+const SCRATCH = join(tmpdir(), "hugind-e2e-claude");
 
 let failures = 0;
 function check(label: string, cond: boolean): void {

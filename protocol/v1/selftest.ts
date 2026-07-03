@@ -48,7 +48,7 @@ const samples: Record<MessageType, unknown> = {
         claude: { installed: true, version: "2.1.170", logged_in: true },
         codex: { installed: true, version: "0.140.0", logged_in: false },
       },
-      project_roots: ["/Users/k/code/repo-a"],
+      project_roots: ["/tmp/code/repo-a"],
     },
     active_jobs: [],
     pending_results: [
@@ -79,7 +79,7 @@ const samples: Record<MessageType, unknown> = {
     id: "m4", ts: now, type: "job.assign",
     job_id: "j1", attempt_id: "a1", lease_id: lease, lease_ttl_ms: 120000,
     engine: "claude",
-    workspace: { repo_root: "/Users/k/code/repo-a", base_sha: "deadbeef" },
+    workspace: { repo_root: "/tmp/code/repo-a", base_sha: "deadbeef" },
     prompt: "Summarize the README.",
     sandbox: "read_only", approval_policy: "on_write",
     env_policy: env, network_policy: { mode: "off" },
