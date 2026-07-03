@@ -16,6 +16,7 @@
     "hugind": "tsx src/index.ts",
     "connect": "tsx src/connect.ts",
     "mock-relay": "tsx mock-relay/server.ts",
+    "mock-pairing": "tsx scripts/mock-pairing.ts",
     "e2e": "tsx scripts/e2e.ts",
     "e2e:claude": "tsx scripts/e2e-claude.ts"
   },
