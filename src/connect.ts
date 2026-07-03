@@ -6,13 +6,15 @@
  * after browser fingerprint confirmation. The private key never leaves the host.
  */
 
-import { connect } from "./auth/connect";
+import { connect, connectSimple } from "./auth/connect";
 import { log } from "./log";
 
 const MAX_TOKEN_BYTES = 1024;
+const SIMPLE_PAIRING_DISABLED_ERROR = "simple pairing is disabled; set HUGIN_SIMPLE_PAIRING=1 for dev, or omit --url for rev2";
 
 interface Args {
   config?: string;
+  url?: string;
   help: boolean;
   valid: boolean;
 }
@@ -25,8 +27,17 @@ function parseArgs(argv: string[]): Args {
       const value = argv[++i];
       if (!value) args.valid = false;
       else args.config = value;
+    } else if (a === "--url") {
+      const value = argv[++i];
+      if (!value) args.valid = false;
+      else args.url = value;
     } else if (a === "--help" || a === "-h") args.help = true;
     else if (a?.startsWith("--config=")) args.config = a.slice("--config=".length);
+    else if (a?.startsWith("--url=")) {
+      const value = a.slice("--url=".length);
+      if (!value) args.valid = false;
+      else args.url = value;
+    }
     else if (a) {
       log.error("unknown argument; pairing tokens are read from hidden stdin");
       args.valid = false;
@@ -37,13 +48,15 @@ function parseArgs(argv: string[]): Args {
 
 const USAGE = `hugin-agent connect — pair this device with a Hugin relay
 
-  hugin-agent connect [--config <path>]
+  hugin-agent connect [--config <path>] [--url <origin>]
 
   --config, -c   Config-file path override (default: ~/.config/hugin-agent/config.json
                  or $HUGIND_CONFIG / $HUGIND_CONFIG_DIR / $XDG_CONFIG_HOME).
+  --url          Dev-only simple pairing origin. Requires HUGIN_SIMPLE_PAIRING=1.
   --help,   -h   Show this help.
 
-Paste the hpk1 pairing token from your browser when prompted. Input is hidden.`;
+Paste the hpk1 pairing token from your browser when prompted. Input is hidden.
+With HUGIN_SIMPLE_PAIRING=1 and --url, paste the simple device code instead.`;
 
 function stripOneTrailingLineEnding(s: string): string {
   if (s.endsWith("\r\n")) return s.slice(0, -2);
@@ -69,12 +82,12 @@ async function readPipedToken(): Promise<string> {
   return stripOneTrailingLineEnding(Buffer.concat(chunks).toString("utf8"));
 }
 
-async function readHiddenToken(): Promise<string> {
+async function readHiddenToken(prompt = "Paste pairing token: "): Promise<string> {
   if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
     return readPipedToken();
   }
 
-  process.stderr.write("Paste pairing token: ");
+  process.stderr.write(prompt);
   return new Promise<string>((resolve, reject) => {
     const stdin = process.stdin;
     const wasRaw = Boolean(stdin.isRaw);
@@ -139,6 +152,11 @@ async function readHiddenToken(): Promise<string> {
   });
 }
 
+function simplePairingEnabled(): boolean {
+  const value = process.env.HUGIN_SIMPLE_PAIRING;
+  return value === "1" || value?.toLowerCase() === "true";
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || !args.valid) {
@@ -147,14 +165,25 @@ async function main(): Promise<void> {
   }
 
   try {
-    const token = await readHiddenToken();
-    const res = await connect({
-      token,
-      configPath: args.config,
-      onFingerprint: (fp) => {
-        console.log(`\nFingerprint:\n  ${fp}\n\nConfirm this fingerprint in your browser to finish.\n`);
-      },
-    });
+    const simpleMode = args.url !== undefined;
+    if (simpleMode && !simplePairingEnabled()) {
+      throw new Error(SIMPLE_PAIRING_DISABLED_ERROR);
+    }
+
+    const hidden = await readHiddenToken(simpleMode ? "Paste device code: " : "Paste pairing token: ");
+    const res = simpleMode
+      ? await connectSimple({
+          deviceCode: hidden,
+          serverUrl: args.url ?? "",
+          configPath: args.config,
+        })
+      : await connect({
+          token: hidden,
+          configPath: args.config,
+          onFingerprint: (fp) => {
+            console.log(`\nFingerprint:\n  ${fp}\n\nConfirm this fingerprint in your browser to finish.\n`);
+          },
+        });
     console.log(
       `paired ✓  agent_id=${res.agentId}  key_id=${res.keyId}  tenant_id=${res.tenantId}\n` +
         `  relay:  ${res.serverUrl}\n` +

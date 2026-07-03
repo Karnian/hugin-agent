@@ -1,11 +1,16 @@
 /**
- * Standalone mock pairing server — a LOCAL stand-in for the (not-yet-built)
- * Python C2, so you can exercise the real `hugin-agent connect` (rev2) flow
- * end-to-end without a cloud relay. DEV / SMOKE-TEST ONLY, not production.
+ * Standalone mock pairing server — a LOCAL stand-in for the Python C2, so you
+ * can exercise the real `hugin-agent connect` flow without a cloud relay.
+ * DEV / SMOKE-TEST ONLY, not production.
  *
  * Two terminals:
  *   1)  npm run mock-pairing          # prints an hpk1 token; keeps serving /pair
  *   2)  npm run connect               # paste the token when prompted (input is HIDDEN)
+ *
+ * Simple mode:
+ *   1)  npm run mock-pairing -- --simple
+ *   2)  HUGIN_SIMPLE_PAIRING=1 npm run connect -- --url ws://127.0.0.1:8787
+ *       # paste the printed device code when prompted
  *
  * The mock auto-confirms activation after the client's first status poll
  * (confirmAfterStatusPolls: 1) — this stands in for the human browser
@@ -19,6 +24,7 @@
 import { MockPairingServer } from "../mock-relay/pairing-server";
 
 const port = Number(process.env.PORT ?? 8787);
+const simpleMode = process.argv.includes("--simple") || process.env.PAIRING_MODE === "simple";
 
 async function main(): Promise<void> {
   const server = new MockPairingServer({
@@ -32,15 +38,24 @@ async function main(): Promise<void> {
     // Generous TTLs so you aren't rushed to paste.
     tokenTtlMs: 60 * 60_000,
     pendingTtlMs: 60 * 60_000,
+    simplePairing: simpleMode,
   });
 
   await server.start(port);
-  const token = server.mint();
+  const token = simpleMode ? "" : server.mint();
+  const deviceCode = simpleMode ? server.mintSimpleDeviceCode() : "";
 
   console.log(`\n  mock pairing server: ${server.baseUrl()}  (dev stand-in for the Python C2 — NOT production)\n`);
-  console.log(`  Paste this token into \`npm run connect\` (input is hidden — paste, then press Enter):\n`);
-  console.log(`      ${token}\n`);
-  console.log(`  It auto-confirms after the client's first status poll (≈2s).`);
+  if (simpleMode) {
+    console.log(`  Simple pairing capability is enabled.`);
+    console.log(`  Run: HUGIN_SIMPLE_PAIRING=1 npm run connect -- --url ws://127.0.0.1:${port}`);
+    console.log(`  Paste this device code when prompted (input is hidden — paste, then press Enter):\n`);
+    console.log(`      ${deviceCode}\n`);
+  } else {
+    console.log(`  Paste this token into \`npm run connect\` (input is hidden — paste, then press Enter):\n`);
+    console.log(`      ${token}\n`);
+    console.log(`  It auto-confirms after the client's first status poll (≈2s).`);
+  }
   console.log(`  On success, connect persists ~/.config/hugin-agent/config.json + a keychain seed.`);
   console.log(`  Ctrl-C to stop.\n`);
 
