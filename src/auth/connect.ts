@@ -1,69 +1,53 @@
 /**
- * Device pairing flow (auth-pairing-spec §3) — the client side of `hugin-agent
- * connect --server <url>`.
+ * Browser-initiated rev2 pairing (auth-pairing-spec §3): paste hpk1 token,
+ * prove possession of a fresh Ed25519 device key, wait for browser fingerprint
+ * activation, then persist the paired identity.
  *
- *   1. Mint an Ed25519 device keypair in memory (nothing persisted yet).
- *   2. Start a device-code flow, sending ONLY the PUBLIC key; show the user code.
- *   3. Poll until the server approves: it mints `agent_id`, registers the public
- *      key, and returns `agent_id`/`key_id`/`tenant_id`(/`user_id`) + the relay
- *      URL to dial.
- *   4. Persist the seed to the OS keychain under the server-assigned `key_id`,
- *      and write the non-secret pairing config.
- *
- * The private key (seed) NEVER leaves the host — the wire carries only the public
- * key at start and, later, signatures at handshake. The in-memory seed is
- * scrubbed on every exit path.
+ * The private key seed never leaves the host. Pairing sends only the public key
+ * plus a PoP signature, and the in-memory seed is scrubbed on every exit path.
  */
 
 import { z } from "zod";
+import { b64u, deriveKeypairFromSeed, signTranscript } from "../../protocol/v1/ed25519";
+import { PROTOCOL_VERSION } from "../../protocol/v1/messages";
 import { canonicalizeServerOrigin } from "../../protocol/v1/origin";
-import { log } from "../log";
+import { buildPairingTranscript, keyFingerprint, PAIRING_SECRET_RE } from "../../protocol/v1/pairing";
 import { configFilePath } from "./paths";
 import { writePairingConfig } from "./config-file";
 import { keychainSeedStore, newDeviceKey, type SeedStore } from "./keystore";
+import { parsePairingToken } from "./pairing-token";
 
 const AuthId = z.string().regex(/^[A-Za-z0-9._-]{1,128}$/);
 
-/** `POST /v1/pair/start` response (RFC 8628-style device authorization). */
-const StartResponse = z.object({
-  device_code: z.string().min(1).max(512),
-  user_code: z.string().min(1).max(64),
-  verification_uri: z.string().min(1).max(512),
-  interval_ms: z.number().int().positive().max(60_000),
-  expires_in_ms: z.number().int().positive().max(3_600_000),
+const CompleteResponse = z.strictObject({
+  status: z.literal("pending"),
+  fingerprint: z.string().regex(PAIRING_SECRET_RE),
+  poll_token: z.string().min(1).max(1024),
 });
 
-/** `POST /v1/pair/poll` response. `approved` carries the minted pairing record. */
-const PollResponse = z.discriminatedUnion("status", [
-  z.object({ status: z.literal("pending") }),
-  z.object({ status: z.literal("denied") }),
-  z.object({ status: z.literal("expired") }),
-  z.object({
-    status: z.literal("approved"),
+const StatusResponse = z.discriminatedUnion("status", [
+  z.strictObject({ status: z.literal("pending") }),
+  z.strictObject({ status: z.literal("rejected") }),
+  z.strictObject({
+    status: z.literal("active"),
     agent_id: AuthId,
     key_id: AuthId,
     tenant_id: AuthId,
-    user_id: z.string().max(256).optional(),
-    /** ws(s):// relay origin to dial (validated canonical before persist). */
-    relay_url: z.string().min(1).max(512),
   }),
 ]);
 
 export interface ConnectOptions {
-  /** Pairing server base URL (http/https). */
-  serverUrl: string;
+  /** The pasted hpk1 token. */
+  token: string;
   agentVersion?: string;
-  /** Where to store the device seed (default: the OS keychain). */
   seedStore?: SeedStore;
-  /** Config-file path (default: resolved from env / XDG / ~/.config). */
   configPath?: string;
-  /** Injected for tests; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
-  /** Called with the user code + URL to display (default: log to stderr). */
-  onUserCode?: (info: { userCode: string; verificationUri: string }) => void;
-  /** Test hooks. */
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
+  onFingerprint?: (fp: string) => void;
+  pollIntervalMs?: number;
+  pollDeadlineMs?: number;
 }
 
 export interface PairingResult {
@@ -76,58 +60,148 @@ export interface PairingResult {
   configPath: string;
 }
 
-async function postJson(fetchImpl: typeof fetch, url: string, body: unknown): Promise<unknown> {
-  const res = await fetchImpl(url, {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-  return res.json();
+interface PairingEndpoints {
+  complete: string;
+  status: string;
 }
 
-/**
- * Run the pairing flow to completion. Resolves with the minted identity (already
- * persisted); rejects on denial / expiry / timeout / malformed server response.
- */
+function pairingEndpoints(canonicalOrigin: string): PairingEndpoints {
+  const url = new URL(canonicalOrigin);
+  const scheme = url.protocol === "wss:" ? "https" : "http";
+  const base = `${scheme}://${url.host}/api/v1/hugin-agents/pair`;
+  return {
+    complete: `${base}/complete`,
+    status: `${base}/status`,
+  };
+}
+
+function validatePollingOptions(pollIntervalMs: number, pollDeadlineMs: number): void {
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw new Error("invalid pairing poll interval");
+  }
+  if (!Number.isFinite(pollDeadlineMs) || pollDeadlineMs <= 0) {
+    throw new Error("invalid pairing poll deadline");
+  }
+}
+
+async function postJson(fetchImpl: typeof fetch, url: string, body: unknown): Promise<Response> {
+  return fetchImpl(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "cache-control": "no-store",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+async function readJson(res: Response, message: string): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
+    throw new Error(message);
+  }
+}
+
+function parseCompleteResponse(value: unknown): z.infer<typeof CompleteResponse> {
+  try {
+    return CompleteResponse.parse(value);
+  } catch {
+    throw new Error("pairing server returned an invalid completion response; re-pair this device");
+  }
+}
+
+function parseStatusResponse(value: unknown): z.infer<typeof StatusResponse> {
+  try {
+    return StatusResponse.parse(value);
+  } catch {
+    throw new Error("pairing server returned an invalid status response; re-pair this device");
+  }
+}
+
 export async function connect(opts: ConnectOptions): Promise<PairingResult> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const sleep = opts.sleepImpl ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = opts.nowImpl ?? (() => Date.now());
   const seedStore = opts.seedStore ?? keychainSeedStore();
   const configPath = opts.configPath ?? configFilePath();
-  const base = opts.serverUrl.replace(/\/+$/, ""); // trim trailing slashes
-  const onUserCode =
-    opts.onUserCode ??
-    ((i) => log.info("approve this device to finish pairing", { url: i.verificationUri, code: i.userCode }));
+  const onFingerprint = opts.onFingerprint ?? (() => undefined);
+  const pollIntervalMs = opts.pollIntervalMs ?? 2000;
+  const pollDeadlineMs = opts.pollDeadlineMs ?? 600_000;
+  validatePollingOptions(pollIntervalMs, pollDeadlineMs);
+
+  const parsedToken = parsePairingToken(opts.token, now());
+  const canonicalOrigin = canonicalizeServerOrigin(parsedToken.origin);
+  if (canonicalOrigin === null) {
+    throw new Error("pairing token origin is invalid; re-copy the token");
+  }
+  const endpoints = pairingEndpoints(canonicalOrigin);
 
   const dk = newDeviceKey();
   try {
-    // 1. start — send ONLY the public key.
-    const start = StartResponse.parse(
-      await postJson(fetchImpl, `${base}/v1/pair/start`, {
-        public_key: dk.publicRaw.toString("base64url"),
-        agent_version: opts.agentVersion ?? "0.0.0",
-        os: { platform: process.platform, arch: process.arch },
-      }),
-    );
-    onUserCode({ userCode: start.user_code, verificationUri: start.verification_uri });
+    const localFingerprint = keyFingerprint(dk.publicRaw);
 
-    // 2. poll until approved / terminal.
-    const deadline = now() + start.expires_in_ms;
+    const completePairing = async (): Promise<string> => {
+      const transcript = buildPairingTranscript({
+        secret: parsedToken.secret,
+        publicRaw: dk.publicRaw,
+        server_origin: canonicalOrigin,
+        protocol_version: PROTOCOL_VERSION,
+      });
+      const { privateKey } = deriveKeypairFromSeed(dk.seed);
+      const popSignature = signTranscript(privateKey, transcript);
+
+      const res = await postJson(fetchImpl, endpoints.complete, {
+        secret: parsedToken.secret,
+        public_key: b64u(dk.publicRaw),
+        pop_signature: popSignature,
+      });
+      if (res.status !== 202) {
+        throw new Error("pairing completion failed; re-copy the token or re-pair this device");
+      }
+      const complete = parseCompleteResponse(
+        await readJson(res, "pairing server returned an invalid completion response; re-pair this device"),
+      );
+      if (complete.fingerprint !== localFingerprint) {
+        throw new Error("pairing server fingerprint mismatch; re-copy the token");
+      }
+      return complete.poll_token;
+    };
+
+    let pollToken = await completePairing();
+    onFingerprint(localFingerprint);
+
+    const deadline = now() + pollDeadlineMs;
+    let recoveredFromMissingPollToken = false;
     while (now() < deadline) {
-      await sleep(start.interval_ms);
-      const poll = PollResponse.parse(await postJson(fetchImpl, `${base}/v1/pair/poll`, { device_code: start.device_code }));
-      if (poll.status === "pending") continue;
-      if (poll.status === "denied") throw new Error("pairing was denied");
-      if (poll.status === "expired") throw new Error("pairing code expired before approval");
+      const res = await postJson(fetchImpl, endpoints.status, { poll_token: pollToken });
+      if (res.status === 404) {
+        if (recoveredFromMissingPollToken) {
+          throw new Error("pairing status expired; re-pair this device");
+        }
+        pollToken = await completePairing();
+        recoveredFromMissingPollToken = true;
+        continue;
+      }
+      if (res.status !== 200) {
+        throw new Error("pairing status request failed; re-pair this device");
+      }
 
-      // 3. approved — validate the relay URL, persist the seed + config.
-      const serverUrl = canonicalizeServerOrigin(poll.relay_url);
-      if (serverUrl === null) throw new Error(`server returned a non-canonical relay_url: ${poll.relay_url}`);
+      const poll = parseStatusResponse(
+        await readJson(res, "pairing server returned an invalid status response; re-pair this device"),
+      );
+      if (poll.status === "pending") {
+        await sleep(pollIntervalMs);
+        continue;
+      }
+      if (poll.status === "rejected") {
+        throw new Error("pairing was rejected; re-pair this device");
+      }
+
       await seedStore.set(poll.key_id, dk.seed);
       writePairingConfig(configPath, {
-        serverUrl,
+        serverUrl: canonicalOrigin,
         agentId: poll.agent_id,
         keyId: poll.key_id,
         tenantId: poll.tenant_id,
@@ -136,12 +210,11 @@ export async function connect(opts: ConnectOptions): Promise<PairingResult> {
         agentId: poll.agent_id,
         keyId: poll.key_id,
         tenantId: poll.tenant_id,
-        userId: poll.user_id,
-        serverUrl,
+        serverUrl: canonicalOrigin,
         configPath,
       };
     }
-    throw new Error("pairing timed out waiting for approval");
+    throw new Error("pairing timed out; re-pair this device");
   } finally {
     dk.seed.fill(0); // scrub the in-memory seed on every path (the store has its own copy)
   }

@@ -1,34 +1,35 @@
 /**
- * `hugin-agent connect --server <url>` — pair this device (auth-pairing-spec §3).
+ * `hugin-agent connect` — pair this device with a browser-minted hpk1 token.
  *
- *   npm run connect -- --server https://relay.example.com
- *
- * Generates an Ed25519 device key (private key → OS keychain), runs the
- * device-code flow, and on approval persists the non-secret pairing config
- * (agent_id/key_id/tenant_id/serverUrl). The private key never leaves the host.
+ * Generates an Ed25519 device key (private key -> OS keychain), proves
+ * possession to the pairing endpoint, and persists the non-secret pairing config
+ * after browser fingerprint confirmation. The private key never leaves the host.
  */
 
 import { connect } from "./auth/connect";
 import { log } from "./log";
 
+const MAX_TOKEN_BYTES = 1024;
+
 interface Args {
-  server?: string;
   config?: string;
   help: boolean;
+  valid: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { help: false };
+  const args: Args = { help: false, valid: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--server" || a === "-s") args.server = argv[++i];
-    else if (a === "--config" || a === "-c") args.config = argv[++i];
-    else if (a === "--help" || a === "-h") args.help = true;
-    else if (a?.startsWith("--server=")) args.server = a.slice("--server=".length);
+    if (a === "--config" || a === "-c") {
+      const value = argv[++i];
+      if (!value) args.valid = false;
+      else args.config = value;
+    } else if (a === "--help" || a === "-h") args.help = true;
     else if (a?.startsWith("--config=")) args.config = a.slice("--config=".length);
     else if (a) {
-      log.error("unknown argument", { arg: a });
-      args.help = true;
+      log.error("unknown argument; pairing tokens are read from hidden stdin");
+      args.valid = false;
     }
   }
   return args;
@@ -36,26 +37,122 @@ function parseArgs(argv: string[]): Args {
 
 const USAGE = `hugin-agent connect — pair this device with a Hugin relay
 
-  hugin-agent connect --server <url> [--config <path>]
+  hugin-agent connect [--config <path>]
 
-  --server, -s   Pairing server base URL (https:// in production).
   --config, -c   Config-file path override (default: ~/.config/hugin-agent/config.json
                  or $HUGIND_CONFIG / $HUGIND_CONFIG_DIR / $XDG_CONFIG_HOME).
-  --help,   -h   Show this help.`;
+  --help,   -h   Show this help.
+
+Paste the hpk1 pairing token from your browser when prompted. Input is hidden.`;
+
+function stripOneTrailingLineEnding(s: string): string {
+  if (s.endsWith("\r\n")) return s.slice(0, -2);
+  if (s.endsWith("\n") || s.endsWith("\r")) return s.slice(0, -1);
+  return s;
+}
+
+function tooLargeError(): Error {
+  return new Error("pairing token is too large; re-copy the token");
+}
+
+async function readPipedToken(): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > MAX_TOKEN_BYTES) {
+      throw tooLargeError();
+    }
+    chunks.push(buf);
+  }
+  return stripOneTrailingLineEnding(Buffer.concat(chunks).toString("utf8"));
+}
+
+async function readHiddenToken(): Promise<string> {
+  if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+    return readPipedToken();
+  }
+
+  process.stderr.write("Paste pairing token: ");
+  return new Promise<string>((resolve, reject) => {
+    const stdin = process.stdin;
+    const wasRaw = Boolean(stdin.isRaw);
+    let token = "";
+    let bytes = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      stdin.off("data", onData);
+      stdin.setRawMode(wasRaw);
+      stdin.pause();
+      process.stderr.write("\n");
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(token);
+    };
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    const appendByte = (byte: number) => {
+      const ch = String.fromCharCode(byte);
+      const nextBytes = bytes + Buffer.byteLength(ch, "utf8");
+      if (nextBytes > MAX_TOKEN_BYTES) {
+        fail(tooLargeError());
+        return;
+      }
+      token += ch;
+      bytes = nextBytes;
+    };
+    const onData = (chunk: Buffer) => {
+      for (const byte of chunk) {
+        if (byte === 3) {
+          fail(new Error("pairing cancelled"));
+          return;
+        }
+        if (byte === 4 || byte === 10 || byte === 13) {
+          finish();
+          return;
+        }
+        if (byte === 8 || byte === 127) {
+          if (token.length > 0) {
+            const removed = token.at(-1) ?? "";
+            token = token.slice(0, -1);
+            bytes -= Buffer.byteLength(removed, "utf8");
+          }
+          continue;
+        }
+        appendByte(byte);
+        if (settled) return;
+      }
+    };
+
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+  });
+}
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  if (args.help || !args.server) {
+  if (args.help || !args.valid) {
     console.log(USAGE);
     process.exit(args.help ? 0 : 1);
   }
 
   try {
+    const token = await readHiddenToken();
     const res = await connect({
-      serverUrl: args.server,
+      token,
       configPath: args.config,
-      onUserCode: (i) => {
-        console.log(`\n  To finish pairing, visit:\n    ${i.verificationUri}\n  and enter code:  ${i.userCode}\n`);
+      onFingerprint: (fp) => {
+        console.log(`\nFingerprint:\n  ${fp}\n\nConfirm this fingerprint in your browser to finish.\n`);
       },
     });
     console.log(
@@ -65,7 +162,7 @@ async function main(): Promise<void> {
         `  device private key stored in the OS keychain — start the daemon with: npm run hugind`,
     );
   } catch (e) {
-    log.error("pairing failed", { err: String(e) });
+    log.error("pairing failed", { err: e instanceof Error ? e.message : "unknown error" });
     process.exit(1);
   }
 }

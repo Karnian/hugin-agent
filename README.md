@@ -27,18 +27,18 @@ ever opened.**
   daemon **fails closed** on write/exec jobs.
 - **Production auth (Track A) — built + tested.** A real Ed25519 device key in the
   OS keychain (`@napi-rs/keyring`) signs the frozen handshake transcript
-  (`keychainSigner`, drop-in for the dev stub); `hugin-agent connect` runs a
-  device-code pairing that mints `agent_id`/`key_id`/`tenant_id` and registers the
-  **public** key — the private key never leaves the host. The mock relay now
-  **verifies** the Ed25519 possession proof (`npm run e2e` scenarios AA–AE).
+  (`keychainSigner`, drop-in for the dev stub); `hugin-agent connect` now runs
+  the rev2 browser-initiated `hpk1` paste-token + Ed25519 PoP + mandatory
+  fingerprint-activation flow, minting `agent_id`/`key_id`/`tenant_id` and
+  registering the **public** key — the private key never leaves the host. The
+  mock pairing server verifies the possession proof (`npm run e2e` AE1–AE9).
   Security surface: [`docs/auth-pairing-spec.md`](docs/auth-pairing-spec.md).
-  > **Pairing ceremony redesigned → rev2 (LOCKED, off-wire).** Track C (Python
-  > C2 integration) replaces the daemon-initiated device-code sketch with a
-  > browser-initiated `hpk1` paste token + Ed25519 proof-of-possession + a
-  > mandatory browser fingerprint activation (auth-spec §3/§5c; PoP vectors in
-  > `protocol/v1/pairing-test-vectors.json`, `npm run pairing:check`). The
-  > **daemon-side implementation of rev2 is queued** — the `connect` command
-  > below still runs the built device-code flow.
+  > **Pairing ceremony rev2 — daemon-side built (LOCKED, off-wire).** The
+  > daemon `connect` implementation uses the browser-initiated `hpk1` paste
+  > token + Ed25519 proof-of-possession + mandatory fingerprint activation
+  > (auth-spec §3/§5c; e2e AE1–AE9). This pairing path is off-wire and leaves
+  > wire `v1.0.0` / `PROTOCOL_VERSION` unchanged; real Python C2 integration
+  > remains Track C.
 - **Approval bridge (Track B) — built + tested.** The real Claude
   `--permission-prompt-tool` is wired to `onApprovalRequest` via an in-process
   `ApprovalBridge` (a per-run UNIX socket — no inbound TCP port) + a stdio MCP
@@ -78,14 +78,14 @@ npm run typecheck        # type-check protocol + daemon
 npm run protocol:check   # validate every protocol message + F4 vectors
 npm run e2e              # daemon ⇄ mock relay, fake engine (CI-safe, no cloud/claude)
 npm run e2e:claude       # real-CLI adapter check (needs `claude` installed + logged in)
-npm run connect -- --server <url>   # pair this device (device key → OS keychain); first run only
+npm run connect                     # pair this device (paste hpk1 token via hidden stdin); first run only
 npm run hugind           # run the daemon (paired config, or env override — see below)
 npm run mock-relay       # a standalone mock relay
 ```
 
 ## Configure (env — [`src/config.ts`](src/config.ts))
 
-After pairing (`npm run connect -- --server <url>`), the daemon reads its identity
+After pairing (`npm run connect`, then paste the browser hpk1 token), the daemon reads its identity
 from the persisted config (`~/.config/hugin-agent/config.json` — non-secret:
 `agent_id`/`key_id`/`tenant_id`/serverUrl; the device private key stays in the OS
 keychain) and needs no env vars. Without a paired key (and no env override) it

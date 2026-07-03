@@ -25,10 +25,27 @@ idempotent re-complete including the post-active short-TTL recovery corner. The
 wire is unchanged (`v1.0.0` frozen; pairing PoP is off-wire). Verification:
 `npm run pairing:check` green (TS 53/53), `protocol/v1/py/selftest.py` green
 (Python 84/84), and `npm run protocol:check` + `npm run e2e` still green. The
-daemon-side rev2 implementation (`src/auth/connect.ts` rewrite, mock
-pairing-server migration, e2e coverage) is QUEUED, not yet built; the committed
-daemon still uses the old daemon-initiated device-code pairing. Cross-reviewed
-(Claude + Codex, 3 rounds each side) → LOCKED.
+ceremony was cross-reviewed (Claude + Codex, 3 rounds each side) → LOCKED.
+
+The **daemon-side rev2 implementation is now built** (replacing the old
+daemon-initiated device-code flow): `src/auth/pairing-token.ts` (new — `hpk1`
+token decode, bounded-first + canonical `validateB64u32` secret gate);
+`src/auth/connect.ts` (rewritten: parse token → frozen-origin canonicalize
+fail-closed → `wss→https`/`ws→http` scheme-swap → PoP `/pair/complete` →
+**local** `keyFingerprint` computed and asserted against the `202` fingerprint →
+bounded `/pair/status` poll with a one-shot 404 re-complete → persist ids +
+canonical origin; in-memory seed scrubbed on every path); `src/connect.ts`
+(hidden-stdin token, fingerprint print, `--server` removed); and
+`mock-relay/pairing-server.ts` (rewritten to the rev2 `/pair/{complete,status}`
++ linearizable CAS `issued→pending→active|rejected|expired|burned` + atomic
+attempt-cap burn + bounded same-winner idempotent re-complete + deterministic
+`confirmAfterStatusPolls`). e2e AE1–AE9 (+AE3b) cover happy path, seed-off-wire
+(multi-encoding), the load-bearing fingerprint assertion, origin fail-closed,
+test-key/bad-PoP refusal, pending→active, one-shot re-complete + post-active
+recovery, pending-state winner-binding, and the attempt-cap burn threshold.
+Wire unchanged (`v1.0.0` frozen; pairing off-wire). Built by parallel Codex
+workers (client ∥ mock → e2e join); Claude+Codex cross-review added a plan
+review and an impl review that hardened five weak e2e assertions → CLEAN.
 
 ## Track B — real MCP approval bridge (permission-prompt-tool → onApprovalRequest)
 Wires Claude Code's `--permission-prompt-tool` to the daemon's remote-approval seam

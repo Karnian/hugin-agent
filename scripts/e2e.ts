@@ -22,10 +22,12 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { LIMITS, PROTOCOL_VERSION, parseMessage } from "../protocol/v1/index";
 import { canonicalizeServerOrigin } from "../protocol/v1/origin";
 import { buildTranscript } from "../protocol/v1/transcript";
-import { deriveKeypairFromSeed, verifyTranscript } from "../protocol/v1/ed25519";
+import { b64u, deriveKeypairFromSeed, signTranscript, verifyTranscript } from "../protocol/v1/ed25519";
+import { buildPairingTranscript, keyFingerprint, REJECTED_TEST_PUBLIC_HEX, validateB64u32 } from "../protocol/v1/pairing";
 import { loadConfig } from "../src/config";
 import { connect } from "../src/auth/connect";
 import { readPairingConfig } from "../src/auth/config-file";
+import { parsePairingToken, type ParsedPairingToken } from "../src/auth/pairing-token";
 import { Daemon } from "../src/daemon";
 import { devSigner, performHandshake } from "../src/conn/handshake";
 import { keychainSeedStore, keychainSigner, memorySeedStore, newDeviceKey } from "../src/auth/keystore";
@@ -1052,53 +1054,568 @@ async function scenarioAD(): Promise<void> {
   check("AD2 keychain entry deleted after cleanup", (await store.get(keyId)) === null);
 }
 
-/** Track A pairing (auth-pairing-spec §3): the connect flow persists
- *  agent_id/key_id/tenant_id + serverUrl to the config file and the device seed
- *  to the (injected) store — and the PRIVATE key NEVER crosses the wire (only the
- *  public key is registered). In-memory seed store keeps it CI-safe. */
-async function scenarioAE(): Promise<void> {
-  const cfgDir = join(SCRATCH, "pairing");
-  rmSync(cfgDir, { recursive: true, force: true });
-  const cfgPath = join(cfgDir, "config.json");
-  const relayUrl = "ws://127.0.0.1:34567"; // canonical loopback origin the daemon would dial
+interface PairCompleteBody extends Record<string, unknown> {
+  secret: string;
+  public_key: string;
+  pop_signature: string;
+}
+
+interface PairStatusBody extends Record<string, unknown> {
+  poll_token: string;
+}
+
+function makeAdvancingNow(start = Date.now()): () => number {
+  let now = start;
+  return () => {
+    now += 25;
+    return now;
+  };
+}
+
+function testSeed(firstByte: number): Buffer {
+  return Buffer.from(Array.from({ length: 32 }, (_, i) => firstByte + i));
+}
+
+function requestJsonBodies(pairing: MockPairingServer): Array<Record<string, unknown>> {
+  const parsed: Array<Record<string, unknown>> = [];
+  for (const raw of pairing.requestBodies) {
+    try {
+      const value: unknown = JSON.parse(raw);
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        parsed.push(value as Record<string, unknown>);
+      }
+    } catch {
+      // Non-JSON request bodies are irrelevant to these pairing assertions.
+    }
+  }
+  return parsed;
+}
+
+function completeBodies(pairing: MockPairingServer): PairCompleteBody[] {
+  return requestJsonBodies(pairing).filter((body): body is PairCompleteBody =>
+    typeof body.secret === "string" &&
+    typeof body.public_key === "string" &&
+    typeof body.pop_signature === "string",
+  );
+}
+
+function statusBodies(pairing: MockPairingServer): PairStatusBody[] {
+  return requestJsonBodies(pairing).filter((body): body is PairStatusBody => typeof body.poll_token === "string");
+}
+
+function bodyString(body: unknown, field: string): string | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const value = (body as Record<string, unknown>)[field];
+  return typeof value === "string" ? value : null;
+}
+
+function pairingFailed(body: unknown): boolean {
+  return bodyString(body, "error") === "pairing_failed";
+}
+
+function tamperB64u(s: string): string {
+  return `${s[0] === "A" ? "B" : "A"}${s.slice(1)}`;
+}
+
+function nonCanonicalB64u32Alias(): string {
+  const alias = `${"A".repeat(42)}B`;
+  if (validateB64u32(alias)) throw new Error("test non-canonical base64url alias unexpectedly validated");
+  return alias;
+}
+
+function rewritePairingTokenOrigin(token: string, origin: string): string {
+  const payload = token.split(".")[1];
+  if (!payload) throw new Error("test token missing payload");
+  const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+  return `hpk1.${b64u(Buffer.from(JSON.stringify({ ...decoded, origin }), "utf8"))}`;
+}
+
+function rewritePairingTokenSecret(token: string, secret: string): string {
+  const payload = token.split(".")[1];
+  if (!payload) throw new Error("test token missing payload");
+  const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+  return `hpk1.${b64u(Buffer.from(JSON.stringify({ ...decoded, secret }), "utf8"))}`;
+}
+
+async function postPairComplete(
+  baseUrl: string,
+  token: ParsedPairingToken,
+  seed: Buffer,
+  opts: { tamperSignature?: boolean } = {},
+): Promise<{ status: number; body: unknown; publicKeyB64u: string; fingerprint: string }> {
+  if (!validateB64u32(token.secret)) throw new Error("test token secret is not canonical");
+  const { privateKey, publicRaw } = deriveKeypairFromSeed(seed);
+  const publicKeyB64u = b64u(publicRaw);
+  if (!validateB64u32(publicKeyB64u)) throw new Error("test public key is not canonical");
+  const transcript = buildPairingTranscript({
+    secret: token.secret,
+    publicRaw,
+    server_origin: token.origin,
+    protocol_version: PROTOCOL_VERSION,
+  });
+  let popSignature = signTranscript(privateKey, transcript);
+  if (opts.tamperSignature) popSignature = tamperB64u(popSignature);
+
+  const res = await fetch(`${baseUrl}/api/v1/hugin-agents/pair/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ secret: token.secret, public_key: publicKeyB64u, pop_signature: popSignature }),
+  });
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  return { status: res.status, body, publicKeyB64u, fingerprint: keyFingerprint(publicRaw) };
+}
+
+async function postRawPairComplete(baseUrl: string, body: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
+  const res = await fetch(`${baseUrl}/api/v1/hugin-agents/pair/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  let parsed: unknown = null;
+  try {
+    parsed = await res.json();
+  } catch {
+    parsed = null;
+  }
+  return { status: res.status, body: parsed };
+}
+
+async function postPairStatus(baseUrl: string, pollToken: string): Promise<{ status: number; body: unknown }> {
+  const res = await fetch(`${baseUrl}/api/v1/hugin-agents/pair/status`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ poll_token: pollToken }),
+  });
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  return { status: res.status, body };
+}
+
+async function scenarioAEHappyPath(cfgDir: string): Promise<void> {
+  const cfgPath = join(cfgDir, "ae1-config.json");
   const pairing = new MockPairingServer({
-    relayUrl, agentId: "agent-mint-01", keyId: "key-mint-01", tenantId: "acme", userId: "user-42", pendingPolls: 1,
+    tenantId: "acme",
+    createdByUserId: "user-42",
+    agentId: "agent-ae1",
+    keyId: "key-ae1",
+    confirmAfterStatusPolls: 1,
   });
   await pairing.start();
-  const store = memorySeedStore();
-  const res = await connect({
-    serverUrl: pairing.baseUrl(),
-    seedStore: store,
-    configPath: cfgPath,
-    sleepImpl: () => Promise.resolve(), // no real poll delay under test
-    onUserCode: () => {},
+  try {
+    const token = pairing.mint();
+    const parsed = parsePairingToken(token, Date.now());
+    const store = memorySeedStore();
+    let surfacedFingerprint = "";
+    const res = await connect({
+      token,
+      seedStore: store,
+      configPath: cfgPath,
+      sleepImpl: () => Promise.resolve(),
+      nowImpl: makeAdvancingNow(),
+      onFingerprint: (fp) => {
+        surfacedFingerprint = fp;
+      },
+    });
+
+    const cfg = readPairingConfig(cfgPath);
+    check(
+      "AE1 happy path persists ids, canonical serverUrl, and config file",
+      cfg?.agentId === "agent-ae1" &&
+        cfg?.keyId === "key-ae1" &&
+        cfg?.tenantId === "acme" &&
+        cfg?.serverUrl === parsed.origin &&
+        res.agentId === "agent-ae1" &&
+        res.keyId === "key-ae1" &&
+        res.tenantId === "acme" &&
+        res.serverUrl === parsed.origin &&
+        res.configPath === cfgPath,
+    );
+
+    const seed = await store.get("key-ae1");
+    const publicRaw = seed ? deriveKeypairFromSeed(seed).publicRaw : Buffer.alloc(0);
+    const publicKeyB64u = seed ? b64u(publicRaw) : "NO_PUBLIC_KEY";
+    const complete = completeBodies(pairing);
+    const seedEncodings = seed
+      ? [b64u(seed), seed.toString("base64"), seed.toString("hex"), seed.toString("hex").toUpperCase(), JSON.stringify(Array.from(seed))]
+      : [];
+    const seedLeaked = pairing.requestBodies.some((body) => seedEncodings.some((encoding) => body.includes(encoding)));
+    const publicSent = complete.some((body) => body.public_key === publicKeyB64u);
+    const popSent = complete.some((body) => body.public_key === publicKeyB64u && /^[A-Za-z0-9_-]{86}$/.test(body.pop_signature));
+    check(
+      "AE2 seed off-wire: public key + PoP sent, seed absent under common encodings, one key registered",
+      seed?.length === 32 &&
+        !seedLeaked &&
+        publicSent &&
+        popSent &&
+        pairing.registeredPublicKeys.length === 1 &&
+        pairing.registeredPublicKeys[0] === publicKeyB64u,
+    );
+
+    const replay = seed ? await postPairComplete(pairing.baseUrl(), parsed, seed) : null;
+    check(
+      "AE3 fingerprint match: onFingerprint == keyFingerprint(pub) == server returned fingerprint",
+      seed !== null &&
+        replay?.status === 202 &&
+        surfacedFingerprint === keyFingerprint(publicRaw) &&
+        bodyString(replay.body, "fingerprint") === replay.fingerprint,
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
+
+async function scenarioAEFingerprintMismatchFailClosed(cfgDir: string): Promise<void> {
+  const cfgPath = join(cfgDir, "ae3b-config.json");
+  const pairing = new MockPairingServer({
+    tenantId: "acme",
+    agentId: "agent-ae3b",
+    keyId: "key-ae3b",
+    forceWrongFingerprint: true,
   });
-  await pairing.stop();
+  await pairing.start();
+  try {
+    let rejected = false;
+    try {
+      await connect({
+        token: pairing.mint(),
+        seedStore: memorySeedStore(),
+        configPath: cfgPath,
+        sleepImpl: () => Promise.resolve(),
+        nowImpl: makeAdvancingNow(),
+      });
+    } catch {
+      rejected = true;
+    }
+    check(
+      "AE3b fingerprint mismatch rejects and does not persist config",
+      rejected &&
+        readPairingConfig(cfgPath) === null &&
+        completeBodies(pairing).length === 1 &&
+        statusBodies(pairing).length === 0,
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
 
-  const cfg = readPairingConfig(cfgPath);
-  check(
-    "AE1 pairing persists agent_id/key_id/tenant_id + serverUrl (config file)",
-    cfg?.agentId === "agent-mint-01" &&
-      cfg?.keyId === "key-mint-01" &&
-      cfg?.tenantId === "acme" &&
-      cfg?.serverUrl === relayUrl &&
-      res.serverUrl === relayUrl,
-  );
+async function scenarioAEOriginFailClosed(cfgDir: string): Promise<void> {
+  const pairing = new MockPairingServer();
+  await pairing.start();
+  try {
+    const token = pairing.mint();
+    const badToken = rewritePairingTokenOrigin(token, `ws://127.0.0.1:${pairing.port}/`);
+    let rejected = false;
+    try {
+      await connect({
+        token: badToken,
+        seedStore: memorySeedStore(),
+        configPath: join(cfgDir, "ae4-config.json"),
+        sleepImpl: () => Promise.resolve(),
+        nowImpl: makeAdvancingNow(),
+      });
+    } catch {
+      rejected = true;
+    }
+    check("AE4 origin fail-closed rejects non-canonical token origin before any POST", rejected && pairing.requestBodies.length === 0);
 
-  const seed = await store.get("key-mint-01");
-  const pubB64u = seed ? deriveKeypairFromSeed(seed).publicRaw.toString("base64url") : "NONE";
-  check(
-    "AE2 device seed stored under the minted key_id; its public key is the one registered",
-    seed?.length === 32 && pairing.registeredPublicKeys.length === 1 && pairing.registeredPublicKeys[0] === pubB64u,
-  );
+    const nonCanonicalSecret = nonCanonicalB64u32Alias();
+    const badSecretToken = rewritePairingTokenSecret(token, nonCanonicalSecret);
+    let parseRejected = false;
+    let parseErrorMessage = "";
+    try {
+      parsePairingToken(badSecretToken, Date.now());
+    } catch (err) {
+      parseRejected = true;
+      parseErrorMessage = err instanceof Error ? err.message : String(err);
+    }
+    const beforeConnectBodies = pairing.requestBodies.length;
+    let connectRejected = false;
+    try {
+      await connect({
+        token: badSecretToken,
+        seedStore: memorySeedStore(),
+        configPath: join(cfgDir, "ae4-secret-config.json"),
+        sleepImpl: () => Promise.resolve(),
+        nowImpl: makeAdvancingNow(),
+      });
+    } catch {
+      connectRejected = true;
+    }
+    check(
+      "AE4 parser rejects non-canonical token secret before any POST",
+      parseRejected &&
+        parseErrorMessage === "invalid pairing token; re-copy the token" &&
+        !parseErrorMessage.includes(nonCanonicalSecret) &&
+        connectRejected &&
+        pairing.requestBodies.length === beforeConnectBodies,
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
 
-  // The private key (seed) must NEVER appear in any request body — only the public key.
-  const seedB64u = seed ? seed.toString("base64url") : "SEED_ABSENT";
-  const leaked = pairing.requestBodies.some((b) => b.includes(seedB64u));
-  const publicSent = pairing.requestBodies.some((b) => b.includes(pubB64u));
-  check("AE3 private key never on the wire (public key sent; seed absent from every body)", !leaked && publicSent);
+async function scenarioAEServerDirectRefusals(): Promise<void> {
+  const pairing = new MockPairingServer({ attemptCap: 5 });
+  await pairing.start();
+  try {
+    const token = parsePairingToken(pairing.mint(), Date.now());
+    const rejectedSeed = testSeed(0x01);
+    const rejectedPubMatches = deriveKeypairFromSeed(rejectedSeed).publicRaw.toString("hex") === REJECTED_TEST_PUBLIC_HEX;
+    const rejectedTestKey = await postPairComplete(pairing.baseUrl(), token, rejectedSeed);
+    const badPop = await postPairComplete(pairing.baseUrl(), token, testSeed(0x21), { tamperSignature: true });
+    check(
+      "AE5 test-key and bad PoP completions return generic pairing_failed",
+      rejectedPubMatches &&
+        rejectedTestKey.status === 400 &&
+        pairingFailed(rejectedTestKey.body) &&
+        badPop.status === 400 &&
+        pairingFailed(badPop.body),
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
 
+async function scenarioAEPendingThenActive(cfgDir: string): Promise<void> {
+  const pendingPolls = 2;
+  const pairing = new MockPairingServer({
+    tenantId: "acme",
+    agentId: "agent-ae6",
+    keyId: "key-ae6",
+    confirmAfterStatusPolls: pendingPolls,
+  });
+  await pairing.start();
+  try {
+    const res = await connect({
+      token: pairing.mint(),
+      seedStore: memorySeedStore(),
+      configPath: join(cfgDir, "ae6-config.json"),
+      sleepImpl: () => Promise.resolve(),
+      nowImpl: makeAdvancingNow(),
+    });
+    check(
+      "AE6 client observes pending status responses before active",
+      res.agentId === "agent-ae6" &&
+        statusBodies(pairing).length >= pendingPolls + 1 &&
+        completeBodies(pairing).length === 1,
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
+
+async function scenarioAEIdempotentRecomplete(cfgDir: string): Promise<void> {
+  const pendingRecovery = new MockPairingServer({
+    tenantId: "acme",
+    agentId: "agent-ae7-pending",
+    keyId: "key-ae7-pending",
+    confirmAfterStatusPolls: 1,
+    forceValidStatus404s: 1,
+  });
+  await pendingRecovery.start();
+  try {
+    const res = await connect({
+      token: pendingRecovery.mint(),
+      seedStore: memorySeedStore(),
+      configPath: join(cfgDir, "ae7-pending-config.json"),
+      sleepImpl: () => Promise.resolve(),
+      nowImpl: makeAdvancingNow(),
+    });
+    const complete = completeBodies(pendingRecovery);
+    check(
+      "AE7 idempotent re-complete recovers from first poll_token 404 while pending",
+      res.agentId === "agent-ae7-pending" &&
+        complete.length === 2 &&
+        new Set(complete.map((body) => body.public_key)).size === 1 &&
+        statusBodies(pendingRecovery).length >= 3,
+    );
+  } finally {
+    await pendingRecovery.stop();
+  }
+
+  const repeated404 = new MockPairingServer({
+    tenantId: "acme",
+    agentId: "agent-ae7-repeated-404",
+    keyId: "key-ae7-repeated-404",
+    confirmAfterStatusPolls: 1,
+    forceValidStatus404s: 2,
+  });
+  await repeated404.start();
+  try {
+    let rejected = false;
+    const cfgPath = join(cfgDir, "ae7-repeated-404-config.json");
+    try {
+      await connect({
+        token: repeated404.mint(),
+        seedStore: memorySeedStore(),
+        configPath: cfgPath,
+        sleepImpl: () => Promise.resolve(),
+        nowImpl: makeAdvancingNow(),
+      });
+    } catch {
+      rejected = true;
+    }
+    const complete = completeBodies(repeated404);
+    check(
+      "AE7 second poll_token 404 fails after exactly one re-complete",
+      rejected &&
+        readPairingConfig(cfgPath) === null &&
+        complete.length === 2 &&
+        new Set(complete.map((body) => body.public_key)).size === 1 &&
+        statusBodies(repeated404).length === 2,
+    );
+  } finally {
+    await repeated404.stop();
+  }
+
+  const activeRecovery = new MockPairingServer({
+    tenantId: "acme",
+    agentId: "agent-ae7-active",
+    keyId: "key-ae7-active",
+    confirmAfterStatusPolls: 0,
+    forceValidStatus404s: 1,
+  });
+  await activeRecovery.start();
+  try {
+    const res = await connect({
+      token: activeRecovery.mint(),
+      seedStore: memorySeedStore(),
+      configPath: join(cfgDir, "ae7-active-config.json"),
+      sleepImpl: () => Promise.resolve(),
+      nowImpl: makeAdvancingNow(),
+    });
+    const complete = completeBodies(activeRecovery);
+    check(
+      "AE7 post-active same-key re-complete recovers ids after first poll_token 404",
+      res.agentId === "agent-ae7-active" &&
+        complete.length === 2 &&
+        new Set(complete.map((body) => body.public_key)).size === 1 &&
+        statusBodies(activeRecovery).length >= 2,
+    );
+  } finally {
+    await activeRecovery.stop();
+  }
+}
+
+async function scenarioAEWinnerBinding(): Promise<void> {
+  const pairing = new MockPairingServer({
+    tenantId: "acme",
+    agentId: "agent-ae8",
+    keyId: "key-ae8",
+  });
+  await pairing.start();
+  try {
+    const token = parsePairingToken(pairing.mint(), Date.now());
+    const winner = await postPairComplete(pairing.baseUrl(), token, testSeed(0x21));
+    const pollToken = bodyString(winner.body, "poll_token") ?? "";
+    const winnerFingerprint = bodyString(winner.body, "fingerprint");
+    const loser = await postPairComplete(pairing.baseUrl(), token, testSeed(0x41));
+    const winnerAgain = await postPairComplete(pairing.baseUrl(), token, testSeed(0x21));
+    const confirmed = pairing.confirm();
+    const status = await postPairStatus(pairing.baseUrl(), pollToken);
+    check(
+      "AE8 pending winner-binding rejects a different key and leaves winning ids unaffected",
+      winner.status === 202 &&
+        winnerFingerprint === winner.fingerprint &&
+        loser.publicKeyB64u !== winner.publicKeyB64u &&
+        loser.status === 400 &&
+        pairingFailed(loser.body) &&
+        winnerAgain.status === 202 &&
+        winnerAgain.publicKeyB64u === winner.publicKeyB64u &&
+        bodyString(winnerAgain.body, "fingerprint") === winnerFingerprint &&
+        pairing.registeredPublicKeys.length === 1 &&
+        pairing.registeredPublicKeys[0] === winner.publicKeyB64u &&
+        confirmed?.agent_id === "agent-ae8" &&
+        confirmed.key_id === "key-ae8" &&
+        status.status === 200 &&
+        bodyString(status.body, "status") === "active" &&
+        bodyString(status.body, "agent_id") === "agent-ae8" &&
+        bodyString(status.body, "key_id") === "key-ae8",
+    );
+  } finally {
+    await pairing.stop();
+  }
+}
+
+async function scenarioAEAttemptCapBurn(): Promise<void> {
+  const attemptCap = 3;
+  const earlyGuard = new MockPairingServer({ attemptCap });
+  await earlyGuard.start();
+  try {
+    const token = parsePairingToken(earlyGuard.mint(), Date.now());
+    const gateFailure = await postRawPairComplete(earlyGuard.baseUrl(), {
+      secret: nonCanonicalB64u32Alias(),
+      public_key: "A".repeat(43),
+      pop_signature: "A".repeat(86),
+    });
+    const invalidsBeforeCap: Array<{ status: number; body: unknown }> = [];
+    for (let i = 0; i < attemptCap - 1; i++) {
+      invalidsBeforeCap.push(await postPairComplete(earlyGuard.baseUrl(), token, testSeed(0x21), { tamperSignature: true }));
+    }
+    const validBeforeBurn = await postPairComplete(earlyGuard.baseUrl(), token, testSeed(0x21));
+    check(
+      "AE9 gate failures do not count and cap-minus-one bad PoPs still allow valid completion",
+      gateFailure.status === 400 &&
+        pairingFailed(gateFailure.body) &&
+        invalidsBeforeCap.every((res) => res.status === 400 && pairingFailed(res.body)) &&
+        validBeforeBurn.status === 202 &&
+        bodyString(validBeforeBurn.body, "status") === "pending" &&
+        earlyGuard.registeredPublicKeys.length === 1 &&
+        earlyGuard.registeredPublicKeys[0] === validBeforeBurn.publicKeyB64u,
+    );
+  } finally {
+    await earlyGuard.stop();
+  }
+
+  const burnGuard = new MockPairingServer({ attemptCap });
+  await burnGuard.start();
+  try {
+    const token = parsePairingToken(burnGuard.mint(), Date.now());
+    const invalidsAtCap: Array<{ status: number; body: unknown }> = [];
+    for (let i = 0; i < attemptCap; i++) {
+      invalidsAtCap.push(await postPairComplete(burnGuard.baseUrl(), token, testSeed(0x21), { tamperSignature: true }));
+    }
+    const validAfterBurn = await postPairComplete(burnGuard.baseUrl(), token, testSeed(0x21));
+    check(
+      "AE9 attempt-cap burn rejects subsequent valid completion only at threshold",
+      invalidsAtCap.every((res) => res.status === 400 && pairingFailed(res.body)) &&
+        validAfterBurn.status === 400 &&
+        pairingFailed(validAfterBurn.body) &&
+        burnGuard.registeredPublicKeys.length === 0,
+    );
+  } finally {
+    await burnGuard.stop();
+  }
+}
+
+/** Track A rev2 pairing (auth-pairing-spec §3/§5c): drive the real client
+ *  against the real mock pairing server, keeping the daemon seed off-wire and
+ *  covering completion, fingerprint, status, re-complete, winner, and burn paths. */
+async function scenarioAE(): Promise<void> {
+  const cfgDir = join(SCRATCH, "pairing-rev2");
   rmSync(cfgDir, { recursive: true, force: true });
+  mkdirSync(cfgDir, { recursive: true });
+  try {
+    await scenarioAEHappyPath(cfgDir);
+    await scenarioAEFingerprintMismatchFailClosed(cfgDir);
+    await scenarioAEOriginFailClosed(cfgDir);
+    await scenarioAEServerDirectRefusals();
+    await scenarioAEPendingThenActive(cfgDir);
+    await scenarioAEIdempotentRecomplete(cfgDir);
+    await scenarioAEWinnerBinding();
+    await scenarioAEAttemptCapBurn();
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
 }
 
 /** Track A robustness (Codex re-review): a duplicate `hello` on an ALREADY-
@@ -1396,7 +1913,7 @@ async function main(): Promise<void> {
   scenarioAC();
   console.log("\n[scenario AD: Track A OS-keychain round-trip (guarded)]");
   await scenarioAD();
-  console.log("\n[scenario AE: Track A device pairing — persist config + seed off-wire]");
+  console.log("\n[scenario AE: Track A rev2 device pairing — AE1–AE9]");
   await scenarioAE();
   console.log("\n[scenario AF: Track A duplicate post-auth hello ignored]");
   await scenarioAF();
