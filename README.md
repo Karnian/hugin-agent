@@ -1,5 +1,7 @@
 # Hugin Agent
 
+**English** | [한국어](README.ko.md)
+
 > Outbound-only local bridge daemon that runs your headless **Claude Code / Codex CLI**
 > on behalf of a cloud orchestrator — without opening any inbound ports.
 
