@@ -30,7 +30,7 @@ import { connect, connectSimple } from "../src/auth/connect";
 import { readPairingConfig } from "../src/auth/config-file";
 import { parsePairingToken, type ParsedPairingToken } from "../src/auth/pairing-token";
 import { canonicalizeDevOrigin } from "../src/simple-pairing-dev";
-import { Daemon } from "../src/daemon";
+import { Daemon, relayDialUrl } from "../src/daemon";
 import { devSigner, performHandshake } from "../src/conn/handshake";
 import { keychainSeedStore, keychainSigner, memorySeedStore, newDeviceKey, type SeedStore } from "../src/auth/keystore";
 import { decodeInbound } from "../src/conn/framing";
@@ -2050,6 +2050,27 @@ function scenarioAMCanonicalizeDevOrigin(): void {
   check("AM1 canonicalizeDevOrigin accepts ws/wss dev origins including raw IPs", accepted.every((origin) => canonicalizeDevOrigin(origin) === origin));
   check("AM2 canonicalizeDevOrigin rejects path/userinfo/query/fragment/port0/non-canonical/bad IPv4", rejected.every((origin) => canonicalizeDevOrigin(origin) === null));
   check("AM3 frozen canonicalizeServerOrigin still rejects non-loopback raw ws IP", canonicalizeServerOrigin("ws://100.120.25.112:5173") === null);
+
+  // relayDialUrl: the WS dial gains the C2 agent-connect PATH, but the transcript
+  // server_origin (canonicalize of the same serverUrl) stays PATH-LESS. The mock
+  // relay accepts an upgrade on any path, so only a pure assertion can guard this
+  // split — a wrong path is exactly the 403-then-reconnect bug this fixes.
+  check(
+    "AM7 relayDialUrl appends the C2 agent-connect path to a bare origin",
+    relayDialUrl("ws://100.120.25.112:8004") === "ws://100.120.25.112:8004/api/v1/hugin-agents/connect",
+  );
+  check(
+    "AM8 relayDialUrl joins cleanly over a trailing slash and preserves wss",
+    relayDialUrl("wss://relay.example.com/") === "wss://relay.example.com/api/v1/hugin-agents/connect",
+  );
+  check(
+    "AM9 relayDialUrl strips stray query/hash before dialing",
+    relayDialUrl("ws://127.0.0.1:8787/?x=1#frag") === "ws://127.0.0.1:8787/api/v1/hugin-agents/connect",
+  );
+  check(
+    "AM10 dial gains a path but the transcript server_origin stays path-less",
+    canonicalizeDevOrigin("ws://100.120.25.112:8004") === "ws://100.120.25.112:8004",
+  );
 }
 
 async function scenarioAMHandshakeDevOrigin(): Promise<void> {

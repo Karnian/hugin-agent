@@ -18,6 +18,24 @@ import { JobRegistry } from "./jobs/registry";
 import { JobManager } from "./jobs/manager";
 import { log } from "./log";
 
+/** WS path the C2 serves the agent connection at — the sibling of the pairing
+ *  HTTP endpoints (`/api/v1/hugin-agents/pair/complete`, `.../capability`). The
+ *  frozen `server_origin` bound into the handshake transcript stays PATH-LESS
+ *  (the bare `config.serverUrl` origin); this path is appended only at DIAL time.
+ *  The mock relay accepts an upgrade on any path, so e2e never exercised it. */
+export const RELAY_CONNECT_PATH = "/api/v1/hugin-agents/connect";
+
+/** Build the WS dial URL by placing `RELAY_CONNECT_PATH` on the canonical relay
+ *  origin. Uses the URL API so a `serverUrl` with a trailing slash still joins
+ *  cleanly, and drops any stray query/hash. */
+export function relayDialUrl(serverUrl: string): string {
+  const u = new URL(serverUrl);
+  u.pathname = RELAY_CONNECT_PATH;
+  u.search = "";
+  u.hash = "";
+  return u.toString();
+}
+
 export class Daemon {
   private running = false;
   private lastEpoch = -1;
@@ -109,7 +127,12 @@ export class Daemon {
       client.onClose(() => resolve());
     });
     try {
-      await client.connect(this.config.serverUrl);
+      // Log the resolved dial URL (origin + connect path) so a path/upgrade
+      // rejection is diagnosable — a bare `403` on the raw origin was exactly the
+      // failure this surfaced. The transcript server_origin stays the bare origin.
+      const dialUrl = relayDialUrl(this.config.serverUrl);
+      log.info("dialing relay", { url: dialUrl });
+      await client.connect(dialUrl);
       // Report our durable state so the server can issue resume directives.
       const resumeState: ResumeState = {
         activeJobs: this.store.activeJobsForResume() as ResumeState["activeJobs"],
