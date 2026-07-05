@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { closeSync, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import type { MessageV2 } from "../../protocol/v1/index";
 
 type SessionListRequestMsg = Extract<MessageV2, { type: "session.list.request" }>;
@@ -181,7 +181,7 @@ export class SessionEnumerator {
 
     const updatedAt = new Date(file.mtimeMs).toISOString();
     const createdAt = isoFromUnknown(head[0]?.timestamp) ?? updatedAt;
-    const title = findClaudeTitle(head) ?? "Claude session";
+    const title = findClaudeTitle(head) ?? genericSessionTitle("claude", scoped.redacted, scoped.abs);
     const handle = this.handleFor({
       engine: "claude",
       session_id: sessionId,
@@ -228,7 +228,7 @@ export class SessionEnumerator {
     const updatedAt = new Date(file.mtimeMs).toISOString();
     const createdAt = isoFromUnknown(payload.timestamp) ?? updatedAt;
     const cliVersion = stringField(payload, "cli_version");
-    const title = findCodexTitle(head.slice(1)) ?? "Codex session";
+    const title = genericSessionTitle("codex", scoped.redacted, scoped.abs);
     const handle = this.handleFor({
       engine: "codex",
       session_id: sessionId,
@@ -370,46 +370,6 @@ function findClaudeTitle(head: readonly Record<string, unknown>[]): string | nul
       if (label) return label;
     }
   }
-  for (const rec of head) {
-    const userText = extractUserText(rec);
-    const label = cleanLabel(userText);
-    if (label) return label;
-  }
-  return null;
-}
-
-function findCodexTitle(records: readonly Record<string, unknown>[]): string | null {
-  for (const rec of records) {
-    const raw = extractUserText(rec);
-    const stripped = raw ? stripInjectedPreamble(raw) : null;
-    const label = cleanLabel(stripped);
-    if (label) return label;
-  }
-  return null;
-}
-
-function extractUserText(rec: Record<string, unknown>): string | null {
-  if (rec.role === "user" || rec.type === "user") {
-    return contentToText(rec.content) ?? contentToText(rec.message) ?? contentToText(rec.text) ?? contentToText(rec.input);
-  }
-
-  const message = objectField(rec, "message");
-  if (message?.role === "user") return contentToText(message.content) ?? contentToText(message.text);
-
-  const payload = objectField(rec, "payload");
-  if (payload) {
-    if (payload.role === "user" || (typeof payload.type === "string" && payload.type.includes("user"))) {
-      return (
-        contentToText(payload.message) ??
-        contentToText(payload.content) ??
-        contentToText(payload.text) ??
-        contentToText(payload.input)
-      );
-    }
-    const payloadMessage = objectField(payload, "message");
-    if (payloadMessage?.role === "user") return contentToText(payloadMessage.content) ?? contentToText(payloadMessage.text);
-  }
-
   return null;
 }
 
@@ -435,29 +395,16 @@ function contentToText(value: unknown): string | null {
   return null;
 }
 
-function stripInjectedPreamble(text: string): string {
-  let s = text.trimStart();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const tag of ["permissions instructions", "environment_context"]) {
-      const open = `<${tag}>`;
-      const close = `</${tag}>`;
-      if (!s.startsWith(open)) continue;
-      const end = s.indexOf(close);
-      if (end === -1) return "";
-      s = s.slice(end + close.length).trimStart();
-      changed = true;
-    }
-  }
-  return s;
-}
-
 function cleanLabel(value: string | null | undefined): string | null {
   const label = value?.replace(/\s+/g, " ").trim();
   if (!label) return null;
   if (label.length <= TITLE_MAX) return label;
   return `${label.slice(0, TITLE_MAX - 3).trimEnd()}...`;
+}
+
+function genericSessionTitle(engine: "claude" | "codex", redactedCwd: string, absCwd: string): string {
+  const cwdBase = basename(redactedCwd === "." ? absCwd : redactedCwd) || ".";
+  return cleanLabel(`${engine} · ${cwdBase}`) ?? `${engine} session`;
 }
 
 function cwdMatchesPrefix(cwd: string, prefix: string): boolean {

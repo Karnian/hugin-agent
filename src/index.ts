@@ -5,6 +5,7 @@
  *   HUGIND_KEY_ID       dev-key
  *   HUGIND_TENANT_ID    dev-tenant
  *   HUGIND_AGENT_VERSION 0.0.0
+ *   HUGIND_PROTOCOL_VERSION 1.0.0 (set 2.0.0 only with a v2-capable relay)
  *   HUGIND_PROJECT_ROOTS comma-separated absolute paths
  *   HUGIND_STATE_DIR    .hugind
  *   HUGIND_ENGINE_CMD   (test override)
@@ -12,6 +13,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { type Config, loadConfig } from "./config";
 import { Daemon } from "./daemon";
 import type { Signer } from "./conn/handshake";
@@ -20,32 +22,38 @@ import { readPairingConfig } from "./auth/config-file";
 import { configFilePath } from "./auth/paths";
 import { ClaudeEngine } from "./engine/claude";
 import { buildIsolation, selfCheckGate, selfCheckLogin } from "./engine/isolate";
+import { detectEngineCapabilities } from "./engine/detect";
 import { log } from "./log";
 import { simplePairingGateEnabled } from "./simple-pairing-dev";
 import { SessionEnumerator } from "./sessions/enumerator";
 import { ClaudeResumeRunner, CodexResumeRunner } from "./sessions/resume";
 
-function loadConfigOrExit(): Config {
+export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
   const roots =
-    process.env.HUGIND_PROJECT_ROOTS?.split(",")
+    env.HUGIND_PROJECT_ROOTS?.split(",")
       .map((s) => s.trim())
       .filter(Boolean) ?? [];
+  // Persisted pairing identity (`hugin-agent connect`) is the baseline; each
+  // HUGIND_* env var overrides its field (tests / custom installs). A malformed
+  // config file throws here → fail closed rather than run half-paired.
+  const paired = readPairingConfig(configFilePath());
+  return loadConfig({
+    serverUrl: env.HUGIND_SERVER_URL ?? paired?.serverUrl,
+    agentId: env.HUGIND_AGENT_ID ?? paired?.agentId,
+    keyId: env.HUGIND_KEY_ID ?? paired?.keyId,
+    tenantId: env.HUGIND_TENANT_ID ?? paired?.tenantId,
+    agentVersion: env.HUGIND_AGENT_VERSION,
+    protocolVersion: env.HUGIND_PROTOCOL_VERSION,
+    allowDevOrigin: simplePairingGateEnabled(env.HUGIN_SIMPLE_PAIRING),
+    projectRoots: roots,
+    stateDir: env.HUGIND_STATE_DIR,
+    engineCommand: env.HUGIND_ENGINE_CMD,
+  });
+}
+
+function loadConfigOrExit(): Config {
   try {
-    // Persisted pairing identity (`hugin-agent connect`) is the baseline; each
-    // HUGIND_* env var overrides its field (tests / custom installs). A malformed
-    // config file throws here → fail closed rather than run half-paired.
-    const paired = readPairingConfig(configFilePath());
-    return loadConfig({
-      serverUrl: process.env.HUGIND_SERVER_URL ?? paired?.serverUrl,
-      agentId: process.env.HUGIND_AGENT_ID ?? paired?.agentId,
-      keyId: process.env.HUGIND_KEY_ID ?? paired?.keyId,
-      tenantId: process.env.HUGIND_TENANT_ID ?? paired?.tenantId,
-      agentVersion: process.env.HUGIND_AGENT_VERSION,
-      allowDevOrigin: simplePairingGateEnabled(process.env.HUGIN_SIMPLE_PAIRING),
-      projectRoots: roots,
-      stateDir: process.env.HUGIND_STATE_DIR,
-      engineCommand: process.env.HUGIND_ENGINE_CMD,
-    });
+    return loadConfigFromEnv();
   } catch (e) {
     log.error("invalid config — pair with `hugin-agent connect`, or set HUGIND_SERVER_URL + HUGIND_AGENT_ID", {
       err: String(e),
@@ -56,6 +64,7 @@ function loadConfigOrExit(): Config {
 
 async function main(): Promise<void> {
   const config = loadConfigOrExit();
+  const engineCapabilities = await detectEngineCapabilities({ claudeCommand: config.engineCommand });
 
   // Permission isolation + startup login self-check (plan §5.6). If isolation
   // drops the login (macOS keychain hosts — see isolate.ts) and no env-auth was
@@ -117,10 +126,10 @@ async function main(): Promise<void> {
     allowlist: config.projectRoots,
   });
   const resumeRunners = {
-    claude: new ClaudeResumeRunner({ command: config.engineCommand }),
-    codex: new CodexResumeRunner(),
+    claude: new ClaudeResumeRunner({ command: config.engineCommand, env: engineEnv }),
+    codex: new CodexResumeRunner({ env: engineEnv }),
   };
-  const daemon = new Daemon(config, signer, engine, gateAvailable, sessionEnumerator, resumeRunners);
+  const daemon = new Daemon(config, signer, engine, gateAvailable, sessionEnumerator, resumeRunners, engineCapabilities);
   const shutdown = () => {
     log.info("signal received — shutting down");
     daemon.stop();
@@ -131,7 +140,9 @@ async function main(): Promise<void> {
   await daemon.start();
 }
 
-main().catch((e) => {
-  log.error("fatal", { err: String(e) });
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    log.error("fatal", { err: String(e) });
+    process.exit(1);
+  });
+}

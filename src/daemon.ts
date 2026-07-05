@@ -20,6 +20,7 @@ import { log } from "./log";
 import type { SessionEnumerator, SessionListResult } from "./sessions/enumerator";
 import { SessionResumeManager } from "./sessions/resume-manager";
 import type { ResumeRunner, ResumeRunnerRegistry } from "./sessions/resume";
+import type { EngineCapabilities } from "./engine/detect";
 
 /** WS path the C2 serves the agent connection at — the sibling of the pairing
  *  HTTP endpoints (`/api/v1/hugin-agents/pair/complete`, `.../capability`). The
@@ -61,6 +62,7 @@ export class Daemon {
     gateAvailable = true,
     private readonly sessionEnumerator?: Pick<SessionEnumerator, "list" | "validateHandle" | "registerForked">,
     resumeRunners?: ResumeRunner | ResumeRunnerRegistry,
+    private readonly engineCapabilities: EngineCapabilities = { claude: { installed: false }, codex: { installed: false } },
   ) {
     this.store = new EventLog(config.dbPath ?? join(config.stateDir, "eventlog.db"));
     // Registry + manager are DAEMON-level so live runs (and their lease/approval
@@ -158,7 +160,9 @@ export class Daemon {
           last_emitted_seq: r.last_emitted_seq,
         })) as ResumeState["pendingResults"],
       };
-      const hs = await performHandshake(client, this.config, this.signer, resumeState);
+      const hs = await performHandshake(client, this.config, this.signer, resumeState, {
+        engines: this.engineCapabilities,
+      });
       if (!this.acceptEpoch(hs.connectionEpoch)) {
         log.warn("non-monotonic connection_epoch — closing", {
           epoch: hs.connectionEpoch,
@@ -252,6 +256,7 @@ export class Daemon {
         stopHeartbeat();
       }
     } finally {
+      this.resumeManager.cancelActiveTurns();
       client.close();
       if (this.activeClient === client) this.activeClient = null;
       if (this.sessionClient === client) this.sessionClient = null;
