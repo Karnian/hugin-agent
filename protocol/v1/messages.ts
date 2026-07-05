@@ -60,6 +60,7 @@
 import { z } from "zod";
 
 export const PROTOCOL_VERSION = "1.0.0" as const;
+export const PROTOCOL_VERSION_V2 = "2.0.0" as const;
 
 // ---------------------------------------------------------------------------
 // Operational limits (part of the contract — both sides enforce these)
@@ -560,11 +561,137 @@ export const ErrorMsg = z.strictObject({
   lease_id: LeaseId.optional(),
 });
 
+// ---- v2 session metadata ---------------------------------------------------
+
+export const SessionInfo = z.strictObject({
+  handle: Id,
+  engine: Engine,
+  cwd: z.string(),
+  git_branch: z.string().nullable(),
+  cli_version: z.string().nullable(),
+  title: z.string(),
+  created_at: Iso,
+  updated_at: Iso,
+  active: z.boolean(),
+  msg_count: PosInt,
+});
+
+const SessionListFilter = z.strictObject({
+  engine: Engine.optional(),
+  cwd_prefix: z.string().optional(),
+  active_only: z.boolean().optional(),
+  updated_after: Iso.optional(),
+});
+
+const SessionListPage = z.strictObject({
+  cursor: z.string().optional(),
+  limit: PosInt,
+});
+
+export const SessionListRequest = z.strictObject({
+  ...base,
+  type: z.literal("session.list.request"),
+  request_id: Id,
+  filter: SessionListFilter.optional(),
+  page: SessionListPage.optional(),
+});
+
+export const SessionListResponse = z.strictObject({
+  ...base,
+  type: z.literal("session.list.response"),
+  request_id: Id,
+  sessions: z.array(SessionInfo).max(ARRAY_MAX),
+  next_cursor: z.string().nullable().optional(),
+  truncated: z.boolean(),
+});
+
+const SessionResumeOptions = z.strictObject({
+  fork: z.boolean().optional(),
+  sandbox: z.enum(["read_only", "workspace_write", "full"]).optional(),
+  model: z.string().optional(),
+});
+
+export const SessionResumeRequest = z.strictObject({
+  ...base,
+  type: z.literal("session.resume.request"),
+  request_id: Id,
+  handle: Id,
+  message: z.string(),
+  options: SessionResumeOptions.optional(),
+});
+
+export const SessionCancel = z.strictObject({
+  ...base,
+  type: z.literal("session.cancel"),
+  turn_id: Id,
+});
+
+export const SessionAck = z.strictObject({
+  ...base,
+  type: z.literal("session.ack"),
+  turn_id: Id,
+  ack_seq: PosInt,
+});
+
+export const SessionMessage = z.strictObject({
+  ...base,
+  type: z.literal("session.message"),
+  request_id: Id,
+  handle: Id,
+  message: z.string(),
+});
+
+export const SessionResumeAccept = z.strictObject({
+  ...base,
+  type: z.literal("session.resume.accept"),
+  request_id: Id,
+  turn_id: Id,
+  effective_options: z.strictObject({
+    fork: z.boolean(),
+    sandbox: z.string(),
+    mutates_source: z.boolean().optional(),
+  }).optional(),
+});
+
+export const SessionResumeReject = z.strictObject({
+  ...base,
+  type: z.literal("session.resume.reject"),
+  request_id: Id,
+  code: z.string(),
+  message: z.string(),
+});
+
+export const SessionEvent = z.strictObject({
+  ...base,
+  type: z.literal("session.event"),
+  turn_id: Id,
+  seq: PosInt,
+  event: z.object({ kind: EventKind }).catchall(z.unknown()),
+});
+
+export const SessionTurnResult = z.strictObject({
+  ...base,
+  type: z.literal("session.turn.result"),
+  turn_id: Id,
+  status: z.enum(["ok", "error", "cancelled"]),
+  final_message: z.string(),
+  new_session_handle: Id.nullable().optional(),
+});
+
+export const SessionError = z.strictObject({
+  ...base,
+  type: z.literal("session.error"),
+  request_id: Id.optional(),
+  turn_id: Id.optional(),
+  code: z.string(),
+  message: z.string(),
+});
+
 // ---------------------------------------------------------------------------
 // Discriminated union + helpers
 // ---------------------------------------------------------------------------
 
-export const Message = z.discriminatedUnion("type", [
+export const V1_VARIANTS = [
   AuthChallenge,
   Hello,
   HelloAccepted,
@@ -588,10 +715,57 @@ export const Message = z.discriminatedUnion("type", [
   CapabilitiesUpdate,
   Nack,
   ErrorMsg,
-]);
+] as const;
+
+export const Message = z.discriminatedUnion("type", V1_VARIANTS);
 
 export type Message = z.infer<typeof Message>;
 export type MessageType = Message["type"];
+type SessionListRequestMsg = z.infer<typeof SessionListRequest>;
+type SessionListResponseMsg = z.infer<typeof SessionListResponse>;
+type SessionResumeRequestMsg = z.infer<typeof SessionResumeRequest>;
+type SessionCancelMsg = z.infer<typeof SessionCancel>;
+type SessionAckMsg = z.infer<typeof SessionAck>;
+type SessionMessageMsg = z.infer<typeof SessionMessage>;
+type SessionResumeAcceptMsg = z.infer<typeof SessionResumeAccept>;
+type SessionResumeRejectMsg = z.infer<typeof SessionResumeReject>;
+type SessionEventMsg = z.infer<typeof SessionEvent>;
+type SessionTurnResultMsg = z.infer<typeof SessionTurnResult>;
+type SessionErrorMsg = z.infer<typeof SessionError>;
+
+export const V2_VARIANTS = [
+  ...V1_VARIANTS,
+  SessionListRequest,
+  SessionListResponse,
+  SessionResumeRequest,
+  SessionCancel,
+  SessionAck,
+  SessionMessage,
+  SessionResumeAccept,
+  SessionResumeReject,
+  SessionEvent,
+  SessionTurnResult,
+  SessionError,
+] as const;
+
+export const MessageV2: z.ZodType<
+  | Message
+  | SessionListRequestMsg
+  | SessionListResponseMsg
+  | SessionResumeRequestMsg
+  | SessionCancelMsg
+  | SessionAckMsg
+  | SessionMessageMsg
+  | SessionResumeAcceptMsg
+  | SessionResumeRejectMsg
+  | SessionEventMsg
+  | SessionTurnResultMsg
+  | SessionErrorMsg
+> =
+  z.discriminatedUnion("type", V2_VARIANTS);
+
+export type MessageV2 = z.infer<typeof MessageV2>;
+export type MessageV2Type = MessageV2["type"];
 
 /** a2s = agent→server, s2a = server→agent. */
 export const DIRECTION = {
@@ -618,7 +792,18 @@ export const DIRECTION = {
   "capabilities.update": "a2s",
   nack: "both",
   error: "both",
-} as const satisfies Record<MessageType, "a2s" | "s2a" | "both">;
+  "session.list.request": "s2a",
+  "session.list.response": "a2s",
+  "session.resume.request": "s2a",
+  "session.cancel": "s2a",
+  "session.ack": "s2a",
+  "session.message": "s2a",
+  "session.resume.accept": "a2s",
+  "session.resume.reject": "a2s",
+  "session.event": "a2s",
+  "session.turn.result": "a2s",
+  "session.error": "a2s",
+} as const satisfies Record<MessageV2Type, "a2s" | "s2a" | "both">;
 
 /** Messages permitted before the handshake completes (pre-auth phase). */
 export const HANDSHAKE_TYPES = new Set<MessageType>([
@@ -631,4 +816,8 @@ export function parseMessage(raw: unknown): Message {
 
 export function safeParseMessage(raw: unknown) {
   return Message.safeParse(raw);
+}
+
+export function safeParseMessageV2(raw: unknown) {
+  return MessageV2.safeParse(raw);
 }

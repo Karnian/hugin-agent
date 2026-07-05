@@ -13,14 +13,14 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { LIMITS, PROTOCOL_VERSION, parseMessage } from "../protocol/v1/index";
+import { LIMITS, PROTOCOL_VERSION, PROTOCOL_VERSION_V2, parseMessage, type MessageV2 } from "../protocol/v1/index";
 import { canonicalizeServerOrigin } from "../protocol/v1/origin";
 import { buildTranscript } from "../protocol/v1/transcript";
 import { b64u, deriveKeypairFromSeed, signTranscript, verifyTranscript } from "../protocol/v1/ed25519";
@@ -44,6 +44,8 @@ import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
 import { validateWorkspace } from "../src/workspace/worktree";
+import { SessionEnumerator, type SessionInfo } from "../src/sessions/enumerator";
+import { FakeResumeRunner } from "../src/sessions/resume";
 import { MockRelay, verifyHello, type PairingRecord } from "../mock-relay/server";
 import { MockPairingServer } from "../mock-relay/pairing-server";
 
@@ -2196,6 +2198,1038 @@ async function scenarioAG(): Promise<void> {
   check("AG1 premature hello.accepted discarded — handshake used the post-hello accept", hs.connectionEpoch === 1);
 }
 
+type VersionHandshakeResult =
+  | { ok: true; negotiatedVersion: string }
+  | { ok: false; message: string };
+
+async function versionHandshake(opts: {
+  agentId: string;
+  protocolVersion?: string;
+  supportedVersions?: readonly string[];
+  forceNegotiatedVersion?: string;
+}): Promise<VersionHandshakeResult> {
+  const relay = new MockRelay({
+    ...(opts.supportedVersions === undefined ? {} : { supportedVersions: opts.supportedVersions }),
+    ...(opts.forceNegotiatedVersion === undefined ? {} : { forceNegotiatedVersion: opts.forceNegotiatedVersion }),
+  });
+  const port = await relay.start();
+  const serverUrl = `ws://127.0.0.1:${port}`;
+  const client = new RelayClient();
+  try {
+    await client.connect(serverUrl);
+    const hs = await performHandshake(
+      client,
+      loadConfig({
+        serverUrl,
+        agentId: opts.agentId,
+        dbPath: ":memory:",
+        ...(opts.protocolVersion === undefined ? {} : { protocolVersion: opts.protocolVersion }),
+      }),
+      devSigner(`key-${opts.agentId}`),
+      { activeJobs: [], pendingResults: [] },
+    );
+    return { ok: true, negotiatedVersion: hs.negotiatedVersion };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  } finally {
+    client.close();
+    await relay.stop();
+    await sleep(50);
+  }
+}
+
+/** Protocol-version negotiation scaffolding: the daemon can advertise v1 or v2,
+ *  and the relay cleanly rejects unsupported majors without authenticating. */
+async function scenarioAN(): Promise<void> {
+  const an1 = await versionHandshake({
+    agentId: "agent-an1",
+    supportedVersions: [PROTOCOL_VERSION],
+  });
+  check("AN1 default daemon + v1-only relay negotiates 1.0.0", an1.ok && an1.negotiatedVersion === PROTOCOL_VERSION);
+
+  const an2 = await versionHandshake({
+    agentId: "agent-an2",
+    protocolVersion: PROTOCOL_VERSION_V2,
+    supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+  });
+  check("AN2 v2 daemon + dual-support relay negotiates 2.0.0", an2.ok && an2.negotiatedVersion === PROTOCOL_VERSION_V2);
+
+  const an3 = await versionHandshake({
+    agentId: "agent-an3",
+    protocolVersion: PROTOCOL_VERSION_V2,
+    supportedVersions: [PROTOCOL_VERSION],
+  });
+  check("AN3 v2 daemon + v1-only relay fails with unsupported_version", !an3.ok && an3.message.includes("hello.rejected: unsupported_version"));
+
+  const an4 = await versionHandshake({ agentId: "agent-an4" });
+  check("AN4 default existing-style handshake still negotiates 1.0.0", an4.ok && an4.negotiatedVersion === PROTOCOL_VERSION);
+
+  const an5 = await versionHandshake({
+    agentId: "agent-an5",
+    forceNegotiatedVersion: "3.0.0",
+  });
+  check(
+    "AN5 daemon rejects a relay-forced unsupported negotiated_version",
+    !an5.ok && an5.message.includes('relay negotiated an unsupported version "3.0.0"'),
+  );
+}
+
+/** Phase 2a AO: default v2 session.list plumbing remains fail-closed; without
+ *  an injected enumerator the daemon returns an empty list on negotiated v2. */
+async function scenarioAO(): Promise<void> {
+  type SessionListResponse = Extract<MessageV2, { type: "session.list.response" }>;
+
+  const ao1 = { response: null as SessionListResponse | null };
+  const ao1Relay = new MockRelay({
+    supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+    sendSessionListAfterAccept: true,
+    onSessionListResponse: (m) => {
+      ao1.response = m;
+    },
+  });
+  const ao1Port = await ao1Relay.start();
+  const ao1Daemon = new Daemon(
+    loadConfig({
+      serverUrl: `ws://127.0.0.1:${ao1Port}`,
+      agentId: "agent-ao1",
+      dbPath: ":memory:",
+      protocolVersion: PROTOCOL_VERSION_V2,
+    }),
+    devSigner("key-ao1"),
+    new FakeEngine({ events: [] }),
+  );
+  try {
+    void ao1Daemon.start().catch(() => {});
+    await waitUntil(() => ao1.response !== null, 5000);
+  } finally {
+    ao1Daemon.stop();
+    await ao1Relay.stop();
+    await sleep(50);
+  }
+  const ao1Response = ao1.response;
+  check(
+    "AO1 v2 session.list.request returns the default empty response",
+    ao1Response?.request_id === "session-list-e2e" &&
+      Array.isArray(ao1Response.sessions) &&
+      ao1Response.sessions.length === 0 &&
+      ao1Response.next_cursor === null &&
+      ao1Response.truncated === false,
+  );
+
+  let ao2Accepted = 0;
+  const ao2 = { response: null as SessionListResponse | null };
+  const ao2Relay = new MockRelay({
+    supportedVersions: [PROTOCOL_VERSION],
+    sendSessionListAfterAccept: true,
+    onAccept: () => {
+      ao2Accepted++;
+    },
+    onSessionListResponse: (m) => {
+      ao2.response = m;
+    },
+  });
+  const ao2Port = await ao2Relay.start();
+  const ao2Daemon = new Daemon(
+    loadConfig({
+      serverUrl: `ws://127.0.0.1:${ao2Port}`,
+      agentId: "agent-ao2",
+      dbPath: ":memory:",
+    }),
+    devSigner("key-ao2"),
+    new FakeEngine({ events: [] }),
+  );
+  try {
+    void ao2Daemon.start().catch(() => {});
+    await waitUntil(() => ao2Accepted > 0, 5000);
+    await sleep(300);
+  } finally {
+    ao2Daemon.stop();
+    await ao2Relay.stop();
+    await sleep(50);
+  }
+  const ao2Frame = JSON.stringify({
+    id: "ao2-direct",
+    ts: "2026-07-01T00:00:00.000Z",
+    type: "session.list.request",
+    request_id: "session-list-e2e",
+  });
+  const ao2Decode = decodeInbound(ao2Frame, { receiver: "agent", authed: true });
+  check("AO2 v1 decoder rejects session.list.request as invalid_message", !ao2Decode.ok && ao2Decode.code === "invalid_message");
+  check("AO2 v1 daemon does not reply with session.list.response", ao2Accepted > 0 && ao2.response === null);
+}
+
+interface SessionFixtureStore {
+  base: string;
+  allowRoot: string;
+  claudeProjectsDir: string;
+  codexSessionsDir: string;
+  nowMs: number;
+}
+
+function writeJsonlFixture(path: string, records: readonly unknown[], mtimeMs: number): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${records.map((r) => JSON.stringify(r)).join("\n")}\n`);
+  const mtime = new Date(mtimeMs);
+  utimesSync(path, mtime, mtime);
+}
+
+function createSessionFixtureStore(): SessionFixtureStore {
+  const base = mkdtempSync(join(tmpdir(), "hugind-e2e-sessions-"));
+  const allowRoot = join(base, "allowed");
+  const outsideRoot = join(base, "outside");
+  const claudeCwd = join(allowRoot, "repo-claude");
+  const codexCwd = join(allowRoot, "repo-codex");
+  const outsideCwd = join(outsideRoot, "repo-outside");
+  const claudeProjectsDir = join(base, "claude", "projects");
+  const codexSessionsDir = join(base, "codex", "sessions");
+  const nowMs = Date.parse("2026-07-05T12:00:00.000Z");
+  mkdirSync(claudeCwd, { recursive: true });
+  mkdirSync(codexCwd, { recursive: true });
+  mkdirSync(outsideCwd, { recursive: true });
+
+  writeJsonlFixture(
+    join(claudeProjectsDir, "encoded-claude", "11111111-1111-4111-8111-111111111111.jsonl"),
+    [
+      { type: "system", timestamp: "2026-07-05T10:00:00.000Z", message: "init" },
+      { type: "system", timestamp: "2026-07-05T10:00:01.000Z", cwd: claudeCwd, gitBranch: "main", version: "1.2.3" },
+      { type: "ai-title", timestamp: "2026-07-05T10:00:02.000Z", title: "Claude fixture title\nwith extra spacing" },
+      { type: "user", timestamp: "2026-07-05T10:00:03.000Z", message: { role: "user", content: "SENSITIVE_PROMPT_CLAUDE" } },
+    ],
+    nowMs - 5 * 60 * 1000,
+  );
+
+  writeJsonlFixture(
+    join(codexSessionsDir, "2026", "07", "05", "rollout-2026-07-05T10-00-00-22222222-2222-4222-8222-222222222222.jsonl"),
+    [
+      {
+        type: "session_meta",
+        payload: {
+          id: "codex-fixture-session",
+          cwd: codexCwd,
+          cli_version: "0.4.5",
+          timestamp: "2026-07-05T09:30:00.000Z",
+          base_instructions: "BASE_INSTRUCTIONS_SECRET",
+        },
+      },
+      {
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "<permissions instructions>\nSENSITIVE_PERMISSIONS_SECRET\n</permissions instructions>\nCodex fixture title with a concise request",
+        },
+      },
+      { type: "event_msg", payload: { type: "assistant_message", message: "ASSISTANT_OUTPUT_SECRET" } },
+    ],
+    nowMs - 30 * 60 * 1000,
+  );
+
+  writeJsonlFixture(
+    join(claudeProjectsDir, "encoded-claude", "subagents", "33333333-3333-4333-8333-333333333333.jsonl"),
+    [
+      { type: "system", timestamp: "2026-07-05T10:05:00.000Z", cwd: claudeCwd, gitBranch: "nested", version: "9.9.9" },
+      { type: "ai-title", timestamp: "2026-07-05T10:05:01.000Z", title: "Nested should not appear" },
+    ],
+    nowMs - 2 * 60 * 1000,
+  );
+
+  writeJsonlFixture(
+    join(claudeProjectsDir, "encoded-outside", "44444444-4444-4444-8444-444444444444.jsonl"),
+    [
+      { type: "system", timestamp: "2026-07-05T10:10:00.000Z", cwd: outsideCwd, gitBranch: "outside", version: "8.8.8" },
+      { type: "ai-title", timestamp: "2026-07-05T10:10:01.000Z", title: "Outside should not appear" },
+    ],
+    nowMs - 1 * 60 * 1000,
+  );
+
+  return { base, allowRoot, claudeProjectsDir, codexSessionsDir, nowMs };
+}
+
+function fixtureEnumerator(fx: SessionFixtureStore, allowlist: readonly string[] = [fx.allowRoot]): SessionEnumerator {
+  return new SessionEnumerator({
+    claudeProjectsDir: fx.claudeProjectsDir,
+    codexSessionsDir: fx.codexSessionsDir,
+    allowlist,
+    now: () => fx.nowMs,
+  });
+}
+
+function byEngine(sessions: readonly SessionInfo[], engine: "claude" | "codex"): SessionInfo | null {
+  return sessions.find((s) => s.engine === engine) ?? null;
+}
+
+async function scenarioAP(): Promise<void> {
+  type SessionListResponse = Extract<MessageV2, { type: "session.list.response" }>;
+  const fx = createSessionFixtureStore();
+  try {
+    const enumerator = fixtureEnumerator(fx);
+    const listed = enumerator.list({});
+    const sessions = listed.sessions;
+    const claude = byEngine(sessions, "claude");
+    const codex = byEngine(sessions, "codex");
+
+    check(
+      "AP1 enumerator lists allowlisted claude + codex metadata",
+      sessions.length === 2 &&
+        claude?.cwd === "repo-claude" &&
+        claude.git_branch === "main" &&
+        claude.cli_version === "1.2.3" &&
+        claude.title === "Claude fixture title with extra spacing" &&
+        claude.created_at === "2026-07-05T10:00:00.000Z" &&
+        claude.msg_count === 4 &&
+        claude.active === true &&
+        codex?.cwd === "repo-codex" &&
+        codex.git_branch === null &&
+        codex.cli_version === "0.4.5" &&
+        codex.title === "Codex fixture title with a concise request" &&
+        codex.created_at === "2026-07-05T09:30:00.000Z" &&
+        codex.msg_count === 3 &&
+        codex.active === false,
+    );
+
+    const codexOnly = enumerator.list({ filter: { engine: "codex" } }).sessions;
+    const activeOnly = enumerator.list({ filter: { active_only: true } }).sessions;
+    const cwdPrefixed = enumerator.list({ filter: { cwd_prefix: "repo-claude" } }).sessions;
+    const recentlyUpdated = enumerator.list({ filter: { updated_after: new Date(fx.nowMs - 10 * 60 * 1000).toISOString() } }).sessions;
+    check(
+      "AP1 filters honor engine, cwd_prefix, active_only, and updated_after",
+      codexOnly.length === 1 &&
+        codexOnly[0]?.engine === "codex" &&
+        activeOnly.length === 1 &&
+        activeOnly[0]?.engine === "claude" &&
+        cwdPrefixed.length === 1 &&
+        cwdPrefixed[0]?.engine === "claude" &&
+        recentlyUpdated.length === 1 &&
+        recentlyUpdated[0]?.engine === "claude",
+    );
+
+    const serialized = JSON.stringify(sessions);
+    const emptyAllowlist = fixtureEnumerator(fx, []).list({});
+    check(
+      "AP2 out-of-allowlist sessions excluded and empty allowlist returns empty",
+      !serialized.includes("Outside should not appear") && emptyAllowlist.sessions.length === 0 && emptyAllowlist.truncated === false,
+    );
+    check("AP3 nested claude subagents logs are excluded", !serialized.includes("Nested should not appear"));
+    check(
+      "AP4 response is redacted metadata only",
+      !serialized.includes("SENSITIVE_PROMPT_CLAUDE") &&
+        !serialized.includes("SENSITIVE_PERMISSIONS_SECRET") &&
+        !serialized.includes("ASSISTANT_OUTPUT_SECRET") &&
+        !serialized.includes("BASE_INSTRUCTIONS_SECRET") &&
+        !serialized.includes(fx.base) &&
+        sessions.every((s) => !("content" in s) && !("path" in s) && !("session_id" in s)),
+    );
+
+    const page1 = enumerator.list({ page: { limit: 1 } });
+    const page2 = enumerator.list({ page: { limit: 1, cursor: page1.next_cursor ?? undefined } });
+    const page2Again = enumerator.list({ page: { limit: 1, cursor: page1.next_cursor ?? undefined } });
+    check(
+      "AP5 pagination limit and cursor are deterministic",
+      page1.sessions.length === 1 &&
+        page1.truncated === true &&
+        typeof page1.next_cursor === "string" &&
+        page2.sessions.length === 1 &&
+        page2.truncated === false &&
+        page2.next_cursor === null &&
+        page1.sessions[0]?.handle !== page2.sessions[0]?.handle &&
+        page2Again.sessions[0]?.handle === page2.sessions[0]?.handle,
+    );
+
+    const ap6 = { response: null as SessionListResponse | null };
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onSessionListResponse: (m) => {
+        ap6.response = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-ap6",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx.allowRoot],
+      }),
+      devSigner("key-ap6"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx),
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => ap6.response !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    const ap6Sessions = ap6.response?.sessions ?? [];
+    check(
+      "AP6 v2 daemon replies over the wire with enumerated sessions",
+      ap6.response?.request_id === "session-list-e2e" &&
+        ap6Sessions.length === 2 &&
+        byEngine(ap6Sessions, "claude")?.cwd === "repo-claude" &&
+        byEngine(ap6Sessions, "codex")?.cwd === "repo-codex",
+    );
+  } finally {
+    rmSync(fx.base, { recursive: true, force: true });
+  }
+}
+
+async function scenarioAQ(): Promise<void> {
+  type SessionResumeAccept = Extract<MessageV2, { type: "session.resume.accept" }>;
+  type SessionResumeReject = Extract<MessageV2, { type: "session.resume.reject" }>;
+  type SessionEvent = Extract<MessageV2, { type: "session.event" }>;
+  type SessionTurnResult = Extract<MessageV2, { type: "session.turn.result" }>;
+
+  const fx1 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({
+      events: [{ kind: "assistant_text", text: "resumed" }],
+      finalMessage: "resume complete",
+      newSessionId: "55555555-5555-4555-8555-555555555555",
+    });
+    const aq1 = {
+      accept: null as SessionResumeAccept | null,
+      events: [] as SessionEvent[],
+      result: null as SessionTurnResult | null,
+    };
+    let wsRef: WebSocket | null = null;
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        const handle = byEngine(m.sessions, "claude")?.handle;
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "aq1", handle, message: "continue" });
+      },
+      onSessionResumeAccept: (m) => {
+        aq1.accept = m;
+      },
+      onSessionEvent: (m) => {
+        aq1.events.push(m);
+      },
+      onSessionTurnResult: (m) => {
+        aq1.result = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-aq1",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx1.allowRoot],
+      }),
+      devSigner("key-aq1"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx1),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => aq1.result !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AQ1 valid claude handle → accept, session.event, ok turn.result with fork handle",
+      aq1.accept?.request_id === "aq1" &&
+        typeof aq1.accept.turn_id === "string" &&
+        aq1.accept.effective_options?.fork === true &&
+        aq1.accept.effective_options?.sandbox === "read_only" &&
+        aq1.events.length >= 1 &&
+        aq1.events[0]?.seq === 1 &&
+        aq1.events[0]?.event.kind === "assistant_text" &&
+        aq1.result?.status === "ok" &&
+        aq1.result.final_message === "resume complete" &&
+        typeof aq1.result.new_session_handle === "string" &&
+        runner.runCount === 1 &&
+        runner.specs[0]?.fork === true &&
+        runner.specs[0]?.sandbox === "read_only",
+    );
+  } finally {
+    rmSync(fx1.base, { recursive: true, force: true });
+  }
+
+  const fx2 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({ events: [] });
+    const aq2 = {
+      reject: null as SessionResumeReject | null,
+      accept: null as SessionResumeAccept | null,
+      result: null as SessionTurnResult | null,
+    };
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      onAccept: (ctx) => {
+        relay.resumeSession(ctx.ws, { request_id: "aq2", handle: "h_missing", message: "continue" });
+      },
+      onSessionResumeAccept: (m) => {
+        aq2.accept = m;
+      },
+      onSessionResumeReject: (m) => {
+        aq2.reject = m;
+      },
+      onSessionTurnResult: (m) => {
+        aq2.result = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-aq2",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx2.allowRoot],
+      }),
+      devSigner("key-aq2"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx2),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => aq2.reject !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AQ2 unknown handle → session.resume.reject handle_invalid and no turn",
+      aq2.reject?.request_id === "aq2" &&
+        aq2.reject.code === "handle_invalid" &&
+        aq2.accept === null &&
+        aq2.result === null &&
+        runner.runCount === 0,
+    );
+  } finally {
+    rmSync(fx2.base, { recursive: true, force: true });
+  }
+
+  const fx3 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({ events: [{ kind: "assistant_text", text: "still running" }], hang: true });
+    const aq3 = { accepts: [] as SessionResumeAccept[], reject: null as SessionResumeReject | null };
+    let wsRef: WebSocket | null = null;
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        const handle = byEngine(m.sessions, "claude")?.handle;
+        if (!handle || !wsRef) return;
+        relay.resumeSession(wsRef, { request_id: "aq3-first", handle, message: "first" });
+        relay.resumeSession(wsRef, { request_id: "aq3-second", handle, message: "second" });
+      },
+      onSessionResumeAccept: (m) => {
+        aq3.accepts.push(m);
+      },
+      onSessionResumeReject: (m) => {
+        aq3.reject = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-aq3",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx3.allowRoot],
+      }),
+      devSigner("key-aq3"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx3),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => aq3.accepts.length >= 1 && aq3.reject !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AQ3 second resume on in-flight handle → session_busy",
+      aq3.accepts.some((m) => m.request_id === "aq3-first") &&
+        aq3.reject?.request_id === "aq3-second" &&
+        aq3.reject.code === "session_busy" &&
+        runner.runCount === 1,
+    );
+  } finally {
+    rmSync(fx3.base, { recursive: true, force: true });
+  }
+
+  const fx4 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({ events: [] });
+    const aq4 = { reject: null as SessionResumeReject | null };
+    let wsRef: WebSocket | null = null;
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        const handle = byEngine(m.sessions, "codex")?.handle;
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "aq4", handle, message: "continue" });
+      },
+      onSessionResumeReject: (m) => {
+        aq4.reject = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-aq4",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx4.allowRoot],
+      }),
+      devSigner("key-aq4"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx4),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => aq4.reject !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AQ4 codex handle → engine_unavailable",
+      aq4.reject?.request_id === "aq4" && aq4.reject.code === "engine_unavailable" && runner.runCount === 0,
+    );
+  } finally {
+    rmSync(fx4.base, { recursive: true, force: true });
+  }
+}
+
+async function scenarioAR(): Promise<void> {
+  type SessionResumeAccept = Extract<MessageV2, { type: "session.resume.accept" }>;
+  type SessionEvent = Extract<MessageV2, { type: "session.event" }>;
+  type SessionTurnResult = Extract<MessageV2, { type: "session.turn.result" }>;
+
+  const fx1 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({ events: [], hang: true });
+    const ar1 = { accepts: [] as SessionResumeAccept[], results: [] as SessionTurnResult[] };
+    let wsRef: WebSocket | null = null;
+    let handle = "";
+    let firstTurn = "";
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        handle = byEngine(m.sessions, "claude")?.handle ?? "";
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "ar1-first", handle, message: "first" });
+      },
+      onSessionResumeAccept: (m) => {
+        ar1.accepts.push(m);
+        if (m.request_id === "ar1-first" && wsRef) {
+          firstTurn = m.turn_id;
+          relay.sendSessionCancel(wsRef, m.turn_id);
+        }
+      },
+      onSessionTurnResult: (m) => {
+        ar1.results.push(m);
+        if (m.turn_id === firstTurn && m.status === "cancelled" && handle && wsRef) {
+          relay.resumeSession(wsRef, { request_id: "ar1-followup", handle, message: "after cancel" });
+        }
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-ar1",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx1.allowRoot],
+      }),
+      devSigner("key-ar1"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx1),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => ar1.accepts.some((m) => m.request_id === "ar1-followup"), 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AR1 session.cancel finalizes cancelled and releases the session mutex",
+      ar1.results.some((m) => m.turn_id === firstTurn && m.status === "cancelled") &&
+        ar1.accepts.some((m) => m.request_id === "ar1-followup") &&
+        runner.runCount === 2,
+    );
+  } finally {
+    rmSync(fx1.base, { recursive: true, force: true });
+  }
+
+  const fx2 = createSessionFixtureStore();
+  try {
+    const cap = 3;
+    const runner = new FakeResumeRunner({
+      events: Array.from({ length: 8 }, (_, i): { kind: "assistant_text"; text: string } => ({ kind: "assistant_text", text: `bp-${i}` })),
+      hang: true,
+    });
+    const ar2 = { events: [] as SessionEvent[] };
+    let wsRef: WebSocket | null = null;
+    let turnId = "";
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        const handle = byEngine(m.sessions, "claude")?.handle;
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "ar2", handle, message: "backpressure" });
+      },
+      onSessionResumeAccept: (m) => {
+        turnId = m.turn_id;
+      },
+      onSessionEvent: (m) => {
+        ar2.events.push(m);
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-ar2",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx2.allowRoot],
+        maxUnackedEventsPerAttempt: cap,
+      }),
+      devSigner("key-ar2"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx2),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => runner.pauseCount > 0 && ar2.events.length === cap, 5000);
+      if (wsRef && turnId) relay.sendSessionAck(wsRef, turnId, cap);
+      await waitUntil(() => runner.resumeCount > 0 && ar2.events.length > cap, 5000);
+      if (wsRef && turnId) relay.sendSessionCancel(wsRef, turnId);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AR2 session.ack applies turn-scoped backpressure pause/resume",
+      runner.pauseCount >= 1 && runner.resumeCount >= 1 && ar2.events[0]?.seq === 1 && ar2.events.length > cap,
+    );
+  } finally {
+    rmSync(fx2.base, { recursive: true, force: true });
+  }
+
+  const fx3 = createSessionFixtureStore();
+  try {
+    const forkedSessionId = "66666666-6666-4666-8666-666666666666";
+    writeJsonlFixture(
+      join(fx3.claudeProjectsDir, "encoded-claude", `${forkedSessionId}.jsonl`),
+      [
+        { type: "system", timestamp: "2026-07-05T09:59:00.000Z", message: "fork init" },
+        { type: "system", timestamp: "2026-07-05T09:59:01.000Z", cwd: join(fx3.allowRoot, "repo-claude"), gitBranch: "main", version: "1.2.3" },
+        { type: "ai-title", timestamp: "2026-07-05T09:59:02.000Z", title: "Forked Claude fixture" },
+      ],
+      fx3.nowMs - 6 * 60 * 1000,
+    );
+    const runner = new FakeResumeRunner({
+      events: [{ kind: "assistant_text", text: "turn" }],
+      finalMessage: "turn complete",
+      newSessionId: forkedSessionId,
+    });
+    const ar3 = { accepts: [] as SessionResumeAccept[], results: [] as SessionTurnResult[] };
+    let wsRef: WebSocket | null = null;
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        const handle = byEngine(m.sessions, "claude")?.handle;
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "ar3-first", handle, message: "first turn" });
+      },
+      onSessionResumeAccept: (m) => {
+        ar3.accepts.push(m);
+      },
+      onSessionTurnResult: (m) => {
+        ar3.results.push(m);
+        if (ar3.results.length === 1 && m.new_session_handle && wsRef) {
+          relay.sendSessionMessage(wsRef, { request_id: "ar3-message", handle: m.new_session_handle, message: "second turn" });
+        }
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-ar3",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx3.allowRoot],
+      }),
+      devSigner("key-ar3"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx3),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => ar3.results.length >= 2, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AR3 session.message starts a follow-up turn with the supplied message",
+      ar3.accepts.some((m) => m.request_id === "ar3-first") &&
+        ar3.accepts.some((m) => m.request_id === "ar3-message") &&
+        ar3.results.length >= 2 &&
+        runner.runCount === 2 &&
+        runner.specs[1]?.message === "second turn",
+    );
+  } finally {
+    rmSync(fx3.base, { recursive: true, force: true });
+  }
+
+  const fx4 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({ events: [], hang: true });
+    const ar4 = { accepts: [] as SessionResumeAccept[], results: [] as SessionTurnResult[] };
+    let wsRef: WebSocket | null = null;
+    let handle = "";
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        handle = byEngine(m.sessions, "claude")?.handle ?? "";
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "ar4-timeout", handle, message: "timeout" });
+      },
+      onSessionResumeAccept: (m) => {
+        ar4.accepts.push(m);
+      },
+      onSessionTurnResult: (m) => {
+        ar4.results.push(m);
+        if (m.status === "error" && m.final_message === "resume turn timed out" && handle && wsRef) {
+          relay.resumeSession(wsRef, { request_id: "ar4-followup", handle, message: "after timeout" });
+        }
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-ar4",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx4.allowRoot],
+        sessionTurnTimeoutMs: 50,
+      }),
+      devSigner("key-ar4"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx4),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => ar4.accepts.some((m) => m.request_id === "ar4-followup"), 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AR4 per-turn timeout emits error and releases the session mutex",
+      ar4.results.some((m) => m.status === "error" && m.final_message === "resume turn timed out") &&
+        ar4.accepts.some((m) => m.request_id === "ar4-followup") &&
+        runner.runCount >= 2,
+    );
+  } finally {
+    rmSync(fx4.base, { recursive: true, force: true });
+  }
+}
+
+async function scenarioAS(): Promise<void> {
+  type SessionResumeAccept = Extract<MessageV2, { type: "session.resume.accept" }>;
+  type SessionResumeReject = Extract<MessageV2, { type: "session.resume.reject" }>;
+  type SessionEvent = Extract<MessageV2, { type: "session.event" }>;
+  type SessionTurnResult = Extract<MessageV2, { type: "session.turn.result" }>;
+
+  const fx1 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({
+      events: [{ kind: "assistant_text", text: "codex resumed" }],
+      finalMessage: "codex resume complete",
+      newSessionId: "99999999-9999-4999-8999-999999999999",
+    });
+    const as1 = {
+      accept: null as SessionResumeAccept | null,
+      events: [] as SessionEvent[],
+      result: null as SessionTurnResult | null,
+    };
+    let wsRef: WebSocket | null = null;
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        const handle = byEngine(m.sessions, "codex")?.handle;
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "as1", handle, message: "continue" });
+      },
+      onSessionResumeAccept: (m) => {
+        as1.accept = m;
+      },
+      onSessionEvent: (m) => {
+        as1.events.push(m);
+      },
+      onSessionTurnResult: (m) => {
+        as1.result = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-as1",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx1.allowRoot],
+      }),
+      devSigner("key-as1"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx1),
+      { codex: runner },
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => as1.result !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AS1 valid codex handle → accept, in-place read-only session.event, ok turn.result without fork handle",
+      as1.accept?.request_id === "as1" &&
+        typeof as1.accept.turn_id === "string" &&
+        as1.accept.effective_options?.fork === false &&
+        as1.accept.effective_options?.sandbox === "read_only" &&
+        as1.accept.effective_options?.mutates_source === true &&
+        as1.events.length >= 1 &&
+        as1.events[0]?.seq === 1 &&
+        as1.events[0]?.event.kind === "assistant_text" &&
+        as1.result?.status === "ok" &&
+        as1.result.final_message === "codex resume complete" &&
+        as1.result.new_session_handle === undefined &&
+        runner.runCount === 1 &&
+        runner.specs[0]?.engine === "codex" &&
+        runner.specs[0]?.fork === false &&
+        runner.specs[0]?.sandbox === "read_only",
+    );
+  } finally {
+    rmSync(fx1.base, { recursive: true, force: true });
+  }
+
+  const fx2 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({ events: [] });
+    const as2 = { reject: null as SessionResumeReject | null, accept: null as SessionResumeAccept | null };
+    let wsRef: WebSocket | null = null;
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+      },
+      onSessionListResponse: (m) => {
+        const handle = byEngine(m.sessions, "codex")?.handle;
+        if (handle && wsRef) relay.resumeSession(wsRef, { request_id: "as2", handle, message: "continue" });
+      },
+      onSessionResumeAccept: (m) => {
+        as2.accept = m;
+      },
+      onSessionResumeReject: (m) => {
+        as2.reject = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-as2",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx2.allowRoot],
+      }),
+      devSigner("key-as2"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx2),
+      { claude: runner },
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => as2.reject !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AS2 codex handle with no codex runner → engine_unavailable",
+      as2.reject?.request_id === "as2" && as2.reject.code === "engine_unavailable" && as2.accept === null && runner.runCount === 0,
+    );
+  } finally {
+    rmSync(fx2.base, { recursive: true, force: true });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Track B — real approval bridge (CI-safe: an MCP client stands in for claude).
 // ---------------------------------------------------------------------------
@@ -2450,6 +3484,18 @@ async function main(): Promise<void> {
   await scenarioAF();
   console.log("\n[scenario AG: Track A premature hello.accepted discarded]");
   await scenarioAG();
+  console.log("\n[scenario AN: protocol-version negotiation]");
+  await scenarioAN();
+  console.log("\n[scenario AO: v2 session.list plumbing]");
+  await scenarioAO();
+  console.log("\n[scenario AP: fixture-backed session enumeration]");
+  await scenarioAP();
+  console.log("\n[scenario AQ: v2 session resume turn]");
+  await scenarioAQ();
+  console.log("\n[scenario AR: v2 Claude resume lifecycle controls]");
+  await scenarioAR();
+  console.log("\n[scenario AS: v2 Codex continue-only resume turn]");
+  await scenarioAS();
   console.log("\n[scenario AH: Track B approval bridge round-trip (MCP client stand-in)]");
   await scenarioAH();
   console.log("\n[scenario AI: Track B ClaudeEngine permission-prompt-tool wiring (fake claude)]");

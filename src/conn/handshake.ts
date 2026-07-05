@@ -9,7 +9,7 @@
  */
 
 import { generateKeyPairSync, sign } from "node:crypto";
-import { type Message, PROTOCOL_VERSION } from "../../protocol/v1/index";
+import { type Message, negotiateVersion } from "../../protocol/v1/index";
 import { buildTranscript } from "../../protocol/v1/transcript";
 import { canonicalizeServerOrigin } from "../../protocol/v1/origin";
 import { canonicalizeDevOrigin } from "../simple-pairing-dev";
@@ -70,13 +70,14 @@ export async function performHandshake(
   const canonicalizeOrigin = config.allowDevOrigin ? canonicalizeDevOrigin : canonicalizeServerOrigin;
   const origin = canonicalizeOrigin(config.serverUrl);
   if (origin === null) throw new Error(`non-canonical serverUrl: ${config.serverUrl}`);
+  const protocolVersion = config.protocolVersion;
 
   const transcript = buildTranscript({
     challenge_id: challenge.challenge_id,
     nonce_raw: Buffer.from(challenge.nonce, "base64url"),
     agent_id: config.agentId,
     key_id: signer.keyId,
-    protocol_version: PROTOCOL_VERSION,
+    protocol_version: protocolVersion,
     tenant_id: config.tenantId,
     server_origin: origin,
   });
@@ -84,7 +85,7 @@ export async function performHandshake(
   const hello: Message = {
     ...envelope(),
     type: "hello",
-    protocol_version: PROTOCOL_VERSION,
+    protocol_version: protocolVersion,
     agent_id: config.agentId,
     agent_version: config.agentVersion,
     auth: {
@@ -117,6 +118,13 @@ export async function performHandshake(
     throw new Error(`hello.rejected: ${r.code} — ${r.message}`);
   }
   const accepted = reply as Extract<Message, { type: "hello.accepted" }>;
+  const negotiated = negotiateVersion(config.protocolVersion, [accepted.negotiated_version]);
+  if (!negotiated.ok || negotiated.version !== accepted.negotiated_version) {
+    throw new Error(
+      `relay negotiated an unsupported version "${accepted.negotiated_version}" (agent advertised "${config.protocolVersion}")`,
+    );
+  }
+  client.setNegotiatedVersion(accepted.negotiated_version);
   client.setAuthed(true);
   return {
     negotiatedVersion: accepted.negotiated_version,
