@@ -59,6 +59,18 @@ export class JobManager {
 
   handleAssign(msg: JobAssign): void {
     const ctx: AttemptCtx = { job_id: msg.job_id, attempt_id: msg.attempt_id, lease_id: msg.lease_id };
+    // Log every assign at receipt so a rejected job is diagnosable from the daemon
+    // side — the reject frames below go to the server, not the local terminal.
+    log.info("job.assign received", {
+      attempt_id: msg.attempt_id,
+      job_id: msg.job_id,
+      engine: msg.engine,
+      sandbox: msg.sandbox,
+      approval_policy: msg.approval_policy,
+      // The job's DECLARED workspace root — the operator needs this to configure
+      // HUGIND_PROJECT_ROOTS (or spot a path the C2 sent that isn't on this host).
+      repo_root: msg.workspace.repo_root,
+    });
 
     // Idempotency (at-least-once delivery) across BOTH the in-memory registry
     // (same connection) and the DURABLE store (survives reconnect — the registry
@@ -78,6 +90,7 @@ export class JobManager {
     }
 
     if (this.registry.atCapacity()) {
+      log.warn("job.assign rejected — at capacity", { attempt_id: msg.attempt_id });
       this.send(jobReject(ctx, "busy", "agent at capacity"));
       return;
     }
@@ -95,6 +108,13 @@ export class JobManager {
     // BEFORE accept/spawn (plan §5.10). The fake engine omits validate → skipped.
     const rej = this.engine.validate?.(spec);
     if (rej) {
+      // Log only the code — rej.message (workspace validation) can interpolate
+      // local filesystem paths (repo_root/cwd), which we keep OUT of the local
+      // log. The full message still travels to the server in the reject frame.
+      log.warn("job.assign rejected by engine.validate", {
+        attempt_id: msg.attempt_id,
+        code: rej.code,
+      });
       this.send(jobReject(ctx, rej.code, rej.message));
       return;
     }
@@ -105,6 +125,12 @@ export class JobManager {
     // approval_policy together as the local-maximum policy. Without a usable
     // gate, reject it. Only a read_only + never job is safe ungated.
     if (!this.gateAvailable && (msg.sandbox !== "read_only" || msg.approval_policy !== "never")) {
+      log.warn("job.assign rejected — approval gate unavailable (fail closed)", {
+        attempt_id: msg.attempt_id,
+        sandbox: msg.sandbox,
+        approval_policy: msg.approval_policy,
+        hint: "gate needs env-auth (ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN) or a clean login; read_only+never runs ungated",
+      });
       this.send(jobReject(ctx, "policy_violation", "approval gate unavailable — daemon fails closed on gated jobs"));
       return;
     }
