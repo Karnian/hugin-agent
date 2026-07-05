@@ -84,21 +84,22 @@ repo's reference relay). On an accepted WSS connection:
    **single-use**, 43-char unpadded base64url (= 32 raw bytes). Generate per
    connection; never reuse.
 2. **Receive `hello`** — carries `agent_id`, `key_id`, `protocol_version`,
-   `tenant_id`, `signature`, capabilities.
+   `signature`, capabilities. It does **not** carry `tenant_id`; C2 reconstructs
+   `tenant_id` from the pairing record.
 3. **Field gates before crypto** (all provided by the vendored module):
    `validate_auth_id` on ids, `validate_protocol_version` **and** require
-   `== "1.0.0"`, `validate_tenant_id`, `decode_nonce`, and match the challenge
-   you issued. Look up the pairing record by `agent_id` + `key_id` — unknown →
-   reject.
+   `== "1.0.0"`, `decode_nonce`, and match the challenge you issued. Look up the
+   pairing record by `agent_id` + `key_id` — unknown → reject — then
+   `validate_tenant_id` on the record's `tenant_id`.
 4. **Reconstruct `server_origin` yourself** via
    `canonicalize_server_origin(<the URL this endpoint is served at>)` — it is
    **not on the wire**; it binds the signature to *your* endpoint (MITM/re-host
    defense). Production form is `wss://` + lowercase DNS name, no default port,
    no path.
 5. **Verify:** `build_transcript(...)` over
-   (challenge_id, nonce_raw, agent_id, key_id, protocol_version, tenant_id,
-   server_origin) → `verify_transcript(registered_public_key, transcript,
-   signature)`.
+   (challenge_id, nonce_raw, agent_id, key_id, protocol_version, pairing-record
+   tenant_id, server_origin) → `verify_transcript(registered_public_key,
+   transcript, signature)`.
 6. Failure → send the protocol error (`bad_signature` / `unauthorized`) and
    close. Success → **atomically consume the nonce**, bump the agent's
    `connection_epoch`, send `hello.accepted {connection_epoch}`. The connection
