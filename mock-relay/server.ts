@@ -7,7 +7,7 @@
 
 import { randomBytes } from "node:crypto";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
-import { LIMITS, type Message, PROTOCOL_VERSION } from "../protocol/v1/index";
+import { LIMITS, type Message, type MessageV2, negotiateVersion, PROTOCOL_VERSION } from "../protocol/v1/index";
 import { resultDigest } from "../protocol/v1/digest";
 import { buildTranscript } from "../protocol/v1/transcript";
 import { verifyTranscript } from "../protocol/v1/ed25519";
@@ -109,6 +109,10 @@ export interface MockRelayOpts {
   onHeartbeat?: () => void;
   /** Heartbeat interval advertised in `hello.accepted` (default: LIMITS value). */
   heartbeatIntervalMs?: number;
+  /** Protocol versions this mock relay can negotiate (default: ["1.0.0"]). */
+  supportedVersions?: readonly string[];
+  /** Test hook: force the exact accepted negotiated_version after normal negotiation succeeds. */
+  forceNegotiatedVersion?: string;
   /** Force a fixed `connection_epoch` instead of the monotonic `++epoch` — used to
    *  exercise the daemon's non-monotonic-epoch rejection. */
   forceEpoch?: number;
@@ -148,6 +152,16 @@ export interface MockRelayOpts {
    *  challenge — BEFORE any `hello` — to exercise the daemon discarding a premature
    *  accept (it must complete only on a post-`hello` accept). */
   prematureAcceptEpoch?: number;
+  /** Test hook: send a v2 session.list.request immediately after hello.accepted. */
+  sendSessionListAfterAccept?: boolean;
+  /** Called when the daemon replies to the test session.list.request. */
+  onSessionListResponse?: (m: Extract<MessageV2, { type: "session.list.response" }>) => void;
+  /** Called when the daemon reports a v2 session-layer error. */
+  onSessionError?: (m: Extract<MessageV2, { type: "session.error" }>) => void;
+  onSessionResumeAccept?: (m: Extract<MessageV2, { type: "session.resume.accept" }>) => void;
+  onSessionResumeReject?: (m: Extract<MessageV2, { type: "session.resume.reject" }>) => void;
+  onSessionEvent?: (m: Extract<MessageV2, { type: "session.event" }>) => void;
+  onSessionTurnResult?: (m: Extract<MessageV2, { type: "session.turn.result" }>) => void;
 }
 
 export interface AssignSpec {
@@ -161,10 +175,21 @@ export interface AssignSpec {
   approval_policy?: "never" | "on_request" | "on_write" | "always";
 }
 
+export interface ResumeSessionSpec {
+  request_id: string;
+  handle: string;
+  message: string;
+}
+
 function toBuffer(data: RawData): Buffer {
   if (Array.isArray(data)) return Buffer.concat(data);
   if (Buffer.isBuffer(data)) return data;
   return Buffer.from(data as ArrayBuffer);
+}
+
+function isProtocolV2(version: string): boolean {
+  const major = Number(version.split(".")[0]);
+  return Number.isInteger(major) && major >= 2;
 }
 
 export class MockRelay {
@@ -185,7 +210,7 @@ export class MockRelay {
 
   start(port = 0): Promise<number> {
     return new Promise((resolve, reject) => {
-      const wss = new WebSocketServer({ port, maxPayload: LIMITS.MAX_FRAME_BYTES });
+      const wss = new WebSocketServer({ port, host: "127.0.0.1", maxPayload: LIMITS.MAX_FRAME_BYTES });
       this.wss = wss;
       wss.on("listening", () => {
         const addr = wss.address();
@@ -197,12 +222,13 @@ export class MockRelay {
     });
   }
 
-  private send(ws: WebSocket, msg: Message): void {
+  private send(ws: WebSocket, msg: MessageV2): void {
     ws.send(JSON.stringify(msg));
   }
 
   private handleConnection(ws: WebSocket): void {
     let authed = false;
+    let v2 = false;
     const now = new Date().toISOString();
     const nonce = this.opts.nonce ?? randomBytes(32).toString("base64url");
     const challengeId = `ch-${messageId()}`;
@@ -234,7 +260,7 @@ export class MockRelay {
     ws.on("message", (data: RawData) => {
       // Same single framing choke point as the daemon (plan §5.1): size → schema
       // → direction/phase. `receiver: "server"` flips the allowed directions.
-      const res = decodeInbound(toBuffer(data), { receiver: "server", authed });
+      const res = decodeInbound(toBuffer(data), { receiver: "server", authed, v2 });
       if (!res.ok) {
         log.warn("[mock] inbound rejected", { code: res.code, reason: res.reason });
         return;
@@ -253,6 +279,18 @@ export class MockRelay {
         if (authed) {
           log.warn("[mock] ignoring duplicate hello on an already-authenticated connection");
           return;
+        }
+        const negotiated = negotiateVersion(m.protocol_version, this.opts.supportedVersions ?? [PROTOCOL_VERSION]);
+        if (!negotiated.ok) {
+          log.warn("[mock] hello rejected", { code: "unsupported_version", reason: negotiated.reason });
+          this.send(ws, {
+            id: messageId(),
+            ts: new Date().toISOString(),
+            type: "hello.rejected",
+            code: "unsupported_version",
+            message: negotiated.reason,
+          });
+          return; // fail closed: no epoch, no accept
         }
         // Track A: verify the Ed25519 possession proof before accepting. No
         // record preserves the non-auth default (accept any signature).
@@ -280,19 +318,41 @@ export class MockRelay {
           log.warn("[mock] accepting hello WITHOUT signature verification (non-auth test mode — set verifyAuth to verify)");
         }
         const epoch = this.opts.forceEpoch ?? ++this.epoch;
+        const acceptedVersion = this.opts.forceNegotiatedVersion ?? negotiated.version;
         this.send(ws, {
           id: messageId(),
           ts: new Date().toISOString(),
           type: "hello.accepted",
-          negotiated_version: PROTOCOL_VERSION,
+          negotiated_version: acceptedVersion,
           connection_epoch: epoch,
           heartbeat_interval_ms: this.opts.heartbeatIntervalMs ?? LIMITS.HEARTBEAT_INTERVAL_MS,
           resume: this.opts.resumeFor?.(m) ?? [],
         });
+        v2 = isProtocolV2(acceptedVersion);
         authed = true;
         this.opts.onAccept?.({ ws, epoch, hello: m });
+        if (this.opts.sendSessionListAfterAccept) {
+          this.send(ws, {
+            id: messageId(),
+            ts: new Date().toISOString(),
+            type: "session.list.request",
+            request_id: "session-list-e2e",
+          });
+        }
       } else if (m.type === "heartbeat") {
         this.opts.onHeartbeat?.();
+      } else if (m.type === "session.list.response") {
+        this.opts.onSessionListResponse?.(m);
+      } else if (m.type === "session.error") {
+        this.opts.onSessionError?.(m);
+      } else if (m.type === "session.resume.accept") {
+        this.opts.onSessionResumeAccept?.(m);
+      } else if (m.type === "session.resume.reject") {
+        this.opts.onSessionResumeReject?.(m);
+      } else if (m.type === "session.event") {
+        this.opts.onSessionEvent?.(m);
+      } else if (m.type === "session.turn.result") {
+        this.opts.onSessionTurnResult?.(m);
       } else if (m.type === "job.accept") {
         this.opts.onJobAccept?.(m);
       } else if (m.type === "job.reject") {
@@ -361,6 +421,47 @@ export class MockRelay {
       limits: { timeout_ms: 600_000, max_output_bytes: 5_000_000 },
       created_at: now,
       assignment_start_timeout_ms: 30_000,
+    });
+  }
+
+  resumeSession(ws: WebSocket, spec: ResumeSessionSpec): void {
+    this.send(ws, {
+      id: messageId(),
+      ts: new Date().toISOString(),
+      type: "session.resume.request",
+      request_id: spec.request_id,
+      handle: spec.handle,
+      message: spec.message,
+    });
+  }
+
+  sendSessionMessage(ws: WebSocket, spec: ResumeSessionSpec): void {
+    this.send(ws, {
+      id: messageId(),
+      ts: new Date().toISOString(),
+      type: "session.message",
+      request_id: spec.request_id,
+      handle: spec.handle,
+      message: spec.message,
+    });
+  }
+
+  sendSessionCancel(ws: WebSocket, turnId: string): void {
+    this.send(ws, {
+      id: messageId(),
+      ts: new Date().toISOString(),
+      type: "session.cancel",
+      turn_id: turnId,
+    });
+  }
+
+  sendSessionAck(ws: WebSocket, turnId: string, ackSeq: number): void {
+    this.send(ws, {
+      id: messageId(),
+      ts: new Date().toISOString(),
+      type: "session.ack",
+      turn_id: turnId,
+      ack_seq: ackSeq,
     });
   }
 

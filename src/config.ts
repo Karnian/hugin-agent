@@ -4,7 +4,7 @@
  */
 
 import { z } from "zod";
-import { LIMITS } from "../protocol/v1/index";
+import { LIMITS, PROTOCOL_VERSION, SemVer } from "../protocol/v1/index";
 
 /** Matches the wire `AuthId` charset (messages.ts) so a configured `agentId`
  *  can be put on the wire without re-validation. */
@@ -26,6 +26,8 @@ export const Config = z.strictObject({
   keyId: AuthId.default("dev-key"),
   /** Daemon version reported in `hello.agent_version`. */
   agentVersion: z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).max(64).default("0.0.0"),
+  /** Protocol version advertised in `hello.protocol_version` and bound into the signed transcript. */
+  protocolVersion: SemVer.default(PROTOCOL_VERSION),
   /** Tenant the device is paired to (off-wire; used only to build the signed
    *  transcript). Grammar 1*128(ALPHA/DIGIT/-/_/.). */
   tenantId: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/).default("dev-tenant"),
@@ -49,6 +51,8 @@ export const Config = z.strictObject({
   maxUnackedBytesPerConn: z.number().int().positive().default(LIMITS.MAX_UNACKED_BYTES_PER_CONN),
   /** Approval-gate timeout before auto-deny (default: protocol LIMITS). */
   approvalTimeoutMs: z.number().int().positive().default(LIMITS.APPROVAL_TIMEOUT_MS_DEFAULT),
+  /** Per Claude session-resume turn timeout. */
+  sessionTurnTimeoutMs: z.number().int().positive().default(3_600_000),
 });
 
 export type Config = z.infer<typeof Config>;

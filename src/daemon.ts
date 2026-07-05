@@ -6,10 +6,10 @@
 
 import { join } from "node:path";
 import type { Config } from "./config";
-import type { Message } from "../protocol/v1/index";
+import type { MessageV2 } from "../protocol/v1/index";
 import type { Engine } from "./engine/types";
 import { RelayClient } from "./conn/client";
-import { agentDrainingMsg } from "./conn/outbound";
+import { agentDrainingMsg, envelope } from "./conn/outbound";
 import { performHandshake, type ResumeState, type Signer } from "./conn/handshake";
 import { startHeartbeat } from "./conn/heartbeat";
 import { backoffDelay, sleep } from "./conn/reconnect";
@@ -17,6 +17,9 @@ import { EventLog } from "./store/eventlog";
 import { JobRegistry } from "./jobs/registry";
 import { JobManager } from "./jobs/manager";
 import { log } from "./log";
+import type { SessionEnumerator, SessionListResult } from "./sessions/enumerator";
+import { SessionResumeManager } from "./sessions/resume-manager";
+import type { ResumeRunner, ResumeRunnerRegistry } from "./sessions/resume";
 
 /** WS path the C2 serves the agent connection at — the sibling of the pairing
  *  HTTP endpoints (`/api/v1/hugin-agents/pair/complete`, `.../capability`). The
@@ -47,6 +50,7 @@ export class Daemon {
   private readonly store: EventLog;
   private readonly registry: JobRegistry;
   private readonly manager: JobManager;
+  private readonly resumeManager: SessionResumeManager;
 
   constructor(
     private readonly config: Config,
@@ -55,6 +59,8 @@ export class Daemon {
     /** Whether the approval gate is usable (startup isolation self-check). When
      *  false, gated (write/exec) jobs are rejected — fail closed. */
     gateAvailable = true,
+    private readonly sessionEnumerator?: Pick<SessionEnumerator, "list" | "validateHandle" | "registerForked">,
+    resumeRunners?: ResumeRunner | ResumeRunnerRegistry,
   ) {
     this.store = new EventLog(config.dbPath ?? join(config.stateDir, "eventlog.db"));
     // Registry + manager are DAEMON-level so live runs (and their lease/approval
@@ -73,9 +79,15 @@ export class Daemon {
       gateAvailable,
       config.approvalTimeoutMs,
     );
+    this.resumeManager = new SessionResumeManager((m) => this.safeSend(m), {
+      enumerator: this.sessionEnumerator,
+      runners: normalizeResumeRunners(resumeRunners),
+      maxUnackedEvents: config.maxUnackedEventsPerAttempt,
+      turnTimeoutMs: config.sessionTurnTimeoutMs,
+    });
   }
 
-  private safeSend(m: Message): void {
+  private safeSend(m: MessageV2): void {
     try {
       this.activeClient?.send(m);
     } catch (e) {
@@ -198,6 +210,36 @@ export class Daemon {
           case "lease.granted":
             this.manager.handleLeaseGranted(m);
             break;
+          case "session.list.request":
+            {
+              let result: SessionListResult = { sessions: [], next_cursor: null, truncated: false };
+              try {
+                result = this.sessionEnumerator?.list({ filter: m.filter, page: m.page }) ?? result;
+              } catch (e) {
+                log.warn("session enumeration failed", { err: String(e) });
+              }
+              this.safeSend({
+                ...envelope(),
+                type: "session.list.response",
+                request_id: m.request_id,
+                sessions: result.sessions,
+                next_cursor: result.next_cursor,
+                truncated: result.truncated,
+              });
+            }
+            break;
+          case "session.resume.request":
+            this.resumeManager.handleRequest(m);
+            break;
+          case "session.cancel":
+            this.resumeManager.handleCancel(m);
+            break;
+          case "session.ack":
+            this.resumeManager.handleAck(m);
+            break;
+          case "session.message":
+            this.resumeManager.handleMessage(m);
+            break;
           default:
             break; // others ignored
         }
@@ -232,4 +274,10 @@ export class Daemon {
     // so a stop() during the handshake doesn't leave the loop awaiting close.
     (this.sessionClient ?? this.activeClient)?.close();
   }
+}
+
+function normalizeResumeRunners(input?: ResumeRunner | ResumeRunnerRegistry): ResumeRunnerRegistry {
+  if (!input) return {};
+  if ("run" in input && typeof input.run === "function") return { claude: input };
+  return input as ResumeRunnerRegistry;
 }

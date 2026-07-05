@@ -10,6 +10,8 @@
  *   HUGIND_ENGINE_CMD   (test override)
  */
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { type Config, loadConfig } from "./config";
 import { Daemon } from "./daemon";
 import type { Signer } from "./conn/handshake";
@@ -20,6 +22,8 @@ import { ClaudeEngine } from "./engine/claude";
 import { buildIsolation, selfCheckGate, selfCheckLogin } from "./engine/isolate";
 import { log } from "./log";
 import { simplePairingGateEnabled } from "./simple-pairing-dev";
+import { SessionEnumerator } from "./sessions/enumerator";
+import { ClaudeResumeRunner, CodexResumeRunner } from "./sessions/resume";
 
 function loadConfigOrExit(): Config {
   const roots =
@@ -107,7 +111,16 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const daemon = new Daemon(config, signer, engine, gateAvailable);
+  const sessionEnumerator = new SessionEnumerator({
+    claudeProjectsDir: join(homedir(), ".claude/projects"),
+    codexSessionsDir: join(homedir(), ".codex/sessions"),
+    allowlist: config.projectRoots,
+  });
+  const resumeRunners = {
+    claude: new ClaudeResumeRunner({ command: config.engineCommand }),
+    codex: new CodexResumeRunner(),
+  };
+  const daemon = new Daemon(config, signer, engine, gateAvailable, sessionEnumerator, resumeRunners);
   const shutdown = () => {
     log.info("signal received — shutting down");
     daemon.stop();

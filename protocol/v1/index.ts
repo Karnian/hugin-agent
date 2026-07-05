@@ -5,10 +5,10 @@
  * contract never drifts between the two codebases.
  */
 
-import { DIRECTION, HANDSHAKE_TYPES, SemVer, type Message } from "./messages";
+import { DIRECTION, HANDSHAKE_TYPES, SemVer, type MessageType, type MessageV2 } from "./messages";
 
 export * from "./messages";
-export { PROTOCOL_VERSION } from "./messages";
+export { PROTOCOL_VERSION, PROTOCOL_VERSION_V2 } from "./messages";
 
 /**
  * Negotiate a protocol version at handshake time.
@@ -56,12 +56,12 @@ export function negotiateVersion(
  * (Codex C3). Call after `parseMessage` on every received frame.
  */
 export function validateInbound(
-  msg: Message,
+  msg: MessageV2,
   opts: { receiver: "agent" | "server"; authed: boolean },
 ): { ok: true } | { ok: false; code: "bad_direction" | "bad_state" } {
   const dir = DIRECTION[msg.type];
   const allowed = opts.receiver === "agent" ? ["s2a", "both"] : ["a2s", "both"];
   if (!allowed.includes(dir)) return { ok: false, code: "bad_direction" };
-  if (!opts.authed && !HANDSHAKE_TYPES.has(msg.type)) return { ok: false, code: "bad_state" };
+  if (!opts.authed && !HANDSHAKE_TYPES.has(msg.type as MessageType)) return { ok: false, code: "bad_state" };
   return { ok: true };
 }
