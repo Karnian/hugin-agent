@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EngineEvent, EngineOutcome } from "../engine/types";
 import { normalizeClaudeLine, normalizeCodexLine } from "../engine/normalize";
+import { scrubbedChildEnv } from "../engine/isolate";
 
 export interface ResumeSpec {
   engine: "claude" | "codex";
@@ -39,10 +40,12 @@ export interface ResumeRunnerRegistry {
 
 export interface ClaudeResumeRunnerOpts {
   command?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface CodexResumeRunnerOpts {
   command?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 interface ClaudeStreamLine {
@@ -165,6 +168,7 @@ export class ClaudeResumeRunner implements ResumeRunner {
 
       child = spawn(this.opts.command ?? "claude", args, {
         cwd: spec.cwd,
+        env: scrubbedChildEnv(this.opts.env),
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
@@ -346,6 +350,7 @@ export class CodexResumeRunner implements ResumeRunner {
       ];
       child = spawn(this.opts.command ?? "codex", args, {
         cwd: spec.cwd,
+        env: scrubbedChildEnv(this.opts.env),
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
@@ -417,6 +422,7 @@ export interface FakeResumeScript {
 
 export class FakeResumeRunner implements ResumeRunner {
   runCount = 0;
+  cancelCount = 0;
   pauseCount = 0;
   resumeCount = 0;
   specs: ResumeSpec[] = [];
@@ -481,7 +487,10 @@ export class FakeResumeRunner implements ResumeRunner {
         this.resumeCount++;
         pump();
       },
-      cancel: () => queueMicrotask(() => finish({ status: "cancelled" })),
+      cancel: () => {
+        this.cancelCount++;
+        queueMicrotask(() => finish({ status: "cancelled" }));
+      },
     };
   }
 

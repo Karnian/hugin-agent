@@ -49,6 +49,14 @@ export class SessionResumeManager {
     this.maybeResume(state);
   }
 
+  cancelActiveTurns(): void {
+    for (const [turnId, state] of [...this.turns]) {
+      if (state.finalized) continue;
+      state.run.cancel(this.cancelGraceMs());
+      this.finalize(turnId, "cancelled", "session connection closed");
+    }
+  }
+
   private startTurn(req: TurnStartMsg): void {
     const target = this.opts.enumerator?.validateHandle(req.handle) ?? null;
     if (!target) {

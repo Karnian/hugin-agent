@@ -16,6 +16,7 @@ import { canonicalizeDevOrigin } from "../simple-pairing-dev";
 import type { Config } from "../config";
 import { envelope } from "./outbound";
 import type { RelayClient } from "./client";
+import type { EngineCapabilities } from "../engine/detect";
 
 export interface Signer {
   keyId: string;
@@ -49,6 +50,11 @@ export interface ResumeState {
   pendingResults: HelloMsg["pending_results"];
 }
 
+export interface HandshakeOpts {
+  timeoutMs?: number;
+  engines: EngineCapabilities;
+}
+
 function nodePlatform(): "darwin" | "linux" | "win32" {
   const p = process.platform;
   if (p === "darwin" || p === "linux" || p === "win32") return p;
@@ -60,8 +66,9 @@ export async function performHandshake(
   config: Config,
   signer: Signer,
   resume: ResumeState,
-  timeoutMs = 10_000,
+  opts: HandshakeOpts,
 ): Promise<HandshakeResult> {
+  const timeoutMs = opts.timeoutMs ?? 10_000;
   const challenge = (await client.waitFor((m) => m.type === "auth.challenge", timeoutMs)) as Extract<
     Message,
     { type: "auth.challenge" }
@@ -95,9 +102,11 @@ export async function performHandshake(
       alg: "ed25519",
     },
     os: { platform: nodePlatform(), arch: process.arch },
-    // P1 stub capabilities; real engine detection lands in P2b.
+    // Stay inside the frozen v1 Capabilities schema. capabilities.sessions is
+    // deferred until a v2 Hello/Capabilities schema exists; C2 infers session.*
+    // support from negotiated_version >= 2.x.
     capabilities: {
-      engines: { claude: { installed: true }, codex: { installed: false } },
+      engines: opts.engines,
       project_roots: config.projectRoots,
     },
     active_jobs: resume.activeJobs,

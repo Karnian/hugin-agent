@@ -40,7 +40,7 @@ const EMPTY_ALLOW = JSON.stringify({ permissions: { allow: [], defaultMode: "def
  *  by config-dir/home-swap (the isolation finding — see the header). Nothing is
  *  injected when neither is set: the child then relies on the host keychain login,
  *  which only survives `none`. */
-function envAuthOverlay(): NodeJS.ProcessEnv {
+export function envAuthOverlay(): NodeJS.ProcessEnv {
   const overlay: NodeJS.ProcessEnv = {};
   if (process.env.ANTHROPIC_API_KEY) overlay.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) overlay.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;

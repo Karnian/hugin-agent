@@ -26,6 +26,7 @@ import { buildTranscript } from "../protocol/v1/transcript";
 import { b64u, deriveKeypairFromSeed, signTranscript, verifyTranscript } from "../protocol/v1/ed25519";
 import { buildPairingTranscript, keyFingerprint, REJECTED_TEST_PUBLIC_HEX, validateB64u32 } from "../protocol/v1/pairing";
 import { loadConfig } from "../src/config";
+import { loadConfigFromEnv } from "../src/index";
 import { connect, connectSimple } from "../src/auth/connect";
 import { readPairingConfig } from "../src/auth/config-file";
 import { parsePairingToken, type ParsedPairingToken } from "../src/auth/pairing-token";
@@ -37,6 +38,7 @@ import { decodeInbound } from "../src/conn/framing";
 import { RelayClient } from "../src/conn/client";
 import { FakeEngine } from "../src/engine/fake-engine";
 import { ClaudeEngine } from "../src/engine/claude";
+import { detectEngineCapabilities, type EngineCapabilities } from "../src/engine/detect";
 import { ApprovalBridge, permissionServerLaunch } from "../src/engine/permission";
 import { buildIsolation, selfCheckGate } from "../src/engine/isolate";
 import type { ApprovalRequest, Engine } from "../src/engine/types";
@@ -45,11 +47,13 @@ import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
 import { validateWorkspace } from "../src/workspace/worktree";
 import { SessionEnumerator, type SessionInfo } from "../src/sessions/enumerator";
-import { FakeResumeRunner } from "../src/sessions/resume";
+import { SessionResumeManager } from "../src/sessions/resume-manager";
+import { ClaudeResumeRunner, CodexResumeRunner, FakeResumeRunner } from "../src/sessions/resume";
 import { MockRelay, verifyHello, type PairingRecord } from "../mock-relay/server";
 import { MockPairingServer } from "../mock-relay/pairing-server";
 
 const SCRATCH = join(tmpdir(), "hugind-e2e-worktree");
+const TEST_ENGINE_CAPABILITIES: EngineCapabilities = { claude: { installed: true }, codex: { installed: false } };
 
 let failures = 0;
 function check(label: string, cond: boolean): void {
@@ -1806,6 +1810,7 @@ async function scenarioALHappyPath(cfgDir: string): Promise<void> {
       }),
       signer,
       { activeJobs: [], pendingResults: [] },
+      { engines: TEST_ENGINE_CAPABILITIES },
     );
     check("AL1b simple pair-then-WSS handshake reaches hello.accepted on the same --url origin", relayPort === port && hs.connectionEpoch === 1);
   } finally {
@@ -2088,6 +2093,7 @@ async function scenarioAMHandshakeDevOrigin(): Promise<void> {
       loadConfig({ serverUrl: rawDevOrigin, allowDevOrigin: true, agentId: "agent-am-dev", dbPath: ":memory:" }),
       devSigner("key-am-dev"),
       { activeJobs: [], pendingResults: [] },
+      { engines: TEST_ENGINE_CAPABILITIES },
     );
     check("AM4 allowDevOrigin:true permits raw-IP dev origin transcript and reaches hello.accepted", hs.connectionEpoch === 1);
   } finally {
@@ -2106,6 +2112,7 @@ async function scenarioAMHandshakeDevOrigin(): Promise<void> {
       loadConfig({ serverUrl: rawDevOrigin, allowDevOrigin: false, agentId: "agent-am-strict", dbPath: ":memory:" }),
       devSigner("key-am-strict"),
       { activeJobs: [], pendingResults: [] },
+      { engines: TEST_ENGINE_CAPABILITIES },
     );
   } catch (err) {
     message = err instanceof Error ? err.message : String(err);
@@ -2159,7 +2166,7 @@ async function scenarioAF(): Promise<void> {
   const client = new RelayClient();
   await client.connect(serverUrl);
   const config = loadConfig({ serverUrl, agentId: "agent-af", dbPath: ":memory:" });
-  await performHandshake(client, config, devSigner("key-af"), { activeJobs: [], pendingResults: [] });
+  await performHandshake(client, config, devSigner("key-af"), { activeJobs: [], pendingResults: [] }, { engines: TEST_ENGINE_CAPABILITIES });
   await waitUntil(() => accepts >= 1, 3000);
   // Re-send a hello on the SAME authed socket — must NOT be re-accepted.
   client.send(
@@ -2191,7 +2198,7 @@ async function scenarioAG(): Promise<void> {
   const client = new RelayClient();
   await client.connect(serverUrl);
   const config = loadConfig({ serverUrl, agentId: "agent-ag", dbPath: ":memory:" });
-  const hs = await performHandshake(client, config, devSigner("key-ag"), { activeJobs: [], pendingResults: [] });
+  const hs = await performHandshake(client, config, devSigner("key-ag"), { activeJobs: [], pendingResults: [] }, { engines: TEST_ENGINE_CAPABILITIES });
   client.close();
   await relay.stop();
   await sleep(50);
@@ -2227,6 +2234,7 @@ async function versionHandshake(opts: {
       }),
       devSigner(`key-${opts.agentId}`),
       { activeJobs: [], pendingResults: [] },
+      { engines: TEST_ENGINE_CAPABILITIES },
     );
     return { ok: true, negotiatedVersion: hs.negotiatedVersion };
   } catch (err) {
@@ -2241,6 +2249,84 @@ async function versionHandshake(opts: {
 /** Protocol-version negotiation scaffolding: the daemon can advertise v1 or v2,
  *  and the relay cleanly rejects unsupported majors without authenticating. */
 async function scenarioAN(): Promise<void> {
+  const prevConfig = process.env.HUGIND_CONFIG;
+  try {
+    process.env.HUGIND_CONFIG = join(SCRATCH, "missing-hugind-config.json");
+    const baseEnv = {
+      HUGIND_SERVER_URL: "ws://127.0.0.1:1",
+      HUGIND_AGENT_ID: "agent-an-env",
+    } as NodeJS.ProcessEnv;
+    const unset = loadConfigFromEnv(baseEnv);
+    const v2 = loadConfigFromEnv({ ...baseEnv, HUGIND_PROTOCOL_VERSION: PROTOCOL_VERSION_V2 } as NodeJS.ProcessEnv);
+    check("AN0 HUGIND_PROTOCOL_VERSION unset defaults to 1.0.0 and env 2.0.0 selects v2", unset.protocolVersion === PROTOCOL_VERSION && v2.protocolVersion === PROTOCOL_VERSION_V2);
+  } finally {
+    if (prevConfig !== undefined) process.env.HUGIND_CONFIG = prevConfig;
+    else delete process.env.HUGIND_CONFIG;
+  }
+
+  const detectBase = mkdtempSync(join(tmpdir(), "hugind-e2e-detect-"));
+  try {
+    const mkVersionCli = (name: string, output: string): string => {
+      const p = join(detectBase, name);
+      writeFileSync(
+        p,
+        `#!/usr/bin/env node
+if (process.argv[2] === '--version') {
+  console.log(${JSON.stringify(output)});
+  process.exit(0);
+}
+process.exit(1);
+`,
+      );
+      chmodSync(p, 0o755);
+      return p;
+    };
+    const detected = await detectEngineCapabilities({
+      claudeCommand: mkVersionCli("claude.js", "claude-code 1.2.3"),
+      codexCommand: mkVersionCli("codex.js", "codex-cli 4.5.6"),
+      timeoutMs: 1_000,
+    });
+    check(
+      "AN0b engine detection runs --version once and parses versions",
+      detected.claude.installed === true &&
+        detected.claude.version === "1.2.3" &&
+        detected.codex.installed === true &&
+        detected.codex.version === "4.5.6",
+    );
+  } finally {
+    rmSync(detectBase, { recursive: true, force: true });
+  }
+
+  const customCaps: EngineCapabilities = { claude: { installed: false }, codex: { installed: true, version: "9.8.7", logged_in: true } };
+  const capSeen: { helloCaps?: { engines: EngineCapabilities; [key: string]: unknown } } = {};
+  const capRelay = new MockRelay({
+    onAccept: (ctx) => {
+      capSeen.helloCaps = ctx.hello.capabilities;
+    },
+  });
+  const capPort = await capRelay.start();
+  const capUrl = `ws://127.0.0.1:${capPort}`;
+  const capClient = new RelayClient();
+  try {
+    await capClient.connect(capUrl);
+    await performHandshake(
+      capClient,
+      loadConfig({ serverUrl: capUrl, agentId: "agent-an-caps", dbPath: ":memory:" }),
+      devSigner("key-agent-an-caps"),
+      { activeJobs: [], pendingResults: [] },
+      { engines: customCaps },
+    );
+  } finally {
+    capClient.close();
+    await capRelay.stop();
+    await sleep(50);
+  }
+  const helloCaps = capSeen.helloCaps;
+  check(
+    "AN0c hello.capabilities uses detected engines and keeps frozen v1 schema",
+    JSON.stringify(helloCaps?.engines) === JSON.stringify(customCaps) && helloCaps !== undefined && !("sessions" in helloCaps),
+  );
+
   const an1 = await versionHandshake({
     agentId: "agent-an1",
     supportedVersions: [PROTOCOL_VERSION],
@@ -2480,7 +2566,7 @@ async function scenarioAP(): Promise<void> {
         codex?.cwd === "repo-codex" &&
         codex.git_branch === null &&
         codex.cli_version === "0.4.5" &&
-        codex.title === "Codex fixture title with a concise request" &&
+        codex.title === "codex · repo-codex" &&
         codex.created_at === "2026-07-05T09:30:00.000Z" &&
         codex.msg_count === 3 &&
         codex.active === false,
@@ -2511,7 +2597,8 @@ async function scenarioAP(): Promise<void> {
     check("AP3 nested claude subagents logs are excluded", !serialized.includes("Nested should not appear"));
     check(
       "AP4 response is redacted metadata only",
-      !serialized.includes("SENSITIVE_PROMPT_CLAUDE") &&
+        !serialized.includes("SENSITIVE_PROMPT_CLAUDE") &&
+        !serialized.includes("Codex fixture title with a concise request") &&
         !serialized.includes("SENSITIVE_PERMISSIONS_SECRET") &&
         !serialized.includes("ASSISTANT_OUTPUT_SECRET") &&
         !serialized.includes("BASE_INSTRUCTIONS_SECRET") &&
@@ -2823,6 +2910,118 @@ async function scenarioAQ(): Promise<void> {
     );
   } finally {
     rmSync(fx4.base, { recursive: true, force: true });
+  }
+
+  const fx5 = createSessionFixtureStore();
+  try {
+    const enumerator = fixtureEnumerator(fx5);
+    const handle = byEngine(enumerator.list({}).sessions, "claude")?.handle ?? "";
+    const runner = new FakeResumeRunner({ events: [], hang: true });
+    const messages: MessageV2[] = [];
+    const manager = new SessionResumeManager((m) => messages.push(m), {
+      enumerator,
+      runners: { claude: runner },
+      cancelGraceMs: 1,
+    });
+    let msgSeq = 0;
+    const req = (requestId: string, message: string): Extract<MessageV2, { type: "session.resume.request" }> => ({
+      id: `ar5-${++msgSeq}`,
+      ts: "2026-07-05T12:00:00.000Z",
+      type: "session.resume.request",
+      request_id: requestId,
+      handle,
+      message,
+    });
+
+    manager.handleRequest(req("ar5-first", "first"));
+    await waitUntil(() => messages.some((m) => m.type === "session.resume.accept" && m.request_id === "ar5-first"), 1000);
+    manager.cancelActiveTurns();
+    await waitUntil(() => messages.some((m) => m.type === "session.turn.result" && m.status === "cancelled"), 1000);
+    manager.handleRequest(req("ar5-followup", "after cancel-all"));
+    await waitUntil(() => messages.some((m) => m.type === "session.resume.accept" && m.request_id === "ar5-followup"), 1000);
+
+    check(
+      "AR5 cancelActiveTurns finalizes cancelled and releases the session mutex",
+      messages.some((m) => m.type === "session.turn.result" && m.status === "cancelled" && m.final_message === "session connection closed") &&
+        messages.some((m) => m.type === "session.resume.accept" && m.request_id === "ar5-followup") &&
+        runner.cancelCount === 1 &&
+        runner.runCount === 2,
+    );
+  } finally {
+    rmSync(fx5.base, { recursive: true, force: true });
+  }
+
+  const fx6 = createSessionFixtureStore();
+  try {
+    const runner = new FakeResumeRunner({ events: [], hang: true });
+    const ar6 = { accepts: [] as SessionResumeAccept[] };
+    let wsRef: WebSocket | null = null;
+    let handle = "";
+    let connectionCount = 0;
+    let sentFirst = false;
+    let sentFollowup = false;
+    let stopped = false;
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionListAfterAccept: true,
+      onAccept: (ctx) => {
+        wsRef = ctx.ws;
+        connectionCount++;
+      },
+      onSessionListResponse: (m) => {
+        handle ||= byEngine(m.sessions, "claude")?.handle ?? "";
+        if (!handle || !wsRef) return;
+        if (!sentFirst) {
+          sentFirst = true;
+          relay.resumeSession(wsRef, { request_id: "ar6-first", handle, message: "first" });
+          return;
+        }
+        if (connectionCount >= 2) maybeSendFollowup();
+      },
+      onSessionResumeAccept: (m) => {
+        ar6.accepts.push(m);
+        if (m.request_id === "ar6-first") setTimeout(() => wsRef?.close(), 0);
+      },
+    });
+    const maybeSendFollowup = () => {
+      if (stopped || sentFollowup || !wsRef || !handle) return;
+      if (runner.cancelCount <= 0) {
+        setTimeout(maybeSendFollowup, 25);
+        return;
+      }
+      sentFollowup = true;
+      relay.resumeSession(wsRef, { request_id: "ar6-followup", handle, message: "after disconnect" });
+    };
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-ar6",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx6.allowRoot],
+      }),
+      devSigner("key-ar6"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx6),
+      runner,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => ar6.accepts.some((m) => m.request_id === "ar6-followup"), 8000);
+    } finally {
+      stopped = true;
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AR6 relay disconnect cancels active session turn and releases the session mutex",
+      runner.cancelCount >= 1 && ar6.accepts.some((m) => m.request_id === "ar6-followup") && runner.runCount === 2,
+    );
+  } finally {
+    rmSync(fx6.base, { recursive: true, force: true });
   }
 }
 
@@ -3415,6 +3614,66 @@ function scenarioAK(): void {
   }
 }
 
+async function scenarioAT(): Promise<void> {
+  const base = join(SCRATCH, "resume-env");
+  rmSync(base, { recursive: true, force: true });
+  mkdirSync(base, { recursive: true });
+  const prevSentinel = process.env.HUGIN_RESUME_SECRET_SENTINEL;
+  try {
+    process.env.HUGIN_RESUME_SECRET_SENTINEL = "host-only-secret";
+    const fakeCli = join(base, "fake-resume-cli.js");
+    writeFileSync(
+      fakeCli,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const envOut = process.env.HG_ENV_OUT;
+if (envOut) {
+  fs.writeFileSync(envOut, JSON.stringify({
+    sentinel: process.env.HUGIN_RESUME_SECRET_SENTINEL ?? null,
+    overlay: process.env.HG_ENV_OVERLAY ?? null
+  }));
+}
+const argv = process.argv.slice(2);
+const outputIdx = argv.indexOf('-o');
+if (outputIdx >= 0) fs.writeFileSync(argv[outputIdx + 1], 'resume done');
+console.log(JSON.stringify({ type: 'result', result: 'resume done', session_id: 'resume-env-session' }));
+`,
+    );
+    chmodSync(fakeCli, 0o755);
+
+    const runAndReadEnv = async (engine: "claude" | "codex", out: string): Promise<Record<string, unknown>> => {
+      const runner =
+        engine === "claude"
+          ? new ClaudeResumeRunner({ command: fakeCli, env: { HG_ENV_OUT: out, HG_ENV_OVERLAY: `${engine}-overlay` } })
+          : new CodexResumeRunner({ command: fakeCli, env: { HG_ENV_OUT: out, HG_ENV_OVERLAY: `${engine}-overlay` } });
+      const run = runner.run({
+        engine,
+        sessionId: "resume-env-session",
+        cwd: base,
+        message: "continue",
+        fork: false,
+        sandbox: "read_only",
+      });
+      await new Promise<void>((resolve) => run.onDone(() => resolve()));
+      return JSON.parse(readFileSync(out, "utf8")) as Record<string, unknown>;
+    };
+
+    const claudeEnv = await runAndReadEnv("claude", join(base, "claude-env.json"));
+    const codexEnv = await runAndReadEnv("codex", join(base, "codex-env.json"));
+    check(
+      "AT1 resume runners spawn with scrubbed env overlays and no host sentinel",
+      claudeEnv.overlay === "claude-overlay" &&
+        claudeEnv.sentinel === null &&
+        codexEnv.overlay === "codex-overlay" &&
+        codexEnv.sentinel === null,
+    );
+  } finally {
+    if (prevSentinel !== undefined) process.env.HUGIN_RESUME_SECRET_SENTINEL = prevSentinel;
+    else delete process.env.HUGIN_RESUME_SECRET_SENTINEL;
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<void> {
   console.log("=== hugind e2e (P1–P5 + Track A auth + Track B approval) ===\n[scenario A: live handshake + heartbeat + reconnect]");
   await scenarioA();
@@ -3504,6 +3763,8 @@ async function main(): Promise<void> {
   await scenarioAJ();
   console.log("\n[scenario AK: Track B env-auth injection into isolation]");
   scenarioAK();
+  console.log("\n[scenario AT: session resume env scrub]");
+  await scenarioAT();
   console.log(`\n${failures === 0 ? `ALL E2E PASS` : `${failures} e2e failure(s)`}`);
   process.exit(failures === 0 ? 0 : 1);
 }
