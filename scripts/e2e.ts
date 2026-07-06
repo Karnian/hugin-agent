@@ -1075,6 +1075,7 @@ interface PairStatusBody extends Record<string, unknown> {
 interface SimpleCompleteBody extends Record<string, unknown> {
   device_code: string;
   public_key: string;
+  hostname?: string;
 }
 
 function trackingSeedStore(): { store: SeedStore; setKeys: string[] } {
@@ -1747,6 +1748,7 @@ async function scenarioALHappyPath(cfgDir: string): Promise<void> {
     const res = await connectSimple({
       deviceCode,
       serverUrl,
+      hostname: "test-host",
       seedStore: tracked.store,
       configPath: cfgPath,
     });
@@ -1776,6 +1778,7 @@ async function scenarioALHappyPath(cfgDir: string): Promise<void> {
         complete.length === 1 &&
         complete[0]?.device_code === deviceCode &&
         complete[0]?.public_key === publicKeyB64u &&
+        complete[0]?.hostname === "test-host" &&
         pairing.registeredPublicKeys.length === 1 &&
         pairing.registeredPublicKeys[0] === publicKeyB64u &&
         !seedLeaked,
@@ -1816,6 +1819,35 @@ async function scenarioALHappyPath(cfgDir: string): Promise<void> {
   } finally {
     client.close();
     await relay.stop();
+  }
+}
+
+async function scenarioALHostnameSchema(): Promise<void> {
+  const pairing = new MockPairingServer({ simplePairing: true });
+  await pairing.start();
+  try {
+    const publicKey = b64u(Buffer.alloc(32, 0x5a));
+    if (!validateB64u32(publicKey)) throw new Error("test public key is not canonical");
+    const postSimple = async (label: string, body: Record<string, unknown>): Promise<{ status: number; body: unknown }> =>
+      postRawPairComplete(pairing.baseUrl(), {
+        device_code: pairing.mintSimpleDeviceCode(`device-code-${label}`),
+        public_key: publicKey,
+        ...body,
+      });
+
+    const withoutHostname = await postSimple("al-hostname-absent", {});
+    const withHostname = await postSimple("al-hostname-valid", { hostname: "a".repeat(255) });
+    const tooLong = await postSimple("al-hostname-too-long", { hostname: "a".repeat(256) });
+    const nonString = await postSimple("al-hostname-non-string", { hostname: 42 });
+    const extraKey = await postSimple("al-hostname-extra-key", { foo: "bar" });
+
+    check("AL10 simple /pair/complete accepts omitted hostname", withoutHostname.status === 200);
+    check("AL10b simple /pair/complete accepts valid hostname metadata", withHostname.status === 200);
+    check("AL10c simple /pair/complete rejects hostname longer than 255", tooLong.status !== 200 && pairingFailed(tooLong.body));
+    check("AL10d simple /pair/complete rejects non-string hostname", nonString.status !== 200 && pairingFailed(nonString.body));
+    check("AL10e simple /pair/complete rejects unknown extra request keys", extraKey.status !== 200 && pairingFailed(extraKey.body));
+  } finally {
+    await pairing.stop();
   }
 }
 
@@ -1982,7 +2014,7 @@ async function scenarioALCompletionRejects(cfgDir: string): Promise<void> {
         { deviceCode: code, serverUrl: `ws://127.0.0.1:${pairing.port}` },
         c.error,
       );
-      check(`AL${6 + i} rejection still sent device_code only in the POST body`, simpleCompleteBodies(pairing).some((body) => body.device_code === code));
+      check(`AL${6 + i} rejection still sent device_code (+ hostname) in the POST body`, simpleCompleteBodies(pairing).some((body) => body.device_code === code));
     } finally {
       await pairing.stop();
     }
@@ -2026,6 +2058,7 @@ async function scenarioAL(): Promise<void> {
   mkdirSync(cfgDir, { recursive: true });
   try {
     await scenarioALHappyPath(cfgDir);
+    await scenarioALHostnameSchema();
     await scenarioALCliGate(cfgDir);
     await scenarioALNonCanonicalUrl(cfgDir);
     await scenarioALCapabilityRejects(cfgDir);

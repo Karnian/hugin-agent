@@ -17,8 +17,9 @@ Issue #1 adds a **dev-only "simple" mode** that runs *alongside* rev2:
 
 - Input: `device_code` (a **bearer** credential, rev1-level) + daemon-supplied
   `--url` origin.
-- `POST /pair/complete {device_code, public_key}` → **200 `{agent_id, key_id,
-  tenant_id}`** immediately. **No PoP, no poll, no confirm.**
+- `POST /pair/complete {device_code, public_key, hostname?}` → **200 `{agent_id,
+  key_id, tenant_id}`** immediately. **No PoP, no poll, no confirm.** `hostname`
+  is optional display metadata (≤255 chars), not a credential.
 - C2 does not verify origin in simple mode (**provisional** WSS handshake); the
   daemon controls the dial origin via `--url`.
 
@@ -59,7 +60,8 @@ name the connect origin directly.
      including a truthy-but-unrecognized shape → **hard error**
      (`this relay does not support simple pairing`). This is the cross-check.
    - `POST {--url→https}/api/v1/hugin-agents/pair/complete {device_code,
-     public_key}`. Response MUST be **exactly HTTP 200** with a **strict**
+     public_key, hostname?}`. `hostname` is optional display metadata (≤255
+     chars), not a credential. Response MUST be **exactly HTTP 200** with a **strict**
      `{agent_id, key_id, tenant_id}` body validated against the existing `AuthId`
      / tenant grammars. **No `seedStore.set` and no config write happen until that
      parse succeeds.** A rev2-shaped body (202 / `pending` / `poll_token`) → refuse
