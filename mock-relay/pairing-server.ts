@@ -315,15 +315,17 @@ export class MockPairingServer {
     const keys = Object.keys(body).sort();
     const deviceCode = body.device_code;
     const publicKey = body.public_key;
+    const hostname = body.hostname;
+    const hasHostname = Object.prototype.hasOwnProperty.call(body, "hostname");
+    const allowed = new Set(["device_code", "public_key", "hostname"]);
     if (
-      keys.length !== 2 ||
-      keys[0] !== "device_code" ||
-      keys[1] !== "public_key" ||
+      keys.some((key) => !allowed.has(key)) ||
       typeof deviceCode !== "string" ||
       typeof publicKey !== "string" ||
       deviceCode.length === 0 ||
       deviceCode.length > 1024 ||
       !validateB64u32(publicKey) ||
+      (hasHostname && (typeof hostname !== "string" || hostname.length > 255)) ||
       !this.simpleDeviceCodes.has(deviceCode)
     ) {
       return this.failComplete(res, "simple_schema_or_code_gate");

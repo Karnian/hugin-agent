@@ -7,6 +7,7 @@
  * plus a PoP signature, and the in-memory seed is scrubbed on every exit path.
  */
 
+import { hostname as osHostname } from "node:os";
 import { z } from "zod";
 import { b64u, deriveKeypairFromSeed, signTranscript } from "../../protocol/v1/ed25519";
 import { PROTOCOL_VERSION } from "../../protocol/v1/messages";
@@ -72,6 +73,8 @@ export interface ConnectSimpleOptions {
   deviceCode: string;
   /** Operator-provided ws(s):// relay origin. */
   serverUrl: string;
+  /** Optional display hostname sent to simple-pairing C2 for UI labeling. */
+  hostname?: string;
   seedStore?: SeedStore;
   configPath?: string;
   fetchImpl?: typeof fetch;
@@ -200,6 +203,16 @@ function trimAsciiBoundaryWhitespace(value: string): string {
   return value.replace(/^[\u0009-\u000d\u0020]+|[\u0009-\u000d\u0020]+$/g, "");
 }
 
+function normalizeHostname(h: string | undefined): string | undefined {
+  const trimmed = h?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, 255);
+}
+
+function defaultAgentHostname(): string | undefined {
+  return normalizeHostname(osHostname());
+}
+
 function validateSimpleDeviceCode(deviceCode: string): string {
   if (deviceCode.length === 0) {
     throw new Error("simple pairing device code is empty; re-copy the device code");
@@ -233,12 +246,16 @@ export async function completeSimplePairing(opts: {
   completeUrl: string;
   deviceCode: string;
   publicKey: string;
+  hostname?: string;
 }): Promise<z.infer<typeof SimpleCompleteResponse>> {
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const res = await postJson(fetchImpl, opts.completeUrl, {
+  const body: Record<string, unknown> = {
     device_code: opts.deviceCode,
     public_key: opts.publicKey,
-  });
+  };
+  const hostname = normalizeHostname(opts.hostname);
+  if (hostname) body.hostname = hostname;
+  const res = await postJson(fetchImpl, opts.completeUrl, body);
 
   if (res.status !== 200) {
     const body = await tryReadJson(res);
@@ -364,6 +381,7 @@ export async function connectSimple(opts: ConnectSimpleOptions): Promise<Pairing
   }
 
   const deviceCode = validateSimpleDeviceCode(opts.deviceCode);
+  const host = normalizeHostname(opts.hostname) ?? defaultAgentHostname();
   const endpoints = simplePairingEndpoints(canonicalOrigin);
   await probeSimplePairingCapability(fetchImpl, endpoints.capability);
 
@@ -374,6 +392,7 @@ export async function connectSimple(opts: ConnectSimpleOptions): Promise<Pairing
       completeUrl: endpoints.complete,
       deviceCode,
       publicKey: b64u(dk.publicRaw),
+      hostname: host,
     });
 
     await seedStore.set(complete.key_id, dk.seed);

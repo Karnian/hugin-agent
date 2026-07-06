@@ -21,8 +21,9 @@ weaker bearer flow onto a rev2 pairing. The daemon reads the `device_code` (a
 bearer credential, rev1-level) from hidden stdin (never argv), canonicalizes
 `--url` with the frozen `canonicalizeServerOrigin`, guards against a pasted
 `hpk1.` token (after CRLF/whitespace trim), then `POST /pair/complete
-{device_code, public_key}` expecting EXACTLY HTTP 200 with a strict
-`{agent_id,key_id,tenant_id}` body — no seed/config is persisted until that parse
+{device_code, public_key, hostname?}` expecting EXACTLY HTTP 200 with a strict
+`{agent_id,key_id,tenant_id}` body — `hostname` is optional display metadata
+(≤255 chars), not a credential; no seed/config is persisted until that parse
 succeeds (a rev2-shaped `202/pending`, a non-200, or a malformed 200 is refused,
 not reinterpreted); the device seed is scrubbed on every exit path. New:
 `src/auth/connect.ts` (`connectSimple`/`completeSimplePairing` + strict schemas;
