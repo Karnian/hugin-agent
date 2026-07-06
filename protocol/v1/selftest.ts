@@ -14,13 +14,21 @@ import {
   DIRECTION,
   Message,
   type MessageType,
+  type MessageV2Type,
   PROTOCOL_VERSION,
   SemVer,
   negotiateVersion,
   parseMessage,
+  safeParseMessage,
+  safeParseMessageV2,
   validateInbound,
 } from "./index";
 import { type VectorsFile } from "./gen-vectors";
+import {
+  type SessionNegativeReason,
+  type SessionVectorType,
+  type SessionVectorsFile,
+} from "./gen-session-vectors";
 import { b64u, deriveKeypairFromSeed, publicKeyFromRaw } from "./ed25519";
 import { ALG, DOMAIN_TAG, buildTranscript, lp } from "./transcript";
 import { canonicalizeServerOrigin, validateTenantId } from "./origin";
@@ -272,6 +280,72 @@ for (const v of vectors.negatives) {
   }
   checks.push([`vector- ${v.label} (${v.failure_mode}): rejected`, pass]);
 }
+
+// --- v2 session.* schema-conformance vectors: verify committed JSON ---
+const sessionVectors = JSON.parse(
+  readFileSync(new URL("./session-test-vectors.json", import.meta.url), "utf8"),
+) as SessionVectorsFile;
+
+const sessionMeta =
+  "v2 schema-conformance fixtures generated from messages.ts. messages.ts is SSOT. JSON key order/whitespace is NOT wire-normative. NOT a frozen ABI — session.* is additive/evolving v2 surface.";
+const requiredSessionTypes = [
+  "session.list.request",
+  "session.list.response",
+  "session.resume.request",
+  "session.resume.accept",
+  "session.resume.reject",
+  "session.event",
+  "session.ack",
+  "session.turn.result",
+  "session.message",
+  "session.cancel",
+  "session.error",
+] as const satisfies readonly Extract<MessageV2Type, `session.${string}`>[];
+const sessionNegativeReasons = new Set<SessionNegativeReason>([
+  "non-positive-int",
+  "null-on-non-nullable",
+  "strict-unknown-field",
+  "bad-event-kind",
+  "v1-rejects-session-cap",
+]);
+const seenSessionTypes = new Set<SessionVectorType>();
+
+checks.push(["session vectors meta", sessionVectors.meta === sessionMeta]);
+checks.push([
+  "session vector negative reasons are known",
+  sessionVectors.negatives.every((v) => sessionNegativeReasons.has(v.reason)),
+]);
+
+for (const v of sessionVectors.positives) {
+  const parsed = safeParseMessageV2(v.message);
+  const parsePass = parsed.success && parsed.data.type === v.type;
+  if (parsed.success && parsed.data.type.startsWith("session.")) {
+    seenSessionTypes.add(parsed.data.type as SessionVectorType);
+  }
+
+  let canonicalPass = false;
+  try {
+    canonicalPass =
+      jcsCanonicalize(JSON.parse(v.canonical)) === v.canonical &&
+      jcsCanonicalize(v.message) === v.canonical;
+  } catch {
+    canonicalPass = false;
+  }
+
+  checks.push([`session vector+ ${v.label}: safeParseMessageV2`, parsePass]);
+  checks.push([`session vector+ ${v.label}: canonical`, canonicalPass]);
+}
+
+for (const type of requiredSessionTypes) {
+  checks.push([`session vector coverage ${type}`, seenSessionTypes.has(type)]);
+}
+
+for (const v of sessionVectors.negatives) {
+  const v2Rejected = !safeParseMessageV2(v.raw).success;
+  const v1CapRejected = v.reason !== "v1-rejects-session-cap" || !safeParseMessage(v.raw).success;
+  checks.push([`session vector- ${v.label} (${v.reason}): rejected`, v2Rejected && v1CapRejected]);
+}
+
 for (const [label, pass] of checks) {
   console.log(pass ? `✓ ${label}` : `✗ ${label}`);
   if (!pass) failures++;

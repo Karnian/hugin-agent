@@ -1,0 +1,484 @@
+{
+  "meta": "v2 schema-conformance fixtures generated from messages.ts. messages.ts is SSOT. JSON key order/whitespace is NOT wire-normative. NOT a frozen ABI — session.* is additive/evolving v2 surface.",
+  "positives": [
+    {
+      "label": "session.list.request-filter-omitted-page-omitted",
+      "type": "session.list.request",
+      "message": {
+        "id": "m-session-list-req-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.request",
+        "request_id": "req-list-1"
+      },
+      "canonical": "{\"id\":\"m-session-list-req-1\",\"request_id\":\"req-list-1\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.request\"}"
+    },
+    {
+      "label": "session.list.request-filter-present-page-present",
+      "type": "session.list.request",
+      "message": {
+        "id": "m-session-list-req-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.request",
+        "request_id": "req-list-2",
+        "filter": {
+          "engine": "codex",
+          "cwd_prefix": "/work",
+          "active_only": true,
+          "updated_after": "2026-01-01T00:00:00.000Z"
+        },
+        "page": {
+          "cursor": "cursor-1",
+          "limit": 2
+        }
+      },
+      "canonical": "{\"filter\":{\"active_only\":true,\"cwd_prefix\":\"/work\",\"engine\":\"codex\",\"updated_after\":\"2026-01-01T00:00:00.000Z\"},\"id\":\"m-session-list-req-2\",\"page\":{\"cursor\":\"cursor-1\",\"limit\":2},\"request_id\":\"req-list-2\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.request\"}"
+    },
+    {
+      "label": "session.list.response-empty-next-cursor-string",
+      "type": "session.list.response",
+      "message": {
+        "id": "m-session-list-resp-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.response",
+        "request_id": "req-list-1",
+        "sessions": [],
+        "next_cursor": "cursor-2",
+        "truncated": true
+      },
+      "canonical": "{\"id\":\"m-session-list-resp-1\",\"next_cursor\":\"cursor-2\",\"request_id\":\"req-list-1\",\"sessions\":[],\"truncated\":true,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
+    },
+    {
+      "label": "session.list.response-one-session-next-cursor-null",
+      "type": "session.list.response",
+      "message": {
+        "id": "m-session-list-resp-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.response",
+        "request_id": "req-list-2",
+        "sessions": [
+          {
+            "handle": "sess-main",
+            "engine": "codex",
+            "cwd": "/work/repo",
+            "git_branch": "main",
+            "cli_version": "0.140.0",
+            "title": "Investigate failing test",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "updated_at": "2026-01-01T00:01:00.000Z",
+            "active": true,
+            "msg_count": 3
+          }
+        ],
+        "next_cursor": null,
+        "truncated": false
+      },
+      "canonical": "{\"id\":\"m-session-list-resp-2\",\"next_cursor\":null,\"request_id\":\"req-list-2\",\"sessions\":[{\"active\":true,\"cli_version\":\"0.140.0\",\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/repo\",\"engine\":\"codex\",\"git_branch\":\"main\",\"handle\":\"sess-main\",\"msg_count\":3,\"title\":\"Investigate failing test\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
+    },
+    {
+      "label": "session.list.response-one-session-next-cursor-omitted",
+      "type": "session.list.response",
+      "message": {
+        "id": "m-session-list-resp-3",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.response",
+        "request_id": "req-list-3",
+        "sessions": [
+          {
+            "handle": "sess-no-meta",
+            "engine": "claude",
+            "cwd": "/work/other",
+            "git_branch": null,
+            "cli_version": null,
+            "title": "Draft migration plan",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "updated_at": "2026-01-01T00:01:00.000Z",
+            "active": false,
+            "msg_count": 1
+          }
+        ],
+        "truncated": false
+      },
+      "canonical": "{\"id\":\"m-session-list-resp-3\",\"request_id\":\"req-list-3\",\"sessions\":[{\"active\":false,\"cli_version\":null,\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/other\",\"engine\":\"claude\",\"git_branch\":null,\"handle\":\"sess-no-meta\",\"msg_count\":1,\"title\":\"Draft migration plan\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
+    },
+    {
+      "label": "session.resume.request-options-omitted",
+      "type": "session.resume.request",
+      "message": {
+        "id": "m-session-resume-req-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.resume.request",
+        "request_id": "req-resume-1",
+        "handle": "sess-main",
+        "message": "Continue from the last checkpoint."
+      },
+      "canonical": "{\"handle\":\"sess-main\",\"id\":\"m-session-resume-req-1\",\"message\":\"Continue from the last checkpoint.\",\"request_id\":\"req-resume-1\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.resume.request\"}"
+    },
+    {
+      "label": "session.resume.request-options-present",
+      "type": "session.resume.request",
+      "message": {
+        "id": "m-session-resume-req-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.resume.request",
+        "request_id": "req-resume-2",
+        "handle": "sess-main",
+        "message": "Fork this session and run the migration tests.",
+        "options": {
+          "fork": true,
+          "sandbox": "workspace_write",
+          "model": "codex-large"
+        }
+      },
+      "canonical": "{\"handle\":\"sess-main\",\"id\":\"m-session-resume-req-2\",\"message\":\"Fork this session and run the migration tests.\",\"options\":{\"fork\":true,\"model\":\"codex-large\",\"sandbox\":\"workspace_write\"},\"request_id\":\"req-resume-2\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.resume.request\"}"
+    },
+    {
+      "label": "session.cancel",
+      "type": "session.cancel",
+      "message": {
+        "id": "m-session-cancel-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.cancel",
+        "turn_id": "turn-main"
+      },
+      "canonical": "{\"id\":\"m-session-cancel-1\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.cancel\"}"
+    },
+    {
+      "label": "session.ack",
+      "type": "session.ack",
+      "message": {
+        "id": "m-session-ack-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.ack",
+        "turn_id": "turn-main",
+        "ack_seq": 4
+      },
+      "canonical": "{\"ack_seq\":4,\"id\":\"m-session-ack-1\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.ack\"}"
+    },
+    {
+      "label": "session.message",
+      "type": "session.message",
+      "message": {
+        "id": "m-session-message-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.message",
+        "request_id": "req-message-1",
+        "handle": "sess-main",
+        "message": "Please inspect the failing snapshot."
+      },
+      "canonical": "{\"handle\":\"sess-main\",\"id\":\"m-session-message-1\",\"message\":\"Please inspect the failing snapshot.\",\"request_id\":\"req-message-1\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.message\"}"
+    },
+    {
+      "label": "session.resume.accept-effective-options-mutates-source",
+      "type": "session.resume.accept",
+      "message": {
+        "id": "m-session-resume-accept-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.resume.accept",
+        "request_id": "req-resume-1",
+        "turn_id": "turn-main",
+        "effective_options": {
+          "fork": true,
+          "sandbox": "workspace_write",
+          "mutates_source": true
+        }
+      },
+      "canonical": "{\"effective_options\":{\"fork\":true,\"mutates_source\":true,\"sandbox\":\"workspace_write\"},\"id\":\"m-session-resume-accept-1\",\"request_id\":\"req-resume-1\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.resume.accept\"}"
+    },
+    {
+      "label": "session.resume.accept-effective-options-mutates-source-omitted",
+      "type": "session.resume.accept",
+      "message": {
+        "id": "m-session-resume-accept-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.resume.accept",
+        "request_id": "req-resume-2",
+        "turn_id": "turn-readonly",
+        "effective_options": {
+          "fork": false,
+          "sandbox": "read_only"
+        }
+      },
+      "canonical": "{\"effective_options\":{\"fork\":false,\"sandbox\":\"read_only\"},\"id\":\"m-session-resume-accept-2\",\"request_id\":\"req-resume-2\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-readonly\",\"type\":\"session.resume.accept\"}"
+    },
+    {
+      "label": "session.resume.accept-effective-options-omitted",
+      "type": "session.resume.accept",
+      "message": {
+        "id": "m-session-resume-accept-3",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.resume.accept",
+        "request_id": "req-resume-3",
+        "turn_id": "turn-default"
+      },
+      "canonical": "{\"id\":\"m-session-resume-accept-3\",\"request_id\":\"req-resume-3\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-default\",\"type\":\"session.resume.accept\"}"
+    },
+    {
+      "label": "session.resume.reject",
+      "type": "session.resume.reject",
+      "message": {
+        "id": "m-session-resume-reject-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.resume.reject",
+        "request_id": "req-resume-4",
+        "code": "unknown_session",
+        "message": "Session handle was not found."
+      },
+      "canonical": "{\"code\":\"unknown_session\",\"id\":\"m-session-resume-reject-1\",\"message\":\"Session handle was not found.\",\"request_id\":\"req-resume-4\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.resume.reject\"}"
+    },
+    {
+      "label": "session.event-core-kind",
+      "type": "session.event",
+      "message": {
+        "id": "m-session-event-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.event",
+        "turn_id": "turn-main",
+        "seq": 1,
+        "event": {
+          "kind": "assistant_text",
+          "text": "I will check the failing case."
+        }
+      },
+      "canonical": "{\"event\":{\"kind\":\"assistant_text\",\"text\":\"I will check the failing case.\"},\"id\":\"m-session-event-1\",\"seq\":1,\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.event\"}"
+    },
+    {
+      "label": "session.event-vendor-kind",
+      "type": "session.event",
+      "message": {
+        "id": "m-session-event-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.event",
+        "turn_id": "turn-main",
+        "seq": 2,
+        "event": {
+          "kind": "vendor.codex.reasoning_delta",
+          "delta": {
+            "tokens": 12
+          }
+        }
+      },
+      "canonical": "{\"event\":{\"delta\":{\"tokens\":12},\"kind\":\"vendor.codex.reasoning_delta\"},\"id\":\"m-session-event-2\",\"seq\":2,\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.event\"}"
+    },
+    {
+      "label": "session.turn.result-new-session-handle-string",
+      "type": "session.turn.result",
+      "message": {
+        "id": "m-session-turn-result-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.turn.result",
+        "turn_id": "turn-main",
+        "status": "ok",
+        "final_message": "Created a forked session.",
+        "new_session_handle": "sess-fork"
+      },
+      "canonical": "{\"final_message\":\"Created a forked session.\",\"id\":\"m-session-turn-result-1\",\"new_session_handle\":\"sess-fork\",\"status\":\"ok\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.turn.result\"}"
+    },
+    {
+      "label": "session.turn.result-new-session-handle-null",
+      "type": "session.turn.result",
+      "message": {
+        "id": "m-session-turn-result-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.turn.result",
+        "turn_id": "turn-readonly",
+        "status": "cancelled",
+        "final_message": "Cancelled before creating a new session.",
+        "new_session_handle": null
+      },
+      "canonical": "{\"final_message\":\"Cancelled before creating a new session.\",\"id\":\"m-session-turn-result-2\",\"new_session_handle\":null,\"status\":\"cancelled\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-readonly\",\"type\":\"session.turn.result\"}"
+    },
+    {
+      "label": "session.turn.result-new-session-handle-omitted",
+      "type": "session.turn.result",
+      "message": {
+        "id": "m-session-turn-result-3",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.turn.result",
+        "turn_id": "turn-default",
+        "status": "error",
+        "final_message": "The engine returned an error."
+      },
+      "canonical": "{\"final_message\":\"The engine returned an error.\",\"id\":\"m-session-turn-result-3\",\"status\":\"error\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-default\",\"type\":\"session.turn.result\"}"
+    },
+    {
+      "label": "session.error-request-id-only",
+      "type": "session.error",
+      "message": {
+        "id": "m-session-error-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.error",
+        "request_id": "req-resume-5",
+        "code": "invalid_request",
+        "message": "The requested session is inactive."
+      },
+      "canonical": "{\"code\":\"invalid_request\",\"id\":\"m-session-error-1\",\"message\":\"The requested session is inactive.\",\"request_id\":\"req-resume-5\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.error\"}"
+    },
+    {
+      "label": "session.error-turn-id-only",
+      "type": "session.error",
+      "message": {
+        "id": "m-session-error-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.error",
+        "turn_id": "turn-main",
+        "code": "engine_error",
+        "message": "The engine process exited unexpectedly."
+      },
+      "canonical": "{\"code\":\"engine_error\",\"id\":\"m-session-error-2\",\"message\":\"The engine process exited unexpectedly.\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.error\"}"
+    }
+  ],
+  "negatives": [
+    {
+      "label": "session.ack-ack_seq-zero",
+      "reason": "non-positive-int",
+      "raw": {
+        "id": "m-session-neg-ack",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.ack",
+        "turn_id": "turn-main",
+        "ack_seq": 0
+      }
+    },
+    {
+      "label": "session.event-seq-zero",
+      "reason": "non-positive-int",
+      "raw": {
+        "id": "m-session-neg-event",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.event",
+        "turn_id": "turn-main",
+        "seq": 0,
+        "event": {
+          "kind": "assistant_text",
+          "text": "hello"
+        }
+      }
+    },
+    {
+      "label": "session.list.request-page-limit-zero",
+      "reason": "non-positive-int",
+      "raw": {
+        "id": "m-session-neg-list",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.request",
+        "request_id": "req-list-neg",
+        "page": {
+          "limit": 0
+        }
+      }
+    },
+    {
+      "label": "session.list.request-filter-engine-null",
+      "reason": "null-on-non-nullable",
+      "raw": {
+        "id": "m-session-neg-list",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.request",
+        "request_id": "req-list-neg",
+        "filter": {
+          "engine": null
+        }
+      }
+    },
+    {
+      "label": "session.resume.request-options-model-null",
+      "reason": "null-on-non-nullable",
+      "raw": {
+        "id": "m-session-neg-resume",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.resume.request",
+        "request_id": "req-resume-neg",
+        "handle": "sess-main",
+        "message": "Continue from the last step.",
+        "options": {
+          "model": null
+        }
+      }
+    },
+    {
+      "label": "session.ack-unknown-top-level-field",
+      "reason": "strict-unknown-field",
+      "raw": {
+        "id": "m-session-neg-ack",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.ack",
+        "turn_id": "turn-main",
+        "ack_seq": 1,
+        "unexpected": true
+      }
+    },
+    {
+      "label": "session.event-kind-not-a-kind",
+      "reason": "bad-event-kind",
+      "raw": {
+        "id": "m-session-neg-event",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.event",
+        "turn_id": "turn-main",
+        "seq": 1,
+        "event": {
+          "kind": "not.a.kind"
+        }
+      }
+    },
+    {
+      "label": "session.event-kind-vendor-gemini",
+      "reason": "bad-event-kind",
+      "raw": {
+        "id": "m-session-neg-event",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.event",
+        "turn_id": "turn-main",
+        "seq": 1,
+        "event": {
+          "kind": "vendor.gemini.foo"
+        }
+      }
+    },
+    {
+      "label": "v1-hello-capabilities-sessions",
+      "reason": "v1-rejects-session-cap",
+      "raw": {
+        "id": "m-session-neg-hello",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "hello",
+        "protocol_version": "1.0.0",
+        "agent_id": "agent-abc",
+        "agent_version": "1.0.0",
+        "auth": {
+          "challenge_id": "ch-1",
+          "key_id": "key-1",
+          "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "alg": "ed25519"
+        },
+        "os": {
+          "platform": "darwin",
+          "arch": "arm64",
+          "release": "25.5.0"
+        },
+        "capabilities": {
+          "engines": {
+            "claude": {
+              "installed": true,
+              "version": "2.1.170",
+              "logged_in": true
+            },
+            "codex": {
+              "installed": true,
+              "version": "0.140.0",
+              "logged_in": false
+            }
+          },
+          "project_roots": [
+            "/work/repo"
+          ],
+          "sessions": {
+            "supported": true
+          }
+        },
+        "active_jobs": [],
+        "pending_results": []
+      }
+    }
+  ]
+}
