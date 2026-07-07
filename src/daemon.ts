@@ -60,7 +60,7 @@ export class Daemon {
     /** Whether the approval gate is usable (startup isolation self-check). When
      *  false, gated (write/exec) jobs are rejected — fail closed. */
     gateAvailable = true,
-    private readonly sessionEnumerator?: Pick<SessionEnumerator, "list" | "validateHandle" | "registerForked">,
+    private readonly sessionEnumerator?: Pick<SessionEnumerator, "list" | "validateHandle" | "registerForked" | "readHistory">,
     resumeRunners?: ResumeRunner | ResumeRunnerRegistry,
     private readonly engineCapabilities: EngineCapabilities = { claude: { installed: false }, codex: { installed: false } },
   ) {
@@ -230,6 +230,37 @@ export class Daemon {
                 next_cursor: result.next_cursor,
                 truncated: result.truncated,
               });
+            }
+            break;
+          case "session.history.request":
+            {
+              const res = this.sessionEnumerator?.readHistory(m.handle, { cursor: m.cursor, limit: m.limit });
+              if (!res) {
+                this.safeSend({
+                  ...envelope(),
+                  type: "session.error",
+                  request_id: m.request_id,
+                  code: "history_unavailable",
+                  message: "session history is unavailable",
+                });
+              } else if (res.ok) {
+                this.safeSend({
+                  ...envelope(),
+                  type: "session.history.response",
+                  request_id: m.request_id,
+                  entries: res.entries,
+                  next_cursor: res.next_cursor,
+                  truncated: res.truncated,
+                });
+              } else {
+                this.safeSend({
+                  ...envelope(),
+                  type: "session.error",
+                  request_id: m.request_id,
+                  code: res.code,
+                  message: `history fetch failed: ${res.code}`,
+                });
+              }
             }
             break;
           case "session.resume.request":

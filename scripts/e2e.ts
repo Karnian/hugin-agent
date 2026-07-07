@@ -2734,6 +2734,196 @@ async function scenarioAP(): Promise<void> {
   }
 }
 
+async function scenarioAW(): Promise<void> {
+  type SessionHistoryResponse = Extract<MessageV2, { type: "session.history.response" }>;
+  type SessionError = Extract<MessageV2, { type: "session.error" }>;
+
+  const fx1 = createSessionFixtureStore();
+  try {
+    const enumerator = fixtureEnumerator(fx1);
+    const handle = byEngine(enumerator.list({}).sessions, "claude")?.handle;
+    const aw1 = { response: null as SessionHistoryResponse | null, error: null as SessionError | null };
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionHistoryAfterAccept: { request_id: "aw1-history", handle: handle ?? "missing", limit: 5 },
+      onSessionHistoryResponse: (m) => {
+        aw1.response = m;
+      },
+      onSessionError: (m) => {
+        aw1.error = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-aw1",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx1.allowRoot],
+      }),
+      devSigner("key-aw1"),
+      new FakeEngine({ events: [] }),
+      true,
+      enumerator,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => aw1.response !== null || aw1.error !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    const first = aw1.response?.entries[0];
+    check(
+      "AW1 v2 session.history.request returns entries for a valid handle",
+      typeof handle === "string" &&
+        aw1.error === null &&
+        aw1.response?.request_id === "aw1-history" &&
+        Array.isArray(aw1.response.entries) &&
+        aw1.response.entries.length > 0 &&
+        typeof first?.entry_id === "string" &&
+        first.entry_id.length > 0 &&
+        (first?.role === "user" || first?.role === "assistant") &&
+        typeof first?.content === "string",
+    );
+  } finally {
+    rmSync(fx1.base, { recursive: true, force: true });
+  }
+
+  const fx2 = createSessionFixtureStore();
+  try {
+    const aw2 = { response: null as SessionHistoryResponse | null, error: null as SessionError | null };
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionHistoryAfterAccept: { request_id: "aw2-history", handle: "h_missing" },
+      onSessionHistoryResponse: (m) => {
+        aw2.response = m;
+      },
+      onSessionError: (m) => {
+        aw2.error = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-aw2",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx2.allowRoot],
+      }),
+      devSigner("key-aw2"),
+      new FakeEngine({ events: [] }),
+      true,
+      fixtureEnumerator(fx2),
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => aw2.error !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AW2 bogus history handle returns session.error handle_invalid",
+      aw2.error?.request_id === "aw2-history" && aw2.error.code === "handle_invalid" && aw2.response === null,
+    );
+  } finally {
+    rmSync(fx2.base, { recursive: true, force: true });
+  }
+
+  const fx3 = createSessionFixtureStore();
+  try {
+    const enumerator = fixtureEnumerator(fx3);
+    const handle = byEngine(enumerator.list({}).sessions, "claude")?.handle;
+    const aw3 = { response: null as SessionHistoryResponse | null, error: null as SessionError | null };
+    const relay = new MockRelay({
+      supportedVersions: [PROTOCOL_VERSION, PROTOCOL_VERSION_V2],
+      sendSessionHistoryAfterAccept: { request_id: "aw3-history", handle: handle ?? "missing", cursor: "not a cursor!", limit: 2 },
+      onSessionHistoryResponse: (m) => {
+        aw3.response = m;
+      },
+      onSessionError: (m) => {
+        aw3.error = m;
+      },
+    });
+    const port = await relay.start();
+    const daemon = new Daemon(
+      loadConfig({
+        serverUrl: `ws://127.0.0.1:${port}`,
+        agentId: "agent-aw3",
+        dbPath: ":memory:",
+        protocolVersion: PROTOCOL_VERSION_V2,
+        projectRoots: [fx3.allowRoot],
+      }),
+      devSigner("key-aw3"),
+      new FakeEngine({ events: [] }),
+      true,
+      enumerator,
+    );
+    try {
+      void daemon.start().catch(() => {});
+      await waitUntil(() => aw3.error !== null, 5000);
+    } finally {
+      daemon.stop();
+      await relay.stop();
+      await sleep(50);
+    }
+    check(
+      "AW3 malformed history cursor returns session.error cursor_invalid",
+      typeof handle === "string" && aw3.error?.request_id === "aw3-history" && aw3.error.code === "cursor_invalid" && aw3.response === null,
+    );
+  } finally {
+    rmSync(fx3.base, { recursive: true, force: true });
+  }
+
+  let aw4Accepted = 0;
+  const aw4 = { response: null as SessionHistoryResponse | null };
+  const relay = new MockRelay({
+    supportedVersions: [PROTOCOL_VERSION],
+    sendSessionHistoryAfterAccept: { request_id: "aw4-history", handle: "h_missing" },
+    onAccept: () => {
+      aw4Accepted++;
+    },
+    onSessionHistoryResponse: (m) => {
+      aw4.response = m;
+    },
+  });
+  const port = await relay.start();
+  const daemon = new Daemon(
+    loadConfig({
+      serverUrl: `ws://127.0.0.1:${port}`,
+      agentId: "agent-aw4",
+      dbPath: ":memory:",
+      protocolVersion: PROTOCOL_VERSION,
+    }),
+    devSigner("key-aw4"),
+    new FakeEngine({ events: [] }),
+  );
+  try {
+    void daemon.start().catch(() => {});
+    await waitUntil(() => aw4Accepted > 0, 5000);
+    await sleep(300);
+  } finally {
+    daemon.stop();
+    await relay.stop();
+    await sleep(50);
+  }
+  const aw4Frame = JSON.stringify({
+    id: "aw4-direct",
+    ts: "2026-07-01T00:00:00.000Z",
+    type: "session.history.request",
+    request_id: "aw4-history",
+    handle: "h_missing",
+  });
+  const aw4Decode = decodeInbound(aw4Frame, { receiver: "agent", authed: true });
+  check("AW4 v1 decoder rejects session.history.request as invalid_message", !aw4Decode.ok && aw4Decode.code === "invalid_message");
+  check("AW4 v1 daemon does not reply with session.history.response", aw4Accepted > 0 && aw4.response === null);
+}
+
 function jsonlFixture(records: readonly unknown[]): string {
   return `${records.map((r) => JSON.stringify(r)).join("\n")}\n`;
 }
@@ -4098,6 +4288,8 @@ async function main(): Promise<void> {
   await scenarioAO();
   console.log("\n[scenario AP: fixture-backed session enumeration]");
   await scenarioAP();
+  console.log("\n[scenario AW: v2 session history handler]");
+  await scenarioAW();
   console.log("\n[scenario AV: session history reader]");
   scenarioAV();
   console.log("\n[scenario AQ: v2 session resume turn]");
