@@ -58,6 +58,7 @@
         "sessions": [
           {
             "handle": "sess-main",
+            "session_id": "s_0123456789abcdef0123456789abcdef",
             "engine": "codex",
             "cwd": "/work/repo",
             "git_branch": "main",
@@ -72,7 +73,7 @@
         "next_cursor": null,
         "truncated": false
       },
-      "canonical": "{\"id\":\"m-session-list-resp-2\",\"next_cursor\":null,\"request_id\":\"req-list-2\",\"sessions\":[{\"active\":true,\"cli_version\":\"0.140.0\",\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/repo\",\"engine\":\"codex\",\"git_branch\":\"main\",\"handle\":\"sess-main\",\"msg_count\":3,\"title\":\"Investigate failing test\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
+      "canonical": "{\"id\":\"m-session-list-resp-2\",\"next_cursor\":null,\"request_id\":\"req-list-2\",\"sessions\":[{\"active\":true,\"cli_version\":\"0.140.0\",\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/repo\",\"engine\":\"codex\",\"git_branch\":\"main\",\"handle\":\"sess-main\",\"msg_count\":3,\"session_id\":\"s_0123456789abcdef0123456789abcdef\",\"title\":\"Investigate failing test\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
     },
     {
       "label": "session.list.response-one-session-next-cursor-omitted",
@@ -85,6 +86,7 @@
         "sessions": [
           {
             "handle": "sess-no-meta",
+            "session_id": "s_fedcba9876543210fedcba9876543210",
             "engine": "claude",
             "cwd": "/work/other",
             "git_branch": null,
@@ -98,7 +100,7 @@
         ],
         "truncated": false
       },
-      "canonical": "{\"id\":\"m-session-list-resp-3\",\"request_id\":\"req-list-3\",\"sessions\":[{\"active\":false,\"cli_version\":null,\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/other\",\"engine\":\"claude\",\"git_branch\":null,\"handle\":\"sess-no-meta\",\"msg_count\":1,\"title\":\"Draft migration plan\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
+      "canonical": "{\"id\":\"m-session-list-resp-3\",\"request_id\":\"req-list-3\",\"sessions\":[{\"active\":false,\"cli_version\":null,\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/other\",\"engine\":\"claude\",\"git_branch\":null,\"handle\":\"sess-no-meta\",\"msg_count\":1,\"session_id\":\"s_fedcba9876543210fedcba9876543210\",\"title\":\"Draft migration plan\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
     },
     {
       "label": "session.resume.request-options-omitted",

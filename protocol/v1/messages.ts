@@ -565,6 +565,7 @@ export const ErrorMsg = z.strictObject({
 
 export const SessionInfo = z.strictObject({
   handle: Id,
+  session_id: Id,
   engine: Engine,
   cwd: z.string(),
   git_branch: z.string().nullable(),

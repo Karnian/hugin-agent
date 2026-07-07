@@ -2587,6 +2587,8 @@ function byEngine(sessions: readonly SessionInfo[], engine: "claude" | "codex"):
   return sessions.find((s) => s.engine === engine) ?? null;
 }
 
+const SESSION_ID_RE = /^s_[0-9a-f]{32}$/;
+
 async function scenarioAP(): Promise<void> {
   type SessionListResponse = Extract<MessageV2, { type: "session.list.response" }>;
   const fx = createSessionFixtureStore();
@@ -2647,7 +2649,24 @@ async function scenarioAP(): Promise<void> {
         !serialized.includes("ASSISTANT_OUTPUT_SECRET") &&
         !serialized.includes("BASE_INSTRUCTIONS_SECRET") &&
         !serialized.includes(fx.base) &&
-        sessions.every((s) => !("content" in s) && !("path" in s) && !("session_id" in s)),
+        sessions.every((s) => !("content" in s) && !("path" in s)),
+    );
+
+    const freshSessions = fixtureEnumerator(fx).list({}).sessions;
+    const freshClaude = byEngine(freshSessions, "claude");
+    const freshCodex = byEngine(freshSessions, "codex");
+    check(
+      "AP4b session_id is opaque, stable, and distinct from handles",
+      sessions.every((s) => SESSION_ID_RE.test(s.session_id) && s.session_id !== s.handle) &&
+        claude?.session_id !== codex?.session_id &&
+        freshClaude?.session_id === claude?.session_id &&
+        freshCodex?.session_id === codex?.session_id &&
+        freshClaude?.handle !== claude?.handle &&
+        freshCodex?.handle !== codex?.handle &&
+        !serialized.includes("11111111-1111-4111-8111-111111111111") &&
+        !serialized.includes("codex-fixture-session") &&
+        !serialized.includes(join(fx.allowRoot, "repo-claude")) &&
+        !serialized.includes(join(fx.allowRoot, "repo-codex")),
     );
 
     const page1 = enumerator.list({ page: { limit: 1 } });
