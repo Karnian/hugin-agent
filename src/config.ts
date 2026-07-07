@@ -4,7 +4,7 @@
  */
 
 import { z } from "zod";
-import { LIMITS, PROTOCOL_VERSION, SemVer } from "../protocol/v1/index";
+import { LIMITS, PROTOCOL_VERSION_V2, SemVer } from "../protocol/v1/index";
 
 /** Matches the wire `AuthId` charset (messages.ts) so a configured `agentId`
  *  can be put on the wire without re-validation. */
@@ -27,7 +27,7 @@ export const Config = z.strictObject({
   /** Daemon version reported in `hello.agent_version`. */
   agentVersion: z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/).max(64).default("0.0.0"),
   /** Protocol version advertised in `hello.protocol_version` and bound into the signed transcript. */
-  protocolVersion: SemVer.default(PROTOCOL_VERSION),
+  protocolVersion: SemVer.default(PROTOCOL_VERSION_V2),
   /** Tenant the device is paired to (off-wire; used only to build the signed
    *  transcript). Grammar 1*128(ALPHA/DIGIT/-/_/.). */
   tenantId: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/).default("dev-tenant"),

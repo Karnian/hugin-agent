@@ -7,7 +7,7 @@
 
 import { randomBytes } from "node:crypto";
 import { WebSocketServer, type WebSocket, type RawData } from "ws";
-import { LIMITS, type Message, type MessageV2, negotiateVersion, PROTOCOL_VERSION } from "../protocol/v1/index";
+import { LIMITS, type Message, type MessageV2, negotiateVersion, PROTOCOL_VERSION, PROTOCOL_VERSION_V2 } from "../protocol/v1/index";
 import { resultDigest } from "../protocol/v1/digest";
 import { buildTranscript } from "../protocol/v1/transcript";
 import { verifyTranscript } from "../protocol/v1/ed25519";
@@ -109,7 +109,7 @@ export interface MockRelayOpts {
   onHeartbeat?: () => void;
   /** Heartbeat interval advertised in `hello.accepted` (default: LIMITS value). */
   heartbeatIntervalMs?: number;
-  /** Protocol versions this mock relay can negotiate (default: ["1.0.0"]). */
+  /** Protocol versions this mock relay can negotiate (default: ["1.0.0", "2.0.0"]). */
   supportedVersions?: readonly string[];
   /** Test hook: force the exact accepted negotiated_version after normal negotiation succeeds. */
   forceNegotiatedVersion?: string;
@@ -280,7 +280,7 @@ export class MockRelay {
           log.warn("[mock] ignoring duplicate hello on an already-authenticated connection");
           return;
         }
-        const negotiated = negotiateVersion(m.protocol_version, this.opts.supportedVersions ?? [PROTOCOL_VERSION]);
+        const negotiated = negotiateVersion(m.protocol_version, this.opts.supportedVersions ?? [PROTOCOL_VERSION, PROTOCOL_VERSION_V2]);
         if (!negotiated.ok) {
           log.warn("[mock] hello rejected", { code: "unsupported_version", reason: negotiated.reason });
           this.send(ws, {

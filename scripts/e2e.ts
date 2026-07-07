@@ -2290,8 +2290,14 @@ async function scenarioAN(): Promise<void> {
       HUGIND_AGENT_ID: "agent-an-env",
     } as NodeJS.ProcessEnv;
     const unset = loadConfigFromEnv(baseEnv);
+    const v1 = loadConfigFromEnv({ ...baseEnv, HUGIND_PROTOCOL_VERSION: PROTOCOL_VERSION } as NodeJS.ProcessEnv);
     const v2 = loadConfigFromEnv({ ...baseEnv, HUGIND_PROTOCOL_VERSION: PROTOCOL_VERSION_V2 } as NodeJS.ProcessEnv);
-    check("AN0 HUGIND_PROTOCOL_VERSION unset defaults to 1.0.0 and env 2.0.0 selects v2", unset.protocolVersion === PROTOCOL_VERSION && v2.protocolVersion === PROTOCOL_VERSION_V2);
+    check(
+      "AN0 HUGIND_PROTOCOL_VERSION unset defaults to 2.0.0; env 1.0.0 downgrades; env 2.0.0 stays v2",
+      unset.protocolVersion === PROTOCOL_VERSION_V2 &&
+        v1.protocolVersion === PROTOCOL_VERSION &&
+        v2.protocolVersion === PROTOCOL_VERSION_V2,
+    );
   } finally {
     if (prevConfig !== undefined) process.env.HUGIND_CONFIG = prevConfig;
     else delete process.env.HUGIND_CONFIG;
@@ -2362,9 +2368,10 @@ process.exit(1);
 
   const an1 = await versionHandshake({
     agentId: "agent-an1",
+    protocolVersion: PROTOCOL_VERSION,
     supportedVersions: [PROTOCOL_VERSION],
   });
-  check("AN1 default daemon + v1-only relay negotiates 1.0.0", an1.ok && an1.negotiatedVersion === PROTOCOL_VERSION);
+  check("AN1 explicit-v1 daemon + v1-only relay negotiates 1.0.0", an1.ok && an1.negotiatedVersion === PROTOCOL_VERSION);
 
   const an2 = await versionHandshake({
     agentId: "agent-an2",
@@ -2381,7 +2388,7 @@ process.exit(1);
   check("AN3 v2 daemon + v1-only relay fails with unsupported_version", !an3.ok && an3.message.includes("hello.rejected: unsupported_version"));
 
   const an4 = await versionHandshake({ agentId: "agent-an4" });
-  check("AN4 default existing-style handshake still negotiates 1.0.0", an4.ok && an4.negotiatedVersion === PROTOCOL_VERSION);
+  check("AN4 default daemon + default relay negotiates 2.0.0", an4.ok && an4.negotiatedVersion === PROTOCOL_VERSION_V2);
 
   const an5 = await versionHandshake({
     agentId: "agent-an5",
@@ -2453,6 +2460,10 @@ async function scenarioAO(): Promise<void> {
       serverUrl: `ws://127.0.0.1:${ao2Port}`,
       agentId: "agent-ao2",
       dbPath: ":memory:",
+      // Explicit v1 daemon: AO2 verifies a v1-NEGOTIATED connection gates
+      // session.* (the daemon default is now v2 — issue #12 — so pin v1 here to
+      // negotiate 1.0.0 with this v1-only relay and exercise the gate).
+      protocolVersion: PROTOCOL_VERSION,
     }),
     devSigner("key-ao2"),
     new FakeEngine({ events: [] }),
