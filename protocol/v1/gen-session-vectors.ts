@@ -44,6 +44,10 @@ export type SessionNegativeReason =
   | "null-on-non-nullable"
   | "strict-unknown-field"
   | "bad-event-kind"
+  | "bad-session-history-role"
+  | "bad-session-history-omitted-kind"
+  | "bad-session-tool-status"
+  | "missing-required-field"
   | "v1-rejects-session-cap";
 
 export interface SessionNegativeVector {
@@ -71,6 +75,8 @@ const SIG = "A".repeat(86);
 const REQUIRED_SESSION_TYPES = [
   "session.list.request",
   "session.list.response",
+  "session.history.request",
+  "session.history.response",
   "session.resume.request",
   "session.resume.accept",
   "session.resume.reject",
@@ -113,6 +119,90 @@ const sessionInfoNulls = {
   active: false,
   msg_count: 1,
 } as const;
+
+type SessionHistoryResponseMessage = Extract<SessionPositiveMessage, { type: "session.history.response" }>;
+type SessionHistoryEntryVector = SessionHistoryResponseMessage["entries"][number];
+
+const historyUserTextEntry: SessionHistoryEntryVector = {
+  entry_id: "hist-entry-user-text",
+  role: "user",
+  content: "Please inspect the failing snapshot.",
+  created_at: TS,
+};
+
+const historyAssistantTextEntry: SessionHistoryEntryVector = {
+  entry_id: "hist-entry-assistant-text",
+  role: "assistant",
+  content: "I checked the snapshot and found the mismatch.",
+  created_at: TS_LATER,
+};
+
+const historyAssistantToolOnlyEntry: SessionHistoryEntryVector = {
+  entry_id: "hist-entry-assistant-tool-only",
+  role: "assistant",
+  content: "",
+  tool_calls: [
+    {
+      id: "call-matched",
+      name: "shell",
+      input: "npm test",
+      output: "Tests passed.",
+      status: "ok",
+    },
+  ],
+  created_at: TS,
+};
+
+const historyAssistantToolOutputCasesEntry: SessionHistoryEntryVector = {
+  entry_id: "hist-entry-assistant-tool-output-cases",
+  role: "assistant",
+  content: "Collected command results.",
+  tool_calls: [
+    {
+      id: "call-unmatched",
+      name: "read_file",
+      input: "protocol/v1/messages.ts",
+    },
+    {
+      id: "call-completed-no-output",
+      name: "noop",
+      input: "{}",
+      status: "ok",
+    },
+    {
+      id: "call-truncated",
+      name: "shell",
+      input: "printf '%s' '<large input>'",
+      input_truncated: true,
+      output: "<large output>",
+      output_truncated: true,
+      status: "ok",
+    },
+  ],
+  created_at: TS_LATER,
+};
+
+const historyAssistantOmittedEntry: SessionHistoryEntryVector = {
+  entry_id: "hist-entry-assistant-omitted",
+  role: "assistant",
+  content: "Some non-text content was omitted.",
+  omitted: [
+    { kind: "image", count: 1 },
+    { kind: "document", count: 1 },
+    { kind: "thinking", count: 1 },
+    { kind: "fallback", count: 1 },
+    { kind: "other", count: 1 },
+  ],
+  created_at: null,
+};
+
+const historyAssistantContentTruncatedEntry: SessionHistoryEntryVector = {
+  entry_id: "hist-entry-assistant-content-truncated",
+  role: "assistant",
+  content: "Partial transcript text",
+  content_truncated: true,
+  created_at: TS,
+};
 
 function issueSummary(error: { issues: Array<{ path: PropertyKey[]; message: string }> }): string {
   return error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ");
@@ -164,6 +254,30 @@ function buildNegatives(): SessionNegativeVector[] {
     handle: "sess-main",
     message: "Continue from the last step.",
   };
+  const historyRequest = {
+    ...base("m-session-neg-history-request"),
+    type: "session.history.request",
+    request_id: "req-history-neg",
+    handle: "sess-main",
+  };
+  const historyEntry = {
+    entry_id: "hist-entry-neg",
+    role: "user",
+    content: "History entry text.",
+    created_at: TS,
+  };
+  const historyResponse = {
+    ...base("m-session-neg-history-response"),
+    type: "session.history.response",
+    request_id: "req-history-neg",
+    entries: [historyEntry],
+    truncated: false,
+  };
+  const historyToolCall = {
+    id: "call-neg",
+    name: "shell",
+    input: "echo hi",
+  };
   const helloWithSessionCapability = {
     ...base("m-session-neg-hello"),
     type: "hello",
@@ -202,6 +316,46 @@ function buildNegatives(): SessionNegativeVector[] {
     negative("session.ack-unknown-top-level-field", "strict-unknown-field", {
       ...ack,
       unexpected: true,
+    }),
+    negative("session.history.request-limit-zero", "non-positive-int", {
+      ...historyRequest,
+      limit: 0,
+    }),
+    negative("session.history.request-unknown-top-level-field", "strict-unknown-field", {
+      ...historyRequest,
+      unexpected: true,
+    }),
+    negative("session.history.response-unknown-top-level-field", "strict-unknown-field", {
+      ...historyResponse,
+      unexpected: true,
+    }),
+    negative("session.history.response-entry-role-system", "bad-session-history-role", {
+      ...historyResponse,
+      entries: [{ ...historyEntry, role: "system" }],
+    }),
+    negative("session.history.response-omitted-kind-video", "bad-session-history-omitted-kind", {
+      ...historyResponse,
+      entries: [{ ...historyEntry, omitted: [{ kind: "video", count: 1 }] }],
+    }),
+    negative("session.history.response-omitted-count-zero", "non-positive-int", {
+      ...historyResponse,
+      entries: [{ ...historyEntry, omitted: [{ kind: "image", count: 0 }] }],
+    }),
+    negative("session.history.response-entry-missing-entry-id", "missing-required-field", {
+      ...historyResponse,
+      entries: [{ role: "user", content: "Missing entry id.", created_at: TS }],
+    }),
+    negative("session.history.response-tool-call-missing-id", "missing-required-field", {
+      ...historyResponse,
+      entries: [{ ...historyEntry, tool_calls: [{ name: "shell" }] }],
+    }),
+    negative("session.history.response-entry-missing-created-at", "missing-required-field", {
+      ...historyResponse,
+      entries: [{ entry_id: "hist-entry-missing-created-at", role: "user", content: "Missing created_at." }],
+    }),
+    negative("session.history.response-tool-call-status-pending", "bad-session-tool-status", {
+      ...historyResponse,
+      entries: [{ ...historyEntry, tool_calls: [{ ...historyToolCall, status: "pending" }] }],
     }),
     negative("session.event-kind-not-a-kind", "bad-event-kind", {
       ...event,
@@ -250,6 +404,50 @@ export function buildSessionVectors(): SessionVectorsFile {
       type: "session.list.response",
       request_id: "req-list-3",
       sessions: [sessionInfoNulls],
+      truncated: false,
+    }),
+    positive("session.history.request-minimal", {
+      ...base("m-session-history-req-1"),
+      type: "session.history.request",
+      request_id: "req-history-1",
+      handle: "sess-main",
+    }),
+    positive("session.history.request-cursor-limit", {
+      ...base("m-session-history-req-2"),
+      type: "session.history.request",
+      request_id: "req-history-2",
+      handle: "sess-main",
+      cursor: "history-cursor-1",
+      limit: 4,
+    }),
+    positive("session.history.response-empty-page-next-cursor-omitted", {
+      ...base("m-session-history-resp-1"),
+      type: "session.history.response",
+      request_id: "req-history-1",
+      entries: [],
+      truncated: false,
+    }),
+    positive("session.history.response-next-cursor-string", {
+      ...base("m-session-history-resp-2"),
+      type: "session.history.response",
+      request_id: "req-history-2",
+      entries: [historyUserTextEntry, historyAssistantTextEntry],
+      next_cursor: "history-cursor-2",
+      truncated: true,
+    }),
+    positive("session.history.response-next-cursor-null", {
+      ...base("m-session-history-resp-3"),
+      type: "session.history.response",
+      request_id: "req-history-3",
+      entries: [historyAssistantToolOnlyEntry, historyAssistantToolOutputCasesEntry],
+      next_cursor: null,
+      truncated: false,
+    }),
+    positive("session.history.response-rich-entries-next-cursor-omitted", {
+      ...base("m-session-history-resp-4"),
+      type: "session.history.response",
+      request_id: "req-history-4",
+      entries: [historyAssistantOmittedEntry, historyAssistantContentTruncatedEntry],
       truncated: false,
     }),
     positive("session.resume.request-options-omitted", {
@@ -362,6 +560,27 @@ export function buildSessionVectors(): SessionVectorsFile {
       turn_id: "turn-main",
       code: "engine_error",
       message: "The engine process exited unexpectedly.",
+    }),
+    positive("session.error-history-unavailable", {
+      ...base("m-session-error-history-unavailable"),
+      type: "session.error",
+      request_id: "req-history-5",
+      code: "history_unavailable",
+      message: "Session history is unavailable.",
+    }),
+    positive("session.error-file-unreadable", {
+      ...base("m-session-error-file-unreadable"),
+      type: "session.error",
+      request_id: "req-history-6",
+      code: "file_unreadable",
+      message: "Session history file could not be read.",
+    }),
+    positive("session.error-payload-too-large", {
+      ...base("m-session-error-payload-too-large"),
+      type: "session.error",
+      request_id: "req-history-7",
+      code: "payload_too_large",
+      message: "Session history payload is too large.",
     }),
   ];
 

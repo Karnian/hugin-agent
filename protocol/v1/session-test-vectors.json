@@ -103,6 +103,179 @@
       "canonical": "{\"id\":\"m-session-list-resp-3\",\"request_id\":\"req-list-3\",\"sessions\":[{\"active\":false,\"cli_version\":null,\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/other\",\"engine\":\"claude\",\"git_branch\":null,\"handle\":\"sess-no-meta\",\"msg_count\":1,\"session_id\":\"s_fedcba9876543210fedcba9876543210\",\"title\":\"Draft migration plan\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
     },
     {
+      "label": "session.history.request-minimal",
+      "type": "session.history.request",
+      "message": {
+        "id": "m-session-history-req-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.request",
+        "request_id": "req-history-1",
+        "handle": "sess-main"
+      },
+      "canonical": "{\"handle\":\"sess-main\",\"id\":\"m-session-history-req-1\",\"request_id\":\"req-history-1\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.history.request\"}"
+    },
+    {
+      "label": "session.history.request-cursor-limit",
+      "type": "session.history.request",
+      "message": {
+        "id": "m-session-history-req-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.request",
+        "request_id": "req-history-2",
+        "handle": "sess-main",
+        "cursor": "history-cursor-1",
+        "limit": 4
+      },
+      "canonical": "{\"cursor\":\"history-cursor-1\",\"handle\":\"sess-main\",\"id\":\"m-session-history-req-2\",\"limit\":4,\"request_id\":\"req-history-2\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.history.request\"}"
+    },
+    {
+      "label": "session.history.response-empty-page-next-cursor-omitted",
+      "type": "session.history.response",
+      "message": {
+        "id": "m-session-history-resp-1",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-1",
+        "entries": [],
+        "truncated": false
+      },
+      "canonical": "{\"entries\":[],\"id\":\"m-session-history-resp-1\",\"request_id\":\"req-history-1\",\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.history.response\"}"
+    },
+    {
+      "label": "session.history.response-next-cursor-string",
+      "type": "session.history.response",
+      "message": {
+        "id": "m-session-history-resp-2",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-2",
+        "entries": [
+          {
+            "entry_id": "hist-entry-user-text",
+            "role": "user",
+            "content": "Please inspect the failing snapshot.",
+            "created_at": "2026-01-01T00:00:00.000Z"
+          },
+          {
+            "entry_id": "hist-entry-assistant-text",
+            "role": "assistant",
+            "content": "I checked the snapshot and found the mismatch.",
+            "created_at": "2026-01-01T00:01:00.000Z"
+          }
+        ],
+        "next_cursor": "history-cursor-2",
+        "truncated": true
+      },
+      "canonical": "{\"entries\":[{\"content\":\"Please inspect the failing snapshot.\",\"created_at\":\"2026-01-01T00:00:00.000Z\",\"entry_id\":\"hist-entry-user-text\",\"role\":\"user\"},{\"content\":\"I checked the snapshot and found the mismatch.\",\"created_at\":\"2026-01-01T00:01:00.000Z\",\"entry_id\":\"hist-entry-assistant-text\",\"role\":\"assistant\"}],\"id\":\"m-session-history-resp-2\",\"next_cursor\":\"history-cursor-2\",\"request_id\":\"req-history-2\",\"truncated\":true,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.history.response\"}"
+    },
+    {
+      "label": "session.history.response-next-cursor-null",
+      "type": "session.history.response",
+      "message": {
+        "id": "m-session-history-resp-3",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-3",
+        "entries": [
+          {
+            "entry_id": "hist-entry-assistant-tool-only",
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call-matched",
+                "name": "shell",
+                "input": "npm test",
+                "output": "Tests passed.",
+                "status": "ok"
+              }
+            ],
+            "created_at": "2026-01-01T00:00:00.000Z"
+          },
+          {
+            "entry_id": "hist-entry-assistant-tool-output-cases",
+            "role": "assistant",
+            "content": "Collected command results.",
+            "tool_calls": [
+              {
+                "id": "call-unmatched",
+                "name": "read_file",
+                "input": "protocol/v1/messages.ts"
+              },
+              {
+                "id": "call-completed-no-output",
+                "name": "noop",
+                "input": "{}",
+                "status": "ok"
+              },
+              {
+                "id": "call-truncated",
+                "name": "shell",
+                "input": "printf '%s' '<large input>'",
+                "input_truncated": true,
+                "output": "<large output>",
+                "output_truncated": true,
+                "status": "ok"
+              }
+            ],
+            "created_at": "2026-01-01T00:01:00.000Z"
+          }
+        ],
+        "next_cursor": null,
+        "truncated": false
+      },
+      "canonical": "{\"entries\":[{\"content\":\"\",\"created_at\":\"2026-01-01T00:00:00.000Z\",\"entry_id\":\"hist-entry-assistant-tool-only\",\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call-matched\",\"input\":\"npm test\",\"name\":\"shell\",\"output\":\"Tests passed.\",\"status\":\"ok\"}]},{\"content\":\"Collected command results.\",\"created_at\":\"2026-01-01T00:01:00.000Z\",\"entry_id\":\"hist-entry-assistant-tool-output-cases\",\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call-unmatched\",\"input\":\"protocol/v1/messages.ts\",\"name\":\"read_file\"},{\"id\":\"call-completed-no-output\",\"input\":\"{}\",\"name\":\"noop\",\"status\":\"ok\"},{\"id\":\"call-truncated\",\"input\":\"printf '%s' '<large input>'\",\"input_truncated\":true,\"name\":\"shell\",\"output\":\"<large output>\",\"output_truncated\":true,\"status\":\"ok\"}]}],\"id\":\"m-session-history-resp-3\",\"next_cursor\":null,\"request_id\":\"req-history-3\",\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.history.response\"}"
+    },
+    {
+      "label": "session.history.response-rich-entries-next-cursor-omitted",
+      "type": "session.history.response",
+      "message": {
+        "id": "m-session-history-resp-4",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-4",
+        "entries": [
+          {
+            "entry_id": "hist-entry-assistant-omitted",
+            "role": "assistant",
+            "content": "Some non-text content was omitted.",
+            "omitted": [
+              {
+                "kind": "image",
+                "count": 1
+              },
+              {
+                "kind": "document",
+                "count": 1
+              },
+              {
+                "kind": "thinking",
+                "count": 1
+              },
+              {
+                "kind": "fallback",
+                "count": 1
+              },
+              {
+                "kind": "other",
+                "count": 1
+              }
+            ],
+            "created_at": null
+          },
+          {
+            "entry_id": "hist-entry-assistant-content-truncated",
+            "role": "assistant",
+            "content": "Partial transcript text",
+            "content_truncated": true,
+            "created_at": "2026-01-01T00:00:00.000Z"
+          }
+        ],
+        "truncated": false
+      },
+      "canonical": "{\"entries\":[{\"content\":\"Some non-text content was omitted.\",\"created_at\":null,\"entry_id\":\"hist-entry-assistant-omitted\",\"omitted\":[{\"count\":1,\"kind\":\"image\"},{\"count\":1,\"kind\":\"document\"},{\"count\":1,\"kind\":\"thinking\"},{\"count\":1,\"kind\":\"fallback\"},{\"count\":1,\"kind\":\"other\"}],\"role\":\"assistant\"},{\"content\":\"Partial transcript text\",\"content_truncated\":true,\"created_at\":\"2026-01-01T00:00:00.000Z\",\"entry_id\":\"hist-entry-assistant-content-truncated\",\"role\":\"assistant\"}],\"id\":\"m-session-history-resp-4\",\"request_id\":\"req-history-4\",\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.history.response\"}"
+    },
+    {
       "label": "session.resume.request-options-omitted",
       "type": "session.resume.request",
       "message": {
@@ -327,6 +500,45 @@
         "message": "The engine process exited unexpectedly."
       },
       "canonical": "{\"code\":\"engine_error\",\"id\":\"m-session-error-2\",\"message\":\"The engine process exited unexpectedly.\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"turn_id\":\"turn-main\",\"type\":\"session.error\"}"
+    },
+    {
+      "label": "session.error-history-unavailable",
+      "type": "session.error",
+      "message": {
+        "id": "m-session-error-history-unavailable",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.error",
+        "request_id": "req-history-5",
+        "code": "history_unavailable",
+        "message": "Session history is unavailable."
+      },
+      "canonical": "{\"code\":\"history_unavailable\",\"id\":\"m-session-error-history-unavailable\",\"message\":\"Session history is unavailable.\",\"request_id\":\"req-history-5\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.error\"}"
+    },
+    {
+      "label": "session.error-file-unreadable",
+      "type": "session.error",
+      "message": {
+        "id": "m-session-error-file-unreadable",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.error",
+        "request_id": "req-history-6",
+        "code": "file_unreadable",
+        "message": "Session history file could not be read."
+      },
+      "canonical": "{\"code\":\"file_unreadable\",\"id\":\"m-session-error-file-unreadable\",\"message\":\"Session history file could not be read.\",\"request_id\":\"req-history-6\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.error\"}"
+    },
+    {
+      "label": "session.error-payload-too-large",
+      "type": "session.error",
+      "message": {
+        "id": "m-session-error-payload-too-large",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.error",
+        "request_id": "req-history-7",
+        "code": "payload_too_large",
+        "message": "Session history payload is too large."
+      },
+      "canonical": "{\"code\":\"payload_too_large\",\"id\":\"m-session-error-payload-too-large\",\"message\":\"Session history payload is too large.\",\"request_id\":\"req-history-7\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.error\"}"
     }
   ],
   "negatives": [
@@ -407,6 +619,206 @@
         "turn_id": "turn-main",
         "ack_seq": 1,
         "unexpected": true
+      }
+    },
+    {
+      "label": "session.history.request-limit-zero",
+      "reason": "non-positive-int",
+      "raw": {
+        "id": "m-session-neg-history-request",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.request",
+        "request_id": "req-history-neg",
+        "handle": "sess-main",
+        "limit": 0
+      }
+    },
+    {
+      "label": "session.history.request-unknown-top-level-field",
+      "reason": "strict-unknown-field",
+      "raw": {
+        "id": "m-session-neg-history-request",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.request",
+        "request_id": "req-history-neg",
+        "handle": "sess-main",
+        "unexpected": true
+      }
+    },
+    {
+      "label": "session.history.response-unknown-top-level-field",
+      "reason": "strict-unknown-field",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "entry_id": "hist-entry-neg",
+            "role": "user",
+            "content": "History entry text.",
+            "created_at": "2026-01-01T00:00:00.000Z"
+          }
+        ],
+        "truncated": false,
+        "unexpected": true
+      }
+    },
+    {
+      "label": "session.history.response-entry-role-system",
+      "reason": "bad-session-history-role",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "entry_id": "hist-entry-neg",
+            "role": "system",
+            "content": "History entry text.",
+            "created_at": "2026-01-01T00:00:00.000Z"
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "label": "session.history.response-omitted-kind-video",
+      "reason": "bad-session-history-omitted-kind",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "entry_id": "hist-entry-neg",
+            "role": "user",
+            "content": "History entry text.",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "omitted": [
+              {
+                "kind": "video",
+                "count": 1
+              }
+            ]
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "label": "session.history.response-omitted-count-zero",
+      "reason": "non-positive-int",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "entry_id": "hist-entry-neg",
+            "role": "user",
+            "content": "History entry text.",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "omitted": [
+              {
+                "kind": "image",
+                "count": 0
+              }
+            ]
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "label": "session.history.response-entry-missing-entry-id",
+      "reason": "missing-required-field",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "role": "user",
+            "content": "Missing entry id.",
+            "created_at": "2026-01-01T00:00:00.000Z"
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "label": "session.history.response-tool-call-missing-id",
+      "reason": "missing-required-field",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "entry_id": "hist-entry-neg",
+            "role": "user",
+            "content": "History entry text.",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "tool_calls": [
+              {
+                "name": "shell"
+              }
+            ]
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "label": "session.history.response-entry-missing-created-at",
+      "reason": "missing-required-field",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "entry_id": "hist-entry-missing-created-at",
+            "role": "user",
+            "content": "Missing created_at."
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "label": "session.history.response-tool-call-status-pending",
+      "reason": "bad-session-tool-status",
+      "raw": {
+        "id": "m-session-neg-history-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.history.response",
+        "request_id": "req-history-neg",
+        "entries": [
+          {
+            "entry_id": "hist-entry-neg",
+            "role": "user",
+            "content": "History entry text.",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "tool_calls": [
+              {
+                "id": "call-neg",
+                "name": "shell",
+                "input": "echo hi",
+                "status": "pending"
+              }
+            ]
+          }
+        ],
+        "truncated": false
       }
     },
     {
