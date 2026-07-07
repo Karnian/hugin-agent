@@ -20,7 +20,7 @@ import { pathToFileURL } from "node:url";
 import type { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { LIMITS, PROTOCOL_VERSION, PROTOCOL_VERSION_V2, parseMessage, type MessageV2 } from "../protocol/v1/index";
+import { LIMITS, PROTOCOL_VERSION, PROTOCOL_VERSION_V2, parseMessage, safeParseMessageV2, type MessageV2 } from "../protocol/v1/index";
 import { canonicalizeServerOrigin } from "../protocol/v1/origin";
 import { buildTranscript } from "../protocol/v1/transcript";
 import { b64u, deriveKeypairFromSeed, signTranscript, verifyTranscript } from "../protocol/v1/ed25519";
@@ -47,6 +47,13 @@ import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
 import { validateWorkspace } from "../src/workspace/worktree";
 import { SessionEnumerator, type SessionInfo } from "../src/sessions/enumerator";
+import {
+  HISTORY_CONTENT_CAP,
+  HISTORY_TOOL_IO_CAP,
+  HistoryCursorError,
+  buildHistoryEntries,
+  readSessionHistory,
+} from "../src/sessions/history";
 import { SessionResumeManager } from "../src/sessions/resume-manager";
 import { ClaudeResumeRunner, CodexResumeRunner, FakeResumeRunner } from "../src/sessions/resume";
 import { MockRelay, verifyHello, type PairingRecord } from "../mock-relay/server";
@@ -2727,6 +2734,285 @@ async function scenarioAP(): Promise<void> {
   }
 }
 
+function jsonlFixture(records: readonly unknown[]): string {
+  return `${records.map((r) => JSON.stringify(r)).join("\n")}\n`;
+}
+
+function scenarioAV(): void {
+  const claudeSessionId = "claude-av-session";
+  const codexSessionId = "codex-av-session";
+  const longContent = "C".repeat(HISTORY_CONTENT_CAP + 19);
+  const longToolOutput = "O".repeat(HISTORY_TOOL_IO_CAP + 23);
+
+  const claudeContent = jsonlFixture([
+    { type: "system", timestamp: "2026-07-06T00:00:00.000Z", content: "drop" },
+    { type: "user", timestamp: "2026-07-06T00:00:01.000Z", message: { role: "user", content: "  Please inspect.  " } },
+    {
+      type: "assistant",
+      timestamp: "2026-07-06T00:00:02.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: " I'll check. " },
+          { type: "tool_use", id: "cl_call_1", name: "read_file", input: { path: "src/a.ts" } },
+          { type: "tool_use", id: "cl_call_2", name: "shell", input: "npm test" },
+        ],
+      },
+    },
+    { type: "attachment", timestamp: "2026-07-06T00:00:03.000Z", attachment: { name: "drop" } },
+    {
+      type: "user",
+      timestamp: "2026-07-06T00:00:04.000Z",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "cl_call_2", content: "tests ok" }] },
+    },
+    {
+      type: "user",
+      timestamp: "2026-07-06T00:00:05.000Z",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "Here is more context" },
+          { type: "tool_result", tool_use_id: "cl_call_1", content: "file text" },
+        ],
+      },
+    },
+    {
+      type: "assistant",
+      timestamp: "2026-07-06T00:00:06.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "cl_unmatched", name: "no_result", input: { x: 1 } },
+          { type: "tool_use", id: "cl_empty", name: "noop", input: {} },
+        ],
+      },
+    },
+    {
+      type: "user",
+      timestamp: "2026-07-06T00:00:07.000Z",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "cl_empty", content: "" }] },
+    },
+    { type: "user", timestamp: "2026-07-06T00:00:08.000Z", message: { role: "user", content: [{ type: "image", source: "omitted" }] } },
+    { type: "assistant", timestamp: "2026-07-06T00:00:09.000Z", message: { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }] } },
+    {
+      type: "assistant",
+      timestamp: "2026-07-06T00:00:10.000Z",
+      message: { role: "assistant", content: [{ type: "strange_block", value: true }, { type: "fallback", reason: "fallback" }] },
+    },
+    { type: "assistant", timestamp: "2026-07-06T00:00:11.000Z", message: { role: "assistant", content: longContent } },
+    {
+      type: "assistant",
+      timestamp: "2026-07-06T00:00:12.000Z",
+      message: { role: "assistant", content: [{ type: "tool_use", id: "cl_big", name: "shell", input: "printf big" }] },
+    },
+    {
+      type: "user",
+      timestamp: "2026-07-06T00:00:13.000Z",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "cl_big", content: longToolOutput }] },
+    },
+  ]);
+
+  const claudeEntries = buildHistoryEntries("claude", claudeContent, claudeSessionId);
+  const claudeEntriesAgain = buildHistoryEntries("claude", claudeContent, claudeSessionId);
+  const claudeIds = claudeEntries.map((e) => e.entry_id);
+  const claudeFirstTools = claudeEntries.find((e) => e.tool_calls?.some((c) => c.id === "cl_call_1"));
+  const clCall1 = claudeFirstTools?.tool_calls?.find((c) => c.id === "cl_call_1");
+  const clCall2 = claudeFirstTools?.tool_calls?.find((c) => c.id === "cl_call_2");
+  const claudeToolOnly = claudeEntries.find((e) => e.tool_calls?.some((c) => c.id === "cl_unmatched"));
+  const clUnmatched = claudeToolOnly?.tool_calls?.find((c) => c.id === "cl_unmatched");
+  const clEmpty = claudeToolOnly?.tool_calls?.find((c) => c.id === "cl_empty");
+  const clBig = claudeEntries.flatMap((e) => e.tool_calls ?? []).find((c) => c.id === "cl_big");
+  const claudeLong = claudeEntries.find((e) => e.content_truncated === true);
+
+  check(
+    "AV1 Claude keeps only user/assistant entries in chronological order",
+    claudeEntries.length === 9 &&
+      claudeEntries.every((e) => e.role === "user" || e.role === "assistant") &&
+      claudeEntries[0]?.content === "Please inspect." &&
+      claudeEntries[1]?.content === "I'll check." &&
+      claudeEntries[2]?.content === "Here is more context" &&
+      !JSON.stringify(claudeEntries).includes("attachment"),
+  );
+  check(
+    "AV2 Claude correlates tool calls/results by id across non-adjacent lines",
+    claudeFirstTools?.role === "assistant" &&
+      claudeFirstTools.tool_calls?.length === 2 &&
+      clCall1?.output === "file text" &&
+      clCall1.status === "ok" &&
+      clCall2?.output === "tests ok" &&
+      clCall2.status === "ok",
+  );
+  check(
+    "AV3 Claude preserves tool-only, unmatched, and completed-no-output cases",
+    claudeToolOnly?.content === "" &&
+      clUnmatched !== undefined &&
+      clUnmatched.output === undefined &&
+      clUnmatched.status === undefined &&
+      clEmpty?.status === "ok" &&
+      clEmpty.output === undefined,
+  );
+  check(
+    "AV4 Claude records omitted non-text blocks without dropping turns",
+    claudeEntries.some((e) => e.role === "user" && e.content === "" && e.omitted?.[0]?.kind === "image" && e.omitted[0].count === 1) &&
+      claudeEntries.some((e) => e.role === "assistant" && e.content === "" && e.omitted?.[0]?.kind === "thinking" && e.omitted[0].count === 1) &&
+      claudeEntries.some(
+        (e) =>
+          e.role === "assistant" &&
+          e.content === "" &&
+          e.omitted?.some((o) => o.kind === "fallback" && o.count === 1) &&
+          e.omitted?.some((o) => o.kind === "other" && o.count === 1),
+      ),
+  );
+  check(
+    "AV5 caps content and tool output with truncation flags",
+    claudeLong?.content.length === HISTORY_CONTENT_CAP &&
+      claudeLong.content_truncated === true &&
+      clBig?.output?.length === HISTORY_TOOL_IO_CAP &&
+      clBig.output_truncated === true &&
+      clBig.status === "ok",
+  );
+  check(
+    "AV6 entry ids are opaque, unique, stable, and not handles/session ids",
+    claudeIds.length === new Set(claudeIds).size &&
+      claudeIds.every((id) => /^e_[0-9a-f]{16,}$/.test(id) && id !== claudeSessionId && id !== "h_av_handle") &&
+      JSON.stringify(claudeIds) === JSON.stringify(claudeEntriesAgain.map((e) => e.entry_id)),
+  );
+
+  const codexContent = jsonlFixture([
+    { type: "session_meta", timestamp: "2026-07-06T01:00:00.000Z", payload: { id: codexSessionId, cwd: SCRATCH } },
+    { type: "event_msg", timestamp: "2026-07-06T01:00:01.000Z", payload: { type: "user_message", message: "Codex user" } },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:02.000Z",
+      payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "developer dropped" }] },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:03.000Z",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Codex user" }] },
+    },
+    { type: "event_msg", timestamp: "2026-07-06T01:00:04.000Z", payload: { type: "agent_message", message: "Codex assistant" } },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:05.000Z",
+      payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Codex assistant" }] },
+    },
+    { type: "response_item", timestamp: "2026-07-06T01:00:06.000Z", payload: { type: "reasoning", summary: "dropped" } },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:07.000Z",
+      payload: { type: "function_call", call_id: "cx_patch", name: "apply_patch", arguments: "{\"patch\":true}" },
+    },
+    { type: "event_msg", timestamp: "2026-07-06T01:00:08.000Z", payload: { type: "token_count", info: {} } },
+    {
+      type: "event_msg",
+      timestamp: "2026-07-06T01:00:09.000Z",
+      payload: { type: "patch_apply_end", call_id: "cx_patch", success: true, status: "success", changes: { "src/a.ts": "modified" }, stdout: "applied" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:10.000Z",
+      payload: { type: "function_call", call_id: "cx_no_output", name: "noop", arguments: "{}" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:11.000Z",
+      payload: { type: "function_call_output", call_id: "cx_no_output", output: "" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:12.000Z",
+      payload: { type: "custom_tool_call", call_id: "cx_unmatched", name: "custom", input: "raw input" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T01:00:13.000Z",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "After tools" }] },
+    },
+    {
+      type: "event_msg",
+      timestamp: "2026-07-06T01:00:14.000Z",
+      payload: { type: "patch_apply_end", call_id: "cx_synthetic", success: true, status: "success", changes: { "src/lonely.ts": "created" } },
+    },
+  ]);
+  const codexEntries = buildHistoryEntries("codex", codexContent, codexSessionId);
+  const codexAssistant = codexEntries.find((e) => e.content === "Codex assistant");
+  const cxPatch = codexAssistant?.tool_calls?.find((c) => c.id === "cx_patch");
+  const cxNoOutput = codexAssistant?.tool_calls?.find((c) => c.id === "cx_no_output");
+  const cxUnmatched = codexAssistant?.tool_calls?.find((c) => c.id === "cx_unmatched");
+  const cxSynthetic = codexEntries.flatMap((e) => e.tool_calls ?? []).find((c) => c.id === "cx_synthetic");
+
+  check(
+    "AV7 Codex uses response_item only for messages and drops meta/developer/reasoning",
+    codexEntries.length === 4 &&
+      codexEntries.filter((e) => e.content === "Codex user").length === 1 &&
+      codexEntries.filter((e) => e.content === "Codex assistant").length === 1 &&
+      !JSON.stringify(codexEntries).includes("developer dropped") &&
+      !JSON.stringify(codexEntries).includes("reasoning"),
+  );
+  check(
+    "AV8 Codex correlates tools, completed-no-output, unmatched, and patch enrichment",
+    cxPatch?.status === "ok" &&
+      cxPatch.output?.includes("patch_apply_end") === true &&
+      cxPatch.output.includes("src/a.ts") &&
+      cxNoOutput?.status === "ok" &&
+      cxNoOutput.output === undefined &&
+      cxUnmatched !== undefined &&
+      cxUnmatched.status === undefined &&
+      cxUnmatched.output === undefined &&
+      cxSynthetic?.name === "apply_patch" &&
+      cxSynthetic.output?.includes("src/lonely.ts") === true,
+  );
+
+  const page1 = readSessionHistory("claude", claudeContent, claudeSessionId, { limit: 3 });
+  const page2 = readSessionHistory("claude", claudeContent, claudeSessionId, { limit: 3, cursor: page1.next_cursor ?? undefined });
+  const page3 = readSessionHistory("claude", claudeContent, claudeSessionId, { limit: 3, cursor: page2.next_cursor ?? undefined });
+  const pagedIds = [...page1.entries, ...page2.entries, ...page3.entries].map((e) => e.entry_id);
+  const appendedClaudeContent =
+    claudeContent +
+    `${JSON.stringify({ type: "user", timestamp: "2026-07-06T00:00:14.000Z", message: { role: "user", content: "appended" } })}\n`;
+  const page2AfterAppend = readSessionHistory("claude", appendedClaudeContent, claudeSessionId, { limit: 3, cursor: page1.next_cursor ?? undefined });
+  let malformedCursorRejected = false;
+  try {
+    readSessionHistory("claude", claudeContent, claudeSessionId, { cursor: "not a cursor!", limit: 2 });
+  } catch (e) {
+    malformedCursorRejected = e instanceof HistoryCursorError && e.code === "cursor_invalid";
+  }
+  check(
+    "AV9 pagination is newest-first, walks older without dup/skip, and is append-stable",
+    page1.entries.length === 3 &&
+      page1.entries[0]?.entry_id === claudeEntries[6]?.entry_id &&
+      page1.truncated === true &&
+      typeof page1.next_cursor === "string" &&
+      page2.entries.length === 3 &&
+      page3.entries.length === 3 &&
+      page3.next_cursor === null &&
+      pagedIds.length === claudeEntries.length &&
+      new Set(pagedIds).size === claudeEntries.length &&
+      claudeIds.every((id) => pagedIds.includes(id)) &&
+      JSON.stringify(page2.entries.map((e) => e.entry_id)) === JSON.stringify(page2AfterAppend.entries.map((e) => e.entry_id)) &&
+      malformedCursorRejected,
+  );
+
+  const claudeWire = safeParseMessageV2({
+    id: "m-av-claude",
+    ts: "2026-07-06T02:00:00.000Z",
+    type: "session.history.response",
+    request_id: "req-av-claude",
+    entries: claudeEntries,
+    truncated: false,
+  });
+  const codexWire = safeParseMessageV2({
+    id: "m-av-codex",
+    ts: "2026-07-06T02:00:01.000Z",
+    type: "session.history.response",
+    request_id: "req-av-codex",
+    entries: codexEntries,
+    truncated: false,
+  });
+  check("AV10 produced history entries validate against the v2 wire schema", claudeWire.success && codexWire.success);
+}
+
 async function scenarioAQ(): Promise<void> {
   type SessionResumeAccept = Extract<MessageV2, { type: "session.resume.accept" }>;
   type SessionResumeReject = Extract<MessageV2, { type: "session.resume.reject" }>;
@@ -3812,6 +4098,8 @@ async function main(): Promise<void> {
   await scenarioAO();
   console.log("\n[scenario AP: fixture-backed session enumeration]");
   await scenarioAP();
+  console.log("\n[scenario AV: session history reader]");
+  scenarioAV();
   console.log("\n[scenario AQ: v2 session resume turn]");
   await scenarioAQ();
   console.log("\n[scenario AR: v2 Claude resume lifecycle controls]");
