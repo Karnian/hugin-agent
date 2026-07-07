@@ -291,6 +291,8 @@ const sessionMeta =
 const requiredSessionTypes = [
   "session.list.request",
   "session.list.response",
+  "session.history.request",
+  "session.history.response",
   "session.resume.request",
   "session.resume.accept",
   "session.resume.reject",
@@ -306,6 +308,10 @@ const sessionNegativeReasons = new Set<SessionNegativeReason>([
   "null-on-non-nullable",
   "strict-unknown-field",
   "bad-event-kind",
+  "bad-session-history-role",
+  "bad-session-history-omitted-kind",
+  "bad-session-tool-status",
+  "missing-required-field",
   "v1-rejects-session-cap",
 ]);
 const seenSessionTypes = new Set<SessionVectorType>();

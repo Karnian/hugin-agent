@@ -577,6 +577,29 @@ export const SessionInfo = z.strictObject({
   msg_count: PosInt,
 });
 
+export const SessionToolCall = z.strictObject({
+  id: Id,
+  name: z.string(),
+  input: z.string().optional(),
+  input_truncated: z.boolean().optional(),
+  output: z.string().optional(),
+  output_truncated: z.boolean().optional(),
+  status: z.enum(["ok", "error"]).optional(),
+});
+
+export const SessionHistoryEntry = z.strictObject({
+  entry_id: Id,
+  role: z.enum(["user", "assistant"]),
+  content: z.string(),
+  content_truncated: z.boolean().optional(),
+  tool_calls: z.array(SessionToolCall).max(ARRAY_MAX).optional(),
+  omitted: z.array(z.strictObject({
+    kind: z.enum(["image", "document", "thinking", "fallback", "other"]),
+    count: PosInt,
+  })).max(ARRAY_MAX).optional(),
+  created_at: Iso.nullable(),
+});
+
 const SessionListFilter = z.strictObject({
   engine: Engine.optional(),
   cwd_prefix: z.string().optional(),
@@ -602,6 +625,24 @@ export const SessionListResponse = z.strictObject({
   type: z.literal("session.list.response"),
   request_id: Id,
   sessions: z.array(SessionInfo).max(ARRAY_MAX),
+  next_cursor: z.string().nullable().optional(),
+  truncated: z.boolean(),
+});
+
+export const SessionHistoryRequest = z.strictObject({
+  ...base,
+  type: z.literal("session.history.request"),
+  request_id: Id,
+  handle: Id,
+  cursor: z.string().optional(),
+  limit: PosInt.optional(),
+});
+
+export const SessionHistoryResponse = z.strictObject({
+  ...base,
+  type: z.literal("session.history.response"),
+  request_id: Id,
+  entries: z.array(SessionHistoryEntry).max(ARRAY_MAX),
   next_cursor: z.string().nullable().optional(),
   truncated: z.boolean(),
 });
@@ -679,6 +720,8 @@ export const SessionTurnResult = z.strictObject({
   new_session_handle: Id.nullable().optional(),
 });
 
+// History fetches may emit history_unavailable, file_unreadable, or
+// payload_too_large; SessionError.code remains a free string.
 export const SessionError = z.strictObject({
   ...base,
   type: z.literal("session.error"),
@@ -724,6 +767,8 @@ export type Message = z.infer<typeof Message>;
 export type MessageType = Message["type"];
 type SessionListRequestMsg = z.infer<typeof SessionListRequest>;
 type SessionListResponseMsg = z.infer<typeof SessionListResponse>;
+type SessionHistoryRequestMsg = z.infer<typeof SessionHistoryRequest>;
+type SessionHistoryResponseMsg = z.infer<typeof SessionHistoryResponse>;
 type SessionResumeRequestMsg = z.infer<typeof SessionResumeRequest>;
 type SessionCancelMsg = z.infer<typeof SessionCancel>;
 type SessionAckMsg = z.infer<typeof SessionAck>;
@@ -738,6 +783,8 @@ export const V2_VARIANTS = [
   ...V1_VARIANTS,
   SessionListRequest,
   SessionListResponse,
+  SessionHistoryRequest,
+  SessionHistoryResponse,
   SessionResumeRequest,
   SessionCancel,
   SessionAck,
@@ -753,6 +800,8 @@ export const MessageV2: z.ZodType<
   | Message
   | SessionListRequestMsg
   | SessionListResponseMsg
+  | SessionHistoryRequestMsg
+  | SessionHistoryResponseMsg
   | SessionResumeRequestMsg
   | SessionCancelMsg
   | SessionAckMsg
@@ -795,6 +844,8 @@ export const DIRECTION = {
   error: "both",
   "session.list.request": "s2a",
   "session.list.response": "a2s",
+  "session.history.request": "s2a",
+  "session.history.response": "a2s",
   "session.resume.request": "s2a",
   "session.cancel": "s2a",
   "session.ack": "s2a",
