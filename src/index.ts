@@ -5,7 +5,7 @@
  *   HUGIND_KEY_ID       dev-key
  *   HUGIND_TENANT_ID    dev-tenant
  *   HUGIND_AGENT_VERSION 0.0.0
- *   HUGIND_PROTOCOL_VERSION 1.0.0 (set 2.0.0 only with a v2-capable relay)
+ *   HUGIND_PROTOCOL_VERSION 2.0.0 default (set 1.0.0 only for a v1-only relay)
  *   HUGIND_PROJECT_ROOTS comma-separated absolute paths
  *   HUGIND_STATE_DIR    .hugind
  *   HUGIND_ENGINE_CMD   (test override)
