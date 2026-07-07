@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { closeSync, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { basename, join, relative, sep } from "node:path";
 import type { MessageV2 } from "../../protocol/v1/index";
+import { HistoryCursorError, readSessionHistory, type SessionHistoryEntry } from "./history";
 
 type SessionListRequestMsg = Extract<MessageV2, { type: "session.list.request" }>;
 export type SessionInfo = Extract<MessageV2, { type: "session.list.response" }>["sessions"][number];
@@ -114,6 +115,33 @@ export class SessionEnumerator {
       return { ...target, mtime: st.mtimeMs };
     } catch {
       return null;
+    }
+  }
+
+  readHistory(
+    handle: string,
+    opts: { cursor?: string; limit?: number },
+  ):
+    | { ok: true; entries: SessionHistoryEntry[]; next_cursor: string | null; truncated: boolean }
+    | { ok: false; code: "handle_invalid" | "file_unreadable" | "payload_too_large" | "cursor_invalid" | "history_unavailable" } {
+    const target = this.validateHandle(handle);
+    if (!target) return { ok: false, code: "handle_invalid" };
+
+    try {
+      if (statSync(target.path).size > MAX_SESSION_BYTES) return { ok: false, code: "payload_too_large" };
+    } catch {
+      return { ok: false, code: "file_unreadable" };
+    }
+
+    const file = this.readSessionFile(target.path);
+    if (!file) return { ok: false, code: "file_unreadable" };
+
+    try {
+      const result = readSessionHistory(target.engine, file.content, target.session_id, opts);
+      return { ok: true, ...result };
+    } catch (e) {
+      if (e instanceof HistoryCursorError) return { ok: false, code: "cursor_invalid" };
+      return { ok: false, code: "history_unavailable" };
     }
   }
 

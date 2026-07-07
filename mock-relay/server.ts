@@ -156,6 +156,10 @@ export interface MockRelayOpts {
   sendSessionListAfterAccept?: boolean;
   /** Called when the daemon replies to the test session.list.request. */
   onSessionListResponse?: (m: Extract<MessageV2, { type: "session.list.response" }>) => void;
+  /** Test hook: send a v2 session.history.request immediately after hello.accepted. */
+  sendSessionHistoryAfterAccept?: { request_id: string; handle: string; cursor?: string; limit?: number };
+  /** Called when the daemon replies to the test session.history.request. */
+  onSessionHistoryResponse?: (m: Extract<MessageV2, { type: "session.history.response" }>) => void;
   /** Called when the daemon reports a v2 session-layer error. */
   onSessionError?: (m: Extract<MessageV2, { type: "session.error" }>) => void;
   onSessionResumeAccept?: (m: Extract<MessageV2, { type: "session.resume.accept" }>) => void;
@@ -339,10 +343,24 @@ export class MockRelay {
             request_id: "session-list-e2e",
           });
         }
+        if (this.opts.sendSessionHistoryAfterAccept) {
+          const req = this.opts.sendSessionHistoryAfterAccept;
+          this.send(ws, {
+            id: messageId(),
+            ts: new Date().toISOString(),
+            type: "session.history.request",
+            request_id: req.request_id,
+            handle: req.handle,
+            ...(req.cursor === undefined ? {} : { cursor: req.cursor }),
+            ...(req.limit === undefined ? {} : { limit: req.limit }),
+          });
+        }
       } else if (m.type === "heartbeat") {
         this.opts.onHeartbeat?.();
       } else if (m.type === "session.list.response") {
         this.opts.onSessionListResponse?.(m);
+      } else if (m.type === "session.history.response") {
+        this.opts.onSessionHistoryResponse?.(m);
       } else if (m.type === "session.error") {
         this.opts.onSessionError?.(m);
       } else if (m.type === "session.resume.accept") {
