@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { closeSync, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { basename, join, relative, sep } from "node:path";
 import type { MessageV2 } from "../../protocol/v1/index";
@@ -50,6 +50,10 @@ const TITLE_MAX = 80;
 const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const CLAUDE_FILE_RE = new RegExp(`^(${UUID_PATTERN})\\.jsonl$`);
 const CODEX_FILE_RE = new RegExp(`^rollout-.+-(${UUID_PATTERN})\\.jsonl$`);
+
+function stableSessionId(engine: "claude" | "codex", rawSessionId: string): string {
+  return `s_${createHash("sha256").update(`${engine}\0${rawSessionId}`).digest("hex").slice(0, 32)}`;
+}
 
 export class SessionEnumerator {
   private readonly now: () => number;
@@ -193,6 +197,7 @@ export class SessionEnumerator {
     return {
       info: {
         handle,
+        session_id: stableSessionId("claude", sessionId),
         engine: "claude",
         cwd: scoped.redacted,
         git_branch: gitBranch,
@@ -240,6 +245,7 @@ export class SessionEnumerator {
     return {
       info: {
         handle,
+        session_id: stableSessionId("codex", sessionId),
         engine: "codex",
         cwd: scoped.redacted,
         git_branch: null,

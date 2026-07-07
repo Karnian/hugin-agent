@@ -88,6 +88,7 @@ function base(id: string) {
 
 const sessionInfoFull = {
   handle: "sess-main",
+  session_id: "s_0123456789abcdef0123456789abcdef",
   engine: "codex",
   cwd: "/work/repo",
   git_branch: "main",
@@ -101,6 +102,7 @@ const sessionInfoFull = {
 
 const sessionInfoNulls = {
   handle: "sess-no-meta",
+  session_id: "s_fedcba9876543210fedcba9876543210",
   engine: "claude",
   cwd: "/work/other",
   git_branch: null,
