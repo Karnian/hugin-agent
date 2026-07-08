@@ -54,7 +54,9 @@ The CLI writes `hugind.pid` and `hugind.log` under `HUGIND_STATE_DIR` when set. 
 | Linux | `${XDG_STATE_HOME:-~/.local/state}/hugin-agent` |
 | Windows | `%LOCALAPPDATA%\hugin-agent` or `~/AppData/Local/hugin-agent` |
 
-For pidfile safety, the lifecycle CLI records the daemon command line and verifies live PIDs against it before reporting or stopping a process. This ownership check is best-effort on macOS/Linux; on Windows it currently degrades to alive-only PID checks.
+On start, the lifecycle CLI first writes a visible in-progress pidfile claim, then atomically publishes the daemon record after spawn. It tails `hugind.log` until the daemon logs `hugind starting`; if the daemon stays alive but the marker is not seen before the readiness timeout, start exits successfully with an unconfirmed-health warning and points at the log.
+
+For pidfile safety, the lifecycle CLI records the daemon command line and verifies live PIDs against it before reporting or stopping a process. Legacy bare-number pidfiles do not carry ownership data, so `hugind stop` refuses to terminate a live legacy PID unless you pass `--force`. On Windows, and when process-command inspection fails, full pidfile records degrade to alive-only PID checks and the CLI reports that ownership could not be re-verified.
 
 Uninstall/cleanup for the lifecycle CLI:
 

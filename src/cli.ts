@@ -1,7 +1,8 @@
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, ftruncateSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export interface RuntimePaths {
@@ -21,15 +22,24 @@ export interface PidRecord {
   cmd: string;
 }
 
+interface ClaimRecord {
+  claiming: true;
+  startedAt: number;
+  ownerPid?: number;
+}
+
 interface LifecycleResult {
   code: number;
   message: string;
 }
 
 type ProcessMatch = "yes" | "no" | "unknown";
+export type PidfileState = "running" | "starting" | "stale" | "none";
 
-const START_GRACE_MS = 500;
 const ACTIVE_CLAIM_GRACE_MS = 2000;
+const DEFAULT_READY_TIMEOUT_MS = 4000;
+const READY_POLL_MS = 150;
+const DEFAULT_READY_MARKER = "hugind starting";
 
 function ensureDir(dir: string): string {
   mkdirSync(dir, { recursive: true });
@@ -105,23 +115,84 @@ function isPidRecord(value: unknown): value is PidRecord {
   );
 }
 
-export function readRecord(pidfile: string): PidRecord | null {
+function isClaimRecord(value: unknown): value is ClaimRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Partial<ClaimRecord>;
+  return (
+    record.claiming === true &&
+    typeof record.startedAt === "number" &&
+    Number.isFinite(record.startedAt) &&
+    (record.ownerPid === undefined || (Number.isInteger(record.ownerPid) && record.ownerPid > 0))
+  );
+}
+
+interface PidfileFingerprint {
+  dev: number;
+  ino: number;
+  mtimeMs: number;
+  size: number;
+}
+
+type PidfileSnapshot =
+  | { kind: "none"; fingerprint?: undefined }
+  | { kind: "record"; record: PidRecord; fingerprint: PidfileFingerprint }
+  | { kind: "claim"; claim: ClaimRecord; fingerprint: PidfileFingerprint }
+  | { kind: "invalid"; fingerprint: PidfileFingerprint };
+
+interface PidfileInspection {
+  state: PidfileState;
+  snapshot: PidfileSnapshot;
+  record?: PidRecord;
+  match?: ProcessMatch;
+  legacy: boolean;
+}
+
+function fingerprintFromStat(stat: Stats): PidfileFingerprint {
+  return { dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
+}
+
+function isFreshFingerprint(fingerprint: PidfileFingerprint): boolean {
+  return Date.now() - fingerprint.mtimeMs < ACTIVE_CLAIM_GRACE_MS;
+}
+
+function readPidfileSnapshot(pidfile: string): PidfileSnapshot {
+  let fingerprint: PidfileFingerprint;
   try {
-    const raw = readFileSync(pidfile, "utf8").trim();
-    if (!raw) return null;
-
-    const legacyPid = Number(raw);
-    if (Number.isInteger(legacyPid) && legacyPid > 0) {
-      return { pid: legacyPid, startedAt: 0, cmd: "" };
-    }
-
-    const parsed = JSON.parse(raw) as unknown;
-    return isPidRecord(parsed) ? parsed : null;
+    fingerprint = fingerprintFromStat(statSync(pidfile));
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
-    if (e instanceof SyntaxError) return null;
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { kind: "none" };
     throw e;
   }
+
+  let raw: string;
+  try {
+    raw = readFileSync(pidfile, "utf8").trim();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { kind: "none" };
+    throw e;
+  }
+
+  if (!raw) return { kind: "invalid", fingerprint };
+
+  const legacyPid = Number(raw);
+  if (Number.isInteger(legacyPid) && legacyPid > 0) {
+    return { kind: "record", record: { pid: legacyPid, startedAt: 0, cmd: "" }, fingerprint };
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (isPidRecord(parsed)) return { kind: "record", record: parsed, fingerprint };
+    if (isClaimRecord(parsed)) return { kind: "claim", claim: parsed, fingerprint };
+    return { kind: "invalid", fingerprint };
+  } catch (e) {
+    if (e instanceof SyntaxError) return { kind: "invalid", fingerprint };
+    throw e;
+  }
+}
+
+export function readRecord(pidfile: string): PidRecord | null {
+  const snapshot = readPidfileSnapshot(pidfile);
+  return snapshot.kind === "record" ? snapshot.record : null;
 }
 
 export function readPid(pidfile: string): number | null {
@@ -142,26 +213,31 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
+function tokenBasename(token: string): string {
+  return token.split(/[\\/]/).pop() ?? token;
+}
+
+function isAbsolutePathLike(token: string): boolean {
+  return token.startsWith("/") || /^[A-Za-z]:[\\/]/.test(token) || token.startsWith("\\\\");
+}
+
 function distinctiveTokens(cmd: string): string[] {
   const common = new Set(["node", "node.exe", "tsx", "--import", "-e", "env"]);
-  const tokens = new Set<string>();
-  for (const part of cmd.split(/\s+/)) {
-    const cleaned = part.trim().replace(/^["']|["']$/g, "");
-    if (!cleaned) continue;
-    const base = basename(cleaned);
-    const candidates = common.has(base.toLowerCase()) ? [base] : [cleaned, base];
-    for (const candidate of candidates) {
-      if (
-        candidate.length >= 4 &&
-        !candidate.startsWith("-") &&
-        !common.has(candidate.toLowerCase()) &&
-        !/^\d+$/.test(candidate)
-      ) {
-        tokens.add(candidate);
-      }
-    }
-  }
-  return [...tokens];
+  const parts = cmd
+    .split(/\s+/)
+    .map((part) => part.trim().replace(/^["']|["']$/g, ""))
+    .filter((part) => part.length > 0);
+  const absoluteTokens = parts
+    .filter((part) => isAbsolutePathLike(part))
+    .filter((part) => {
+      const base = tokenBasename(part).toLowerCase();
+      return part.length >= 4 && !common.has(base) && !/^\d+$/.test(base);
+    })
+    .sort((a, b) => b.length - a.length);
+  if (absoluteTokens.length > 0) return [absoluteTokens[0] as string];
+
+  const trimmed = cmd.trim();
+  return trimmed ? [trimmed] : [];
 }
 
 export function processMatches(pid: number, cmd: string): ProcessMatch {
@@ -185,22 +261,68 @@ export function isOurDaemonRunning(record: PidRecord | null): boolean {
   return record !== null && isPidAlive(record.pid) && processMatches(record.pid, record.cmd) !== "no";
 }
 
-function writeRecordFd(fd: number, record: PidRecord): void {
-  ftruncateSync(fd, 0);
-  writeFileSync(fd, `${JSON.stringify(record)}\n`, "utf8");
+function isLegacyRecord(record: PidRecord): boolean {
+  return record.cmd.trim() === "";
 }
 
-function pidfileHoldsPid(pidfile: string, pid: number): boolean {
-  return readRecord(pidfile)?.pid === pid;
+function inspectPidfile(paths: RuntimePaths): PidfileInspection {
+  const snapshot = readPidfileSnapshot(paths.pidfile);
+  if (snapshot.kind === "none") return { state: "none", snapshot, legacy: false };
+  if (snapshot.kind === "claim") {
+    return { state: isFreshFingerprint(snapshot.fingerprint) ? "starting" : "stale", snapshot, legacy: false };
+  }
+  if (snapshot.kind === "invalid") {
+    return { state: isFreshFingerprint(snapshot.fingerprint) ? "starting" : "stale", snapshot, legacy: false };
+  }
+
+  const { record } = snapshot;
+  if (!isPidAlive(record.pid)) return { state: "stale", snapshot, record, legacy: isLegacyRecord(record) };
+
+  const legacy = isLegacyRecord(record);
+  const match = legacy ? "unknown" : processMatches(record.pid, record.cmd);
+  return { state: match === "no" ? "stale" : "running", snapshot, record, match, legacy };
 }
 
-function isFreshPidfileClaim(pidfile: string): boolean {
+export function pidfileState(paths: RuntimePaths): PidfileState {
+  return inspectPidfile(paths).state;
+}
+
+function sameFingerprint(a: PidfileFingerprint, b: PidfileFingerprint): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
+function removePidfileIfUnchanged(pidfile: string, snapshot: PidfileSnapshot): boolean {
+  if (snapshot.kind === "none") return false;
+  let current: PidfileFingerprint;
   try {
-    return Date.now() - statSync(pidfile).mtimeMs < ACTIVE_CLAIM_GRACE_MS;
+    current = fingerprintFromStat(statSync(pidfile));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw e;
   }
+  if (!sameFingerprint(current, snapshot.fingerprint)) return false;
+  removePidfile(pidfile);
+  return true;
+}
+
+function writeClaimFd(fd: number): void {
+  const claim: ClaimRecord = { claiming: true, startedAt: Date.now(), ownerPid: process.pid };
+  writeFileSync(fd, `${JSON.stringify(claim)}\n`, "utf8");
+}
+
+function writeRecordAtomic(pidfile: string, record: PidRecord): void {
+  const tmp = `${pidfile}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(record)}\n`, { encoding: "utf8", flag: "wx" });
+    renameSync(tmp, pidfile);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+}
+
+function pidfileHoldsPid(pidfile: string, pid: number): boolean {
+  return readRecord(pidfile)?.pid === pid;
 }
 
 function readLogTail(logfile: string, maxLines = 8): string {
@@ -219,25 +341,129 @@ function startFailureMessage(paths: RuntimePaths, detail: string): string {
   return tail ? `${detail}; logs: ${paths.logfile}\n${tail}` : `${detail}; logs: ${paths.logfile}`;
 }
 
-function claimPidfile(paths: RuntimePaths): { fd: number } | { result: LifecycleResult } {
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw e;
+  }
+}
+
+function logContainsMarkerSince(logfile: string, marker: string, offset: number): boolean {
+  if (marker === "") return true;
+  try {
+    const raw = readFileSync(logfile, "utf8");
+    return raw.slice(Math.min(offset, raw.length)).includes(marker);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+}
+
+function envMs(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+interface ChildState {
+  spawnError?: Error;
+  exit?: { code: number | null; signal: NodeJS.Signals | null };
+}
+
+function childExitDetail(childState: ChildState): string {
+  const childExit = childState.exit;
+  return childExit !== undefined
+    ? `failed to start hugind; child exited immediately/before readiness (code ${childExit.code ?? "null"}, signal ${childExit.signal ?? "null"})`
+    : "failed to start hugind; child did not remain alive";
+}
+
+function killStartedChild(pid: number): void {
+  if (!isPidAlive(pid)) return;
+  try {
+    process.kill(pid);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+  }
+}
+
+async function waitForDaemonReadiness(
+  env: NodeJS.ProcessEnv,
+  paths: RuntimePaths,
+  pid: number,
+  childState: ChildState,
+  logOffset: number,
+): Promise<LifecycleResult> {
+  const marker = env.HUGIND_READY_MARKER ?? DEFAULT_READY_MARKER;
+  const timeoutMs = envMs(env, "HUGIND_READY_TIMEOUT_MS", DEFAULT_READY_TIMEOUT_MS);
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    const stillOwnsPidfile = pidfileHoldsPid(paths.pidfile, pid);
+    if (childState.exit !== undefined || !isPidAlive(pid) || !stillOwnsPidfile) {
+      if (stillOwnsPidfile) removePidfile(paths.pidfile);
+      killStartedChild(pid);
+      return { code: 1, message: startFailureMessage(paths, childExitDetail(childState)) };
+    }
+
+    if (logContainsMarkerSince(paths.logfile, marker, logOffset)) {
+      return { code: 0, message: `hugind started (pid ${pid}) — logs: ${paths.logfile}` };
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(READY_POLL_MS, remaining));
+  }
+
+  const stillOwnsPidfile = pidfileHoldsPid(paths.pidfile, pid);
+  if (childState.exit !== undefined || !isPidAlive(pid) || !stillOwnsPidfile) {
+    if (stillOwnsPidfile) removePidfile(paths.pidfile);
+    killStartedChild(pid);
+    return { code: 1, message: startFailureMessage(paths, childExitDetail(childState)) };
+  }
+
+  return {
+    code: 0,
+    message: `hugind started (pid ${pid}) — not yet confirmed healthy; check logs: ${paths.logfile}`,
+  };
+}
+
+function claimPidfile(paths: RuntimePaths): { claimed: true } | { result: LifecycleResult } {
   for (let attempt = 0; attempt < 2; attempt++) {
+    let fd: number | null = null;
     try {
-      return { fd: openSync(paths.pidfile, "wx") };
+      fd = openSync(paths.pidfile, "wx");
+      writeClaimFd(fd);
+      return { claimed: true };
     } catch (e) {
+      if (fd !== null) {
+        closeSync(fd);
+        fd = null;
+        removePidfile(paths.pidfile);
+      }
       const err = e as NodeJS.ErrnoException;
       if (err.code !== "EEXIST") throw e;
 
-      const existing = readRecord(paths.pidfile);
-      if (existing !== null && isOurDaemonRunning(existing)) {
-        return { result: { code: 1, message: `already running (pid ${existing.pid})` } };
+      const inspection = inspectPidfile(paths);
+      if (inspection.state === "running" && inspection.record !== undefined) {
+        const suffix = inspection.legacy || inspection.match === "unknown" ? ", ownership unverified" : "";
+        return { result: { code: 1, message: `already running (pid ${inspection.record.pid}${suffix})` } };
       }
 
-      if (attempt === 0 && (existing !== null || !isFreshPidfileClaim(paths.pidfile))) {
-        removePidfile(paths.pidfile);
+      if (inspection.state === "starting") {
+        return { result: { code: 1, message: "already running / start in progress; try again" } };
+      }
+
+      if (attempt === 0 && (inspection.state === "stale" || inspection.state === "none")) {
+        removePidfileIfUnchanged(paths.pidfile, inspection.snapshot);
         continue;
       }
 
       return { result: { code: 1, message: "already running / try again" } };
+    } finally {
+      if (fd !== null) closeSync(fd);
     }
   }
 
@@ -248,16 +474,16 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env, paths = 
   const claim = claimPidfile(paths);
   if ("result" in claim) return claim.result;
 
-  let pidfd: number | null = claim.fd;
+  let claimActive = true;
   let logfd: number | null = null;
+  let childPid: number | null = null;
+  let recordWritten = false;
   try {
     logfd = openSync(paths.logfile, "a");
+    const logOffset = fileSize(paths.logfile);
     const cmd = daemonCommand(env);
     const cmdLine = daemonCommandLine(cmd);
-    const childState: {
-      spawnError?: Error;
-      exit?: { code: number | null; signal: NodeJS.Signals | null };
-    } = {};
+    const childState: ChildState = {};
     const child = spawn(cmd.command, cmd.args, {
       detached: true,
       stdio: ["ignore", logfd, logfd],
@@ -271,35 +497,23 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env, paths = 
       childState.exit = { code, signal };
     });
     if (child.pid === undefined) {
-      closeSync(pidfd);
-      pidfd = null;
       removePidfile(paths.pidfile);
+      claimActive = false;
       await sleep(50);
       const reason = childState.spawnError ? `failed to start hugind: ${childState.spawnError.message}` : "failed to start hugind";
       return { code: 1, message: startFailureMessage(paths, reason) };
     }
 
+    childPid = child.pid;
     child.unref();
-    writeRecordFd(pidfd, { pid: child.pid, startedAt: Date.now(), cmd: cmdLine });
-    closeSync(pidfd);
-    pidfd = null;
+    writeRecordAtomic(paths.pidfile, { pid: child.pid, startedAt: Date.now(), cmd: cmdLine });
+    claimActive = false;
+    recordWritten = true;
 
-    await sleep(START_GRACE_MS);
-    const stillOwnsPidfile = pidfileHoldsPid(paths.pidfile, child.pid);
-    const childExit = childState.exit;
-    if (childExit !== undefined || !isPidAlive(child.pid) || !stillOwnsPidfile) {
-      if (stillOwnsPidfile) removePidfile(paths.pidfile);
-      const exitDetail =
-        childExit !== undefined
-          ? `failed to start hugind; child exited immediately (code ${childExit.code ?? "null"}, signal ${childExit.signal ?? "null"})`
-          : "failed to start hugind; child did not remain alive";
-      return { code: 1, message: startFailureMessage(paths, exitDetail) };
-    }
-
-    return { code: 0, message: `hugind started (pid ${child.pid}) — logs: ${paths.logfile}` };
+    return await waitForDaemonReadiness(env, paths, child.pid, childState, logOffset);
   } finally {
-    if (pidfd !== null) {
-      closeSync(pidfd);
+    if (!recordWritten && childPid !== null) killStartedChild(childPid);
+    if (claimActive) {
       removePidfile(paths.pidfile);
     }
     if (logfd !== null) closeSync(logfd);
@@ -324,18 +538,30 @@ export async function stopDaemon(
   paths = runtimePaths(env),
   opts: { force?: boolean; timeoutMs?: number } = {},
 ): Promise<LifecycleResult> {
-  const record = readRecord(paths.pidfile);
-  if (record === null || !isPidAlive(record.pid)) {
-    removePidfile(paths.pidfile);
+  const inspection = inspectPidfile(paths);
+  if (inspection.state === "none") {
     return { code: 1, message: "not running" };
   }
 
-  if (processMatches(record.pid, record.cmd) === "no") {
-    removePidfile(paths.pidfile);
+  if (inspection.state === "starting") {
+    return { code: 1, message: "a start is in progress; retry" };
+  }
+
+  if (inspection.state === "stale" || inspection.record === undefined) {
+    removePidfileIfUnchanged(paths.pidfile, inspection.snapshot);
     return { code: 1, message: "not running (stale pidfile removed)" };
   }
 
+  const record = inspection.record;
   const pid = record.pid;
+  const ownershipUnverified = inspection.legacy || inspection.match === "unknown";
+  if (inspection.legacy && !opts.force) {
+    return {
+      code: 1,
+      message: `cannot verify this pidfile belongs to hugind; rerun with --force to terminate pid ${pid}, or remove the stale pidfile`,
+    };
+  }
+
   try {
     process.kill(pid);
   } catch (e) {
@@ -344,7 +570,8 @@ export async function stopDaemon(
 
   if (await waitForExit(pid, opts.timeoutMs ?? 5000)) {
     removePidfile(paths.pidfile);
-    return { code: 0, message: `stopped (pid ${pid})` };
+    const suffix = ownershipUnverified ? "; ownership could not be re-verified" : "";
+    return { code: 0, message: `stopped (pid ${pid}${suffix})` };
   }
 
   if (opts.force) {
@@ -355,7 +582,8 @@ export async function stopDaemon(
     }
     if (await waitForExit(pid, 2000)) {
       removePidfile(paths.pidfile);
-      return { code: 0, message: `stopped (pid ${pid})` };
+      const suffix = ownershipUnverified ? "; ownership could not be re-verified" : "";
+      return { code: 0, message: `stopped (pid ${pid}${suffix})` };
     }
   }
 
@@ -363,11 +591,18 @@ export async function stopDaemon(
 }
 
 export function statusDaemon(env: NodeJS.ProcessEnv = process.env, paths = runtimePaths(env)): LifecycleResult {
-  const record = readRecord(paths.pidfile);
-  if (record !== null && isOurDaemonRunning(record)) {
-    return { code: 0, message: `running (pid ${record.pid}, logs: ${paths.logfile})` };
+  const inspection = inspectPidfile(paths);
+  if (inspection.state === "starting") {
+    return { code: 1, message: "starting (in progress)" };
   }
-  removePidfile(paths.pidfile);
+
+  if (inspection.state === "running" && inspection.record !== undefined) {
+    const unverified = inspection.legacy || inspection.match === "unknown";
+    const suffix = unverified ? ", ownership unverified" : "";
+    return { code: 0, message: `running (pid ${inspection.record.pid}${suffix}, logs: ${paths.logfile})` };
+  }
+
+  if (inspection.state === "stale") removePidfileIfUnchanged(paths.pidfile, inspection.snapshot);
   return { code: 1, message: "stopped" };
 }
 
