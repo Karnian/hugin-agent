@@ -3017,16 +3017,20 @@ function createSessionFixtureStore(): SessionFixtureStore {
   const allowRoot = join(base, "allowed");
   const outsideRoot = join(base, "outside");
   const claudeCwd = join(allowRoot, "repo-claude");
+  const claudeSdkCwd = join(allowRoot, "repo-claude-sdk");
   const claudeSidechainCwd = join(allowRoot, "repo-claude-sidechain");
   const codexCwd = join(allowRoot, "repo-codex");
+  const codexExecCwd = join(allowRoot, "repo-codex-exec");
   const codexSubagentCwd = join(allowRoot, "repo-codex-subagent");
   const outsideCwd = join(outsideRoot, "repo-outside");
   const claudeProjectsDir = join(base, "claude", "projects");
   const codexSessionsDir = join(base, "codex", "sessions");
   const nowMs = Date.parse("2026-07-05T12:00:00.000Z");
   mkdirSync(claudeCwd, { recursive: true });
+  mkdirSync(claudeSdkCwd, { recursive: true });
   mkdirSync(claudeSidechainCwd, { recursive: true });
   mkdirSync(codexCwd, { recursive: true });
+  mkdirSync(codexExecCwd, { recursive: true });
   mkdirSync(codexSubagentCwd, { recursive: true });
   mkdirSync(outsideCwd, { recursive: true });
 
@@ -3036,9 +3040,30 @@ function createSessionFixtureStore(): SessionFixtureStore {
       { type: "system", timestamp: "2026-07-05T10:00:00.000Z", message: "init" },
       { type: "system", timestamp: "2026-07-05T10:00:01.000Z", cwd: claudeCwd, gitBranch: "main", version: "1.2.3" },
       { type: "ai-title", timestamp: "2026-07-05T10:00:02.000Z", title: "Claude fixture title\nwith extra spacing" },
-      { type: "user", timestamp: "2026-07-05T10:00:03.000Z", isSidechain: false, message: { role: "user", content: "SENSITIVE_PROMPT_CLAUDE" } },
+      {
+        type: "user",
+        timestamp: "2026-07-05T10:00:03.000Z",
+        entrypoint: "claude-desktop",
+        isSidechain: false,
+        message: { role: "user", content: "SENSITIVE_PROMPT_CLAUDE" },
+      },
     ],
     nowMs - 5 * 60 * 1000,
+  );
+
+  writeJsonlFixture(
+    join(claudeProjectsDir, "encoded-claude", "33333333-3333-4333-8333-333333333333.jsonl"),
+    [
+      { type: "system", timestamp: "2026-07-05T10:01:00.000Z", cwd: claudeSdkCwd, gitBranch: "sdk", version: "1.2.6" },
+      { type: "ai-title", timestamp: "2026-07-05T10:01:01.000Z", title: "Claude sdk-cli fixture" },
+      {
+        type: "user",
+        timestamp: "2026-07-05T10:01:02.000Z",
+        entrypoint: "sdk-cli",
+        message: { role: "user", content: "SENSITIVE_CLAUDE_SDK_PROMPT" },
+      },
+    ],
+    nowMs - 4 * 60 * 1000,
   );
 
   writeJsonlFixture(
@@ -3061,7 +3086,7 @@ function createSessionFixtureStore(): SessionFixtureStore {
           id: "codex-fixture-session",
           cwd: codexCwd,
           cli_version: "0.4.5",
-          source: "exec",
+          source: "vscode",
           timestamp: "2026-07-05T09:30:00.000Z",
           base_instructions: "BASE_INSTRUCTIONS_SECRET",
         },
@@ -3076,6 +3101,33 @@ function createSessionFixtureStore(): SessionFixtureStore {
       { type: "event_msg", payload: { type: "assistant_message", message: "ASSISTANT_OUTPUT_SECRET" } },
     ],
     nowMs - 30 * 60 * 1000,
+  );
+
+  writeJsonlFixture(
+    join(codexSessionsDir, "2026", "07", "05", "rollout-2026-07-05T10-01-00-99999999-9999-4999-8999-999999999999.jsonl"),
+    [
+      {
+        type: "session_meta",
+        payload: {
+          id: "codex-exec-session",
+          cwd: codexExecCwd,
+          cli_version: "0.4.7",
+          source: "exec",
+          originator: "codex_exec",
+          timestamp: "2026-07-05T10:01:00.000Z",
+          base_instructions: "BASE_INSTRUCTIONS_EXEC_SECRET",
+        },
+      },
+      {
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "SENSITIVE_CODEX_EXEC_PROMPT",
+        },
+      },
+      { type: "event_msg", payload: { type: "assistant_message", message: "SENSITIVE_CODEX_EXEC_REPLY" } },
+    ],
+    nowMs - 7 * 60 * 1000,
   );
 
   writeJsonlFixture(
@@ -3226,29 +3278,39 @@ async function scenarioAP(): Promise<void> {
     );
 
     const withSubagents = enumerator.list({ filter: { include_subagents: true } }).sessions;
+    const claudeSdk = withSubagents.find((s) => s.engine === "claude" && s.title === "Claude sdk-cli fixture");
     const claudeNestedSubagent = withSubagents.find((s) => s.engine === "claude" && s.title === "Claude nested subagent fixture");
+    const codexExec = withSubagents.find((s) => s.engine === "codex" && s.cwd === "repo-codex-exec");
     const codexSubagent = withSubagents.find((s) => s.engine === "codex" && s.cwd === "repo-codex-subagent");
     const includedClaudeMain = withSubagents.find((s) => s.handle === claude?.handle);
     const includedClaudeTopLevelSidechainMain = withSubagents.find((s) => s.handle === claudeTopLevelSidechainMain?.handle);
     const includedCodexMain = withSubagents.find((s) => s.handle === codex?.handle);
     check(
-      "AP1b session.list defaults exclude nested claude and codex subagents; include_subagents restores them",
+      "AP1b session.list defaults exclude non-primary sessions; include_subagents restores them",
       sessions.length === 3 &&
         sessions.every((s) => s.is_subagent === false) &&
+        !sessions.some((s) => s.title === "Claude sdk-cli fixture") &&
         !sessions.some((s) => s.title === "Claude nested subagent fixture") &&
+        !sessions.some((s) => s.cwd === "repo-codex-exec") &&
         !sessions.some((s) => s.cwd === "repo-codex-subagent") &&
-        withSubagents.length === 5 &&
+        withSubagents.length === 7 &&
         includedClaudeMain?.is_subagent === false &&
         includedClaudeTopLevelSidechainMain?.is_subagent === false &&
         includedCodexMain?.is_subagent === false &&
+        claudeSdk?.is_subagent === true &&
+        claudeSdk.cwd === "repo-claude-sdk" &&
+        claudeSdk.git_branch === "sdk" &&
+        claudeSdk.cli_version === "1.2.6" &&
         claudeNestedSubagent?.is_subagent === true &&
         claudeNestedSubagent.cwd === "repo-claude" &&
         claudeNestedSubagent.git_branch === "nested" &&
         claudeNestedSubagent.cli_version === "1.2.5" &&
         claudeNestedSubagent.msg_count === 4 &&
+        codexExec?.is_subagent === true &&
+        codexExec.cli_version === "0.4.7" &&
         codexSubagent?.is_subagent === true &&
         codexSubagent.cli_version === "0.4.6" &&
-        withSubagents.filter((s) => s.is_subagent).length === 2,
+        withSubagents.filter((s) => s.is_subagent).length === 4,
     );
     check(
       "AP1c claude top-level UUID file with isSidechain records is classified as main by location",
@@ -3282,8 +3344,11 @@ async function scenarioAP(): Promise<void> {
       !serialized.includes("Outside should not appear") && emptyAllowlist.sessions.length === 0 && emptyAllowlist.truncated === false,
     );
     check(
-      "AP3 default list excludes nested claude and codex subagent logs",
-      !serialized.includes("Claude nested subagent fixture") && !serialized.includes("repo-codex-subagent"),
+      "AP3 default list excludes non-primary session logs",
+      !serialized.includes("Claude sdk-cli fixture") &&
+        !serialized.includes("Claude nested subagent fixture") &&
+        !serialized.includes("repo-codex-exec") &&
+        !serialized.includes("repo-codex-subagent"),
     );
     check(
       "AP4 response is redacted metadata only",
@@ -3292,6 +3357,10 @@ async function scenarioAP(): Promise<void> {
         !serializedWithSubagents.includes("SENSITIVE_PERMISSIONS_SECRET") &&
         !serializedWithSubagents.includes("ASSISTANT_OUTPUT_SECRET") &&
         !serializedWithSubagents.includes("BASE_INSTRUCTIONS_SECRET") &&
+        !serializedWithSubagents.includes("SENSITIVE_CLAUDE_SDK_PROMPT") &&
+        !serializedWithSubagents.includes("BASE_INSTRUCTIONS_EXEC_SECRET") &&
+        !serializedWithSubagents.includes("SENSITIVE_CODEX_EXEC_PROMPT") &&
+        !serializedWithSubagents.includes("SENSITIVE_CODEX_EXEC_REPLY") &&
         !serializedWithSubagents.includes("SENSITIVE_SIDECHAIN_PROMPT") &&
         !serializedWithSubagents.includes("SENSITIVE_SIDECHAIN_REPLY") &&
         !serializedWithSubagents.includes("SENSITIVE_CLAUDE_SUBAGENT_PROMPT") &&
@@ -3431,8 +3500,12 @@ async function scenarioAP(): Promise<void> {
       filter: { include_subagents: true },
       page: { limit: 256 },
     });
-    const uncappedClaudeSubagentCount = uncappedSubagents.sessions.filter((s) => s.engine === "claude" && s.is_subagent).length;
-    const cappedClaudeSubagentCount = cappedSubagents.sessions.filter((s) => s.engine === "claude" && s.is_subagent).length;
+    const isScannedClaudeSubagent = (s: SessionInfo) =>
+      s.engine === "claude" &&
+      s.is_subagent &&
+      (s.title === "Claude nested subagent fixture" || s.title.startsWith("Claude capped subagent fixture"));
+    const uncappedClaudeSubagentCount = uncappedSubagents.sessions.filter(isScannedClaudeSubagent).length;
+    const cappedClaudeSubagentCount = cappedSubagents.sessions.filter(isScannedClaudeSubagent).length;
     check(
       "AP7 claude subagent scan cap reports truncation without changing pagination cursor semantics",
       uncappedSubagents.truncated === false &&
