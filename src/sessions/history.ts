@@ -29,8 +29,9 @@ export function readSessionHistory(
   content: string,
   sessionId: string,
   opts: { cursor?: string; limit?: number },
+  cursorScope = sessionId,
 ): { entries: SessionHistoryEntry[]; next_cursor: string | null; truncated: boolean } {
-  return paginateHistory(buildHistoryEntries(engine, content, sessionId), sessionId, opts);
+  return paginateHistory(buildHistoryEntries(engine, content, sessionId), cursorScope, opts);
 }
 
 export function buildHistoryEntries(engine: HistoryEngine, content: string, sessionId: string): SessionHistoryEntry[] {
@@ -41,11 +42,11 @@ export function buildHistoryEntries(engine: HistoryEngine, content: string, sess
 
 export function paginateHistory(
   entries: readonly SessionHistoryEntry[],
-  sessionId: string,
+  cursorScope: string,
   opts: { cursor?: string; limit?: number } = {},
 ): { entries: SessionHistoryEntry[]; next_cursor: string | null; truncated: boolean } {
   const limit = clampLimit(opts.limit);
-  const sig = sessionSig(sessionId);
+  const sig = sessionSig(cursorScope);
   const boundary = opts.cursor === undefined ? entries.length : decodeHistoryCursor(opts.cursor, entries.length, sig).b;
   let start = boundary;
   let count = 0;
