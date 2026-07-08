@@ -49,6 +49,8 @@ import { validateWorkspace } from "../src/workspace/worktree";
 import { SessionEnumerator, type SessionInfo } from "../src/sessions/enumerator";
 import {
   HISTORY_CONTENT_CAP,
+  HISTORY_ENTRY_BYTE_MAX,
+  HISTORY_PAGE_MAX,
   HISTORY_TOOL_IO_CAP,
   HistoryCursorError,
   buildHistoryEntries,
@@ -3275,6 +3277,181 @@ function scenarioAV(): void {
     truncated: false,
   });
   check("AV10 produced history entries validate against the v2 wire schema", claudeWire.success && codexWire.success);
+
+  type SessionHistoryResponse = Extract<MessageV2, { type: "session.history.response" }>;
+  const historyResponse = (
+    page: { entries: SessionHistoryResponse["entries"]; next_cursor: string | null; truncated: boolean },
+    requestId: string,
+  ): SessionHistoryResponse => ({
+    id: `m-${requestId}`,
+    ts: "2026-07-06T02:30:00.000Z",
+    type: "session.history.response",
+    request_id: requestId,
+    entries: page.entries,
+    next_cursor: page.next_cursor,
+    truncated: page.truncated,
+  });
+  const historyResponseBytes = (response: SessionHistoryResponse): number => Buffer.byteLength(JSON.stringify(response), "utf8");
+
+  const largeSessionId = "claude-av-large-session";
+  const timestampAt = (offsetSeconds: number): string => new Date(Date.UTC(2026, 6, 7, 0, 0, offsetSeconds)).toISOString();
+  const largeToolInput = "I".repeat(HISTORY_TOOL_IO_CAP + 31);
+  const largeToolOutput = "O".repeat(HISTORY_TOOL_IO_CAP + 37);
+  const largeContentRecords = [
+    ...Array.from({ length: 72 }, (_, i) => ({
+      type: "user",
+      timestamp: timestampAt(i),
+      message: { role: "user", content: `${i}:${"M".repeat(HISTORY_CONTENT_CAP + 101)}` },
+    })),
+    {
+      type: "assistant",
+      timestamp: timestampAt(72),
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "oversized tool entry" },
+          ...Array.from({ length: HISTORY_PAGE_MAX }, (_, i) => ({
+            type: "tool_use",
+            id: `large_call_${i}`,
+            name: "shell",
+            input: `${i}:${largeToolInput}`,
+          })),
+        ],
+      },
+    },
+    {
+      type: "user",
+      timestamp: timestampAt(73),
+      message: {
+        role: "user",
+        content: Array.from({ length: HISTORY_PAGE_MAX }, (_, i) => ({
+          type: "tool_result",
+          tool_use_id: `large_call_${i}`,
+          content: `${i}:${largeToolOutput}`,
+        })),
+      },
+    },
+  ];
+  const largeContentFixture = jsonlFixture(largeContentRecords);
+  const largeEntries = buildHistoryEntries("claude", largeContentFixture, largeSessionId);
+  const largeOversizedEntry = largeEntries.find((e) => e.content === "oversized tool entry");
+  const largeDroppedTools = HISTORY_PAGE_MAX - (largeOversizedEntry?.tool_calls?.length ?? 0);
+
+  const largeWalkedIds: string[] = [];
+  let largeCursor: string | undefined;
+  let largeWalkTerminated = false;
+  let largePagesFitFrame = true;
+  let largePagesNonEmpty = true;
+  for (let i = 0; i < 20; i++) {
+    const page = readSessionHistory("claude", largeContentFixture, largeSessionId, { limit: HISTORY_PAGE_MAX, cursor: largeCursor });
+    const response = historyResponse(page, `req-av11-${i}`);
+    largePagesFitFrame =
+      largePagesFitFrame &&
+      historyResponseBytes(response) <= LIMITS.MAX_FRAME_BYTES &&
+      safeParseMessageV2(response).success &&
+      page.entries.every((entry) => Buffer.byteLength(JSON.stringify(entry), "utf8") <= HISTORY_ENTRY_BYTE_MAX);
+    largePagesNonEmpty = largePagesNonEmpty && page.entries.length > 0;
+    largeWalkedIds.push(...page.entries.map((entry) => entry.entry_id));
+    if (page.next_cursor === null) {
+      largeWalkTerminated = true;
+      break;
+    }
+    largeCursor = page.next_cursor;
+  }
+  check(
+    "AV11 large history pages stay under the frame cap and walk without dup/skip",
+    largePagesFitFrame &&
+      largePagesNonEmpty &&
+      largeWalkTerminated &&
+      largeWalkedIds.length === largeEntries.length &&
+      new Set(largeWalkedIds).size === largeEntries.length &&
+      largeEntries.every((entry) => largeWalkedIds.includes(entry.entry_id)) &&
+      largeDroppedTools > 0 &&
+      largeOversizedEntry?.omitted?.some((item) => item.kind === "other" && item.count === largeDroppedTools) === true,
+  );
+
+  const duplicateClaudeContent = jsonlFixture([
+    {
+      type: "assistant",
+      timestamp: "2026-07-06T03:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "duplicate claude calls" },
+          { type: "tool_use", id: "dup_call", name: "shell", input: "first" },
+          { type: "tool_use", id: "dup_call", name: "shell", input: "second" },
+        ],
+      },
+    },
+    {
+      type: "user",
+      timestamp: "2026-07-06T03:00:01.000Z",
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "dup_call", content: "claude result 1" },
+          { type: "tool_result", tool_use_id: "dup_call", content: "claude result 2" },
+        ],
+      },
+    },
+  ]);
+  const duplicateClaudeCalls = buildHistoryEntries("claude", duplicateClaudeContent, "claude-av-duplicate-session").flatMap((e) => e.tool_calls ?? []);
+  const duplicateCodexContent = jsonlFixture([
+    {
+      type: "response_item",
+      timestamp: "2026-07-06T03:01:00.000Z",
+      payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "duplicate codex calls" }] },
+    },
+    { type: "response_item", timestamp: "2026-07-06T03:01:01.000Z", payload: { type: "function_call", call_id: "dup_call", name: "shell", arguments: "first" } },
+    { type: "response_item", timestamp: "2026-07-06T03:01:02.000Z", payload: { type: "function_call_output", call_id: "dup_call", output: "codex result 1" } },
+    { type: "response_item", timestamp: "2026-07-06T03:01:03.000Z", payload: { type: "function_call", call_id: "dup_call", name: "shell", arguments: "second" } },
+    { type: "response_item", timestamp: "2026-07-06T03:01:04.000Z", payload: { type: "function_call_output", call_id: "dup_call", output: "codex result 2" } },
+  ]);
+  const duplicateCodexCalls = buildHistoryEntries("codex", duplicateCodexContent, "codex-av-duplicate-session").flatMap((e) => e.tool_calls ?? []);
+  check(
+    "AV12 duplicate tool-call ids consume results FIFO",
+    duplicateClaudeCalls.length === 2 &&
+      duplicateClaudeCalls[0]?.output === "claude result 1" &&
+      duplicateClaudeCalls[0].status === "ok" &&
+      duplicateClaudeCalls[1]?.output === "claude result 2" &&
+      duplicateClaudeCalls[1].status === "ok" &&
+      duplicateCodexCalls.length === 2 &&
+      duplicateCodexCalls[0]?.output === "codex result 1" &&
+      duplicateCodexCalls[0].status === "ok" &&
+      duplicateCodexCalls[1]?.output === "codex result 2" &&
+      duplicateCodexCalls[1].status === "ok",
+  );
+
+  const cursorContentA = jsonlFixture(
+    Array.from({ length: 4 }, (_, i) => ({
+      type: "user",
+      timestamp: `2026-07-06T03:02:0${i}.000Z`,
+      message: { role: "user", content: `cursor A ${i}` },
+    })),
+  );
+  const cursorContentB = jsonlFixture(
+    Array.from({ length: 4 }, (_, i) => ({
+      type: "user",
+      timestamp: `2026-07-06T03:03:0${i}.000Z`,
+      message: { role: "user", content: `cursor B ${i}` },
+    })),
+  );
+  const cursorA1 = readSessionHistory("claude", cursorContentA, "cursor-session-a", { limit: 2 });
+  const cursorA2 = readSessionHistory("claude", cursorContentA, "cursor-session-a", { limit: 2, cursor: cursorA1.next_cursor ?? undefined });
+  let crossSessionCursorRejected = false;
+  try {
+    readSessionHistory("claude", cursorContentB, "cursor-session-b", { limit: 2, cursor: cursorA1.next_cursor ?? undefined });
+  } catch (e) {
+    crossSessionCursorRejected = e instanceof HistoryCursorError && e.code === "cursor_invalid";
+  }
+  check(
+    "AV13 history cursors are bound to the session id",
+    typeof cursorA1.next_cursor === "string" &&
+      cursorA2.entries.length === 2 &&
+      cursorA2.entries[0]?.content === "cursor A 0" &&
+      cursorA2.next_cursor === null &&
+      crossSessionCursorRejected,
+  );
 }
 
 async function scenarioAQ(): Promise<void> {
