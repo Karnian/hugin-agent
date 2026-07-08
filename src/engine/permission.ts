@@ -160,10 +160,10 @@ export class ApprovalBridge {
   }
 }
 
-/** How claude should launch the permission MCP server (for `--mcp-config`). Runs
- *  this file under `tsx` (dev); a compiled deploy would point at the built .js. */
+/** How claude should launch the permission MCP server (for `--mcp-config`). */
 export function permissionServerLaunch(): { command: string; args: string[] } {
   const self = fileURLToPath(import.meta.url);
+  if (self.endsWith(".js")) return { command: process.execPath, args: [self] };
   const tsxBin = fileURLToPath(new URL("../../node_modules/.bin/tsx", import.meta.url));
   return { command: tsxBin, args: [self] };
 }

@@ -1,5 +1,6 @@
+#!/usr/bin/env node
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -81,7 +82,9 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env): RuntimePaths
 }
 
 export function daemonEntryPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "index.ts");
+  const self = fileURLToPath(import.meta.url);
+  const extension = self.endsWith(".js") ? ".js" : ".ts";
+  return join(dirname(self), `index${extension}`);
 }
 
 function parseDaemonArgs(raw: string | undefined): string[] {
@@ -100,7 +103,9 @@ function parseDaemonArgs(raw: string | undefined): string[] {
 export function daemonCommand(env: NodeJS.ProcessEnv = process.env): DaemonCommand {
   const override = env.HUGIND_DAEMON_CMD?.trim();
   if (override) return { command: override, args: parseDaemonArgs(env.HUGIND_DAEMON_ARGS) };
-  return { command: process.execPath, args: ["--import", "tsx", daemonEntryPath()] };
+  const entry = daemonEntryPath();
+  if (entry.endsWith(".js")) return { command: process.execPath, args: [entry] };
+  return { command: process.execPath, args: ["--import", "tsx", entry] };
 }
 
 function daemonCommandLine(cmd: DaemonCommand): string {
@@ -718,7 +723,21 @@ export async function runCli(argv = process.argv.slice(2), env: NodeJS.ProcessEn
   return result.code;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/** True when this module is the process entrypoint. Compares REAL paths so an
+ *  npm `bin` symlink (dist/cli.js reached via a symlinked `hugind`) still counts
+ *  as main — `process.argv[1]` is the symlink while `import.meta.url` is the
+ *  resolved file, so a plain URL compare would miss it and the CLI would no-op. */
+function invokedAsMain(): boolean {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return import.meta.url === pathToFileURL(argv1).href;
+  }
+}
+
+if (invokedAsMain()) {
   runCli().then(
     (code) => process.exit(code),
     (e) => {
