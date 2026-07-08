@@ -78,7 +78,7 @@ These are the theoretical floor of pidfile supervision and are unlikely to be hi
 
 ## macOS launchd
 
-Edit `service/com.contextualai.hugind.plist` before installing:
+Edit `service/com.hugin-agent.plist` before installing:
 
 - Replace `/usr/local/bin/node` with the absolute path from `which node`.
 - Replace `/opt/hugin-agent` and `/opt/hugin-agent/src/index.ts` with this repo's absolute path.
@@ -89,10 +89,10 @@ Install/start:
 
 ```bash
 mkdir -p ~/Library/LaunchAgents ~/Library/Logs
-cp service/com.contextualai.hugind.plist ~/Library/LaunchAgents/
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.contextualai.hugind.plist
-launchctl kickstart -k "gui/$(id -u)/com.contextualai.hugind"
-launchctl print "gui/$(id -u)/com.contextualai.hugind"
+cp service/com.hugin-agent.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.hugin-agent.plist
+launchctl kickstart -k "gui/$(id -u)/com.hugin-agent"
+launchctl print "gui/$(id -u)/com.hugin-agent"
 ```
 
 Logs:
@@ -104,8 +104,8 @@ tail -f ~/Library/Logs/hugind.out.log ~/Library/Logs/hugind.err.log
 Uninstall/stop:
 
 ```bash
-launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.contextualai.hugind.plist
-rm -f ~/Library/LaunchAgents/com.contextualai.hugind.plist
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.hugin-agent.plist
+rm -f ~/Library/LaunchAgents/com.hugin-agent.plist
 ```
 
 ## Linux systemd user service

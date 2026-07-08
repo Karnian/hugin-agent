@@ -1,15 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- launchd agent for hugind (macOS). Template — fill REPLACE_ME + absolute paths, then:
-       cp service/com.contextualai.hugind.plist ~/Library/LaunchAgents/
-       launchctl load ~/Library/LaunchAgents/com.contextualai.hugind.plist
+       cp service/com.hugin-agent.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.hugin-agent.plist
      A LaunchAgent (not Daemon) so it runs in your login session — the macOS
      keychain Claude login is per-user and needs that session.
      ProgramArguments must use absolute paths for node and src/index.ts. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.contextualai.hugind</string>
+  <string>com.hugin-agent</string>
   <key>WorkingDirectory</key>
   <string>/opt/hugin-agent</string>
   <key>ProgramArguments</key>
