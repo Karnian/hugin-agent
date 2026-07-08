@@ -574,6 +574,7 @@ export const SessionInfo = z.strictObject({
   created_at: Iso,
   updated_at: Iso,
   active: z.boolean(),
+  is_subagent: z.boolean(),
   msg_count: PosInt,
 });
 
@@ -605,6 +606,7 @@ const SessionListFilter = z.strictObject({
   cwd_prefix: z.string().optional(),
   active_only: z.boolean().optional(),
   updated_after: Iso.optional(),
+  include_subagents: z.boolean().optional(),
 });
 
 const SessionListPage = z.strictObject({

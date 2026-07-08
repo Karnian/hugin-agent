@@ -34,6 +34,20 @@
       "canonical": "{\"filter\":{\"active_only\":true,\"cwd_prefix\":\"/work\",\"engine\":\"codex\",\"updated_after\":\"2026-01-01T00:00:00.000Z\"},\"id\":\"m-session-list-req-2\",\"page\":{\"cursor\":\"cursor-1\",\"limit\":2},\"request_id\":\"req-list-2\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.request\"}"
     },
     {
+      "label": "session.list.request-include-subagents",
+      "type": "session.list.request",
+      "message": {
+        "id": "m-session-list-req-3",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.request",
+        "request_id": "req-list-3",
+        "filter": {
+          "include_subagents": true
+        }
+      },
+      "canonical": "{\"filter\":{\"include_subagents\":true},\"id\":\"m-session-list-req-3\",\"request_id\":\"req-list-3\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.request\"}"
+    },
+    {
       "label": "session.list.response-empty-next-cursor-string",
       "type": "session.list.response",
       "message": {
@@ -67,13 +81,14 @@
             "created_at": "2026-01-01T00:00:00.000Z",
             "updated_at": "2026-01-01T00:01:00.000Z",
             "active": true,
+            "is_subagent": false,
             "msg_count": 3
           }
         ],
         "next_cursor": null,
         "truncated": false
       },
-      "canonical": "{\"id\":\"m-session-list-resp-2\",\"next_cursor\":null,\"request_id\":\"req-list-2\",\"sessions\":[{\"active\":true,\"cli_version\":\"0.140.0\",\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/repo\",\"engine\":\"codex\",\"git_branch\":\"main\",\"handle\":\"sess-main\",\"msg_count\":3,\"session_id\":\"s_0123456789abcdef0123456789abcdef\",\"title\":\"Investigate failing test\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
+      "canonical": "{\"id\":\"m-session-list-resp-2\",\"next_cursor\":null,\"request_id\":\"req-list-2\",\"sessions\":[{\"active\":true,\"cli_version\":\"0.140.0\",\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/repo\",\"engine\":\"codex\",\"git_branch\":\"main\",\"handle\":\"sess-main\",\"is_subagent\":false,\"msg_count\":3,\"session_id\":\"s_0123456789abcdef0123456789abcdef\",\"title\":\"Investigate failing test\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
     },
     {
       "label": "session.list.response-one-session-next-cursor-omitted",
@@ -95,12 +110,13 @@
             "created_at": "2026-01-01T00:00:00.000Z",
             "updated_at": "2026-01-01T00:01:00.000Z",
             "active": false,
+            "is_subagent": true,
             "msg_count": 1
           }
         ],
         "truncated": false
       },
-      "canonical": "{\"id\":\"m-session-list-resp-3\",\"request_id\":\"req-list-3\",\"sessions\":[{\"active\":false,\"cli_version\":null,\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/other\",\"engine\":\"claude\",\"git_branch\":null,\"handle\":\"sess-no-meta\",\"msg_count\":1,\"session_id\":\"s_fedcba9876543210fedcba9876543210\",\"title\":\"Draft migration plan\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
+      "canonical": "{\"id\":\"m-session-list-resp-3\",\"request_id\":\"req-list-3\",\"sessions\":[{\"active\":false,\"cli_version\":null,\"created_at\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/work/other\",\"engine\":\"claude\",\"git_branch\":null,\"handle\":\"sess-no-meta\",\"is_subagent\":true,\"msg_count\":1,\"session_id\":\"s_fedcba9876543210fedcba9876543210\",\"title\":\"Draft migration plan\",\"updated_at\":\"2026-01-01T00:01:00.000Z\"}],\"truncated\":false,\"ts\":\"2026-01-01T00:00:00.000Z\",\"type\":\"session.list.response\"}"
     },
     {
       "label": "session.history.request-minimal",
@@ -592,6 +608,45 @@
         "filter": {
           "engine": null
         }
+      }
+    },
+    {
+      "label": "session.list.request-filter-include-subagents-string",
+      "reason": "bad-field-type",
+      "raw": {
+        "id": "m-session-neg-list",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.request",
+        "request_id": "req-list-neg",
+        "filter": {
+          "include_subagents": "yes"
+        }
+      }
+    },
+    {
+      "label": "session.list.response-session-missing-is-subagent",
+      "reason": "missing-required-field",
+      "raw": {
+        "id": "m-session-neg-list-response",
+        "ts": "2026-01-01T00:00:00.000Z",
+        "type": "session.list.response",
+        "request_id": "req-list-neg",
+        "sessions": [
+          {
+            "handle": "sess-main",
+            "session_id": "s_0123456789abcdef0123456789abcdef",
+            "engine": "codex",
+            "cwd": "/work/repo",
+            "git_branch": "main",
+            "cli_version": "0.140.0",
+            "title": "Investigate failing test",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "updated_at": "2026-01-01T00:01:00.000Z",
+            "active": true,
+            "msg_count": 3
+          }
+        ],
+        "truncated": false
       }
     },
     {

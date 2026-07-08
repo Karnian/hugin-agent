@@ -2516,12 +2516,14 @@ function createSessionFixtureStore(): SessionFixtureStore {
   const outsideRoot = join(base, "outside");
   const claudeCwd = join(allowRoot, "repo-claude");
   const codexCwd = join(allowRoot, "repo-codex");
+  const codexSubagentCwd = join(allowRoot, "repo-codex-subagent");
   const outsideCwd = join(outsideRoot, "repo-outside");
   const claudeProjectsDir = join(base, "claude", "projects");
   const codexSessionsDir = join(base, "codex", "sessions");
   const nowMs = Date.parse("2026-07-05T12:00:00.000Z");
   mkdirSync(claudeCwd, { recursive: true });
   mkdirSync(codexCwd, { recursive: true });
+  mkdirSync(codexSubagentCwd, { recursive: true });
   mkdirSync(outsideCwd, { recursive: true });
 
   writeJsonlFixture(
@@ -2530,9 +2532,20 @@ function createSessionFixtureStore(): SessionFixtureStore {
       { type: "system", timestamp: "2026-07-05T10:00:00.000Z", message: "init" },
       { type: "system", timestamp: "2026-07-05T10:00:01.000Z", cwd: claudeCwd, gitBranch: "main", version: "1.2.3" },
       { type: "ai-title", timestamp: "2026-07-05T10:00:02.000Z", title: "Claude fixture title\nwith extra spacing" },
-      { type: "user", timestamp: "2026-07-05T10:00:03.000Z", message: { role: "user", content: "SENSITIVE_PROMPT_CLAUDE" } },
+      { type: "user", timestamp: "2026-07-05T10:00:03.000Z", isSidechain: false, message: { role: "user", content: "SENSITIVE_PROMPT_CLAUDE" } },
     ],
     nowMs - 5 * 60 * 1000,
+  );
+
+  writeJsonlFixture(
+    join(claudeProjectsDir, "encoded-claude", "77777777-7777-4777-8777-777777777777.jsonl"),
+    [
+      { type: "system", timestamp: "2026-07-05T10:02:00.000Z", cwd: claudeCwd, gitBranch: "sidechain", version: "1.2.4" },
+      { type: "ai-title", timestamp: "2026-07-05T10:02:01.000Z", title: "Claude sidechain fixture" },
+      { type: "user", timestamp: "2026-07-05T10:02:02.000Z", isSidechain: true, message: { role: "user", content: "SENSITIVE_SIDECHAIN_PROMPT" } },
+      { type: "assistant", timestamp: "2026-07-05T10:02:03.000Z", isSidechain: true, message: { role: "assistant", content: "SENSITIVE_SIDECHAIN_REPLY" } },
+    ],
+    nowMs - 4 * 60 * 1000,
   );
 
   writeJsonlFixture(
@@ -2544,6 +2557,7 @@ function createSessionFixtureStore(): SessionFixtureStore {
           id: "codex-fixture-session",
           cwd: codexCwd,
           cli_version: "0.4.5",
+          source: "exec",
           timestamp: "2026-07-05T09:30:00.000Z",
           base_instructions: "BASE_INSTRUCTIONS_SECRET",
         },
@@ -2558,6 +2572,32 @@ function createSessionFixtureStore(): SessionFixtureStore {
       { type: "event_msg", payload: { type: "assistant_message", message: "ASSISTANT_OUTPUT_SECRET" } },
     ],
     nowMs - 30 * 60 * 1000,
+  );
+
+  writeJsonlFixture(
+    join(codexSessionsDir, "2026", "07", "05", "rollout-2026-07-05T10-03-00-88888888-8888-4888-8888-888888888888.jsonl"),
+    [
+      {
+        type: "session_meta",
+        payload: {
+          id: "codex-subagent-session",
+          cwd: codexSubagentCwd,
+          cli_version: "0.4.6",
+          source: { subagent: "review" },
+          timestamp: "2026-07-05T10:03:00.000Z",
+          base_instructions: "BASE_INSTRUCTIONS_SUBAGENT_SECRET",
+        },
+      },
+      {
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "SENSITIVE_CODEX_SUBAGENT_PROMPT",
+        },
+      },
+      { type: "event_msg", payload: { type: "assistant_message", message: "SENSITIVE_CODEX_SUBAGENT_REPLY" } },
+    ],
+    nowMs - 6 * 60 * 1000,
   );
 
   writeJsonlFixture(
@@ -2616,13 +2656,35 @@ async function scenarioAP(): Promise<void> {
         claude.created_at === "2026-07-05T10:00:00.000Z" &&
         claude.msg_count === 4 &&
         claude.active === true &&
+        claude.is_subagent === false &&
         codex?.cwd === "repo-codex" &&
         codex.git_branch === null &&
         codex.cli_version === "0.4.5" &&
         codex.title === "codex · repo-codex" &&
         codex.created_at === "2026-07-05T09:30:00.000Z" &&
         codex.msg_count === 3 &&
-        codex.active === false,
+        codex.active === false &&
+        codex.is_subagent === false,
+    );
+
+    const withSubagents = enumerator.list({ filter: { include_subagents: true } }).sessions;
+    const claudeSidechain = withSubagents.find((s) => s.engine === "claude" && s.title === "Claude sidechain fixture");
+    const codexSubagent = withSubagents.find((s) => s.engine === "codex" && s.cwd === "repo-codex-subagent");
+    const includedClaudeMain = withSubagents.find((s) => s.handle === claude?.handle);
+    const includedCodexMain = withSubagents.find((s) => s.handle === codex?.handle);
+    check(
+      "AP1b session.list defaults exclude subagents and include_subagents restores them",
+      sessions.length === 2 &&
+        sessions.every((s) => s.is_subagent === false) &&
+        withSubagents.length === 4 &&
+        includedClaudeMain?.is_subagent === false &&
+        includedCodexMain?.is_subagent === false &&
+        claudeSidechain?.is_subagent === true &&
+        claudeSidechain.cwd === "repo-claude" &&
+        claudeSidechain.msg_count === 4 &&
+        codexSubagent?.is_subagent === true &&
+        codexSubagent.cli_version === "0.4.6" &&
+        withSubagents.filter((s) => s.is_subagent).length === 2,
     );
 
     const codexOnly = enumerator.list({ filter: { engine: "codex" } }).sessions;
@@ -2642,21 +2704,32 @@ async function scenarioAP(): Promise<void> {
     );
 
     const serialized = JSON.stringify(sessions);
+    const serializedWithSubagents = JSON.stringify(withSubagents);
     const emptyAllowlist = fixtureEnumerator(fx, []).list({});
     check(
       "AP2 out-of-allowlist sessions excluded and empty allowlist returns empty",
       !serialized.includes("Outside should not appear") && emptyAllowlist.sessions.length === 0 && emptyAllowlist.truncated === false,
     );
-    check("AP3 nested claude subagents logs are excluded", !serialized.includes("Nested should not appear"));
+    check(
+      "AP3 default list excludes nested and classified subagent logs",
+      !serialized.includes("Nested should not appear") &&
+        !serialized.includes("Claude sidechain fixture") &&
+        !serialized.includes("repo-codex-subagent"),
+    );
     check(
       "AP4 response is redacted metadata only",
-        !serialized.includes("SENSITIVE_PROMPT_CLAUDE") &&
-        !serialized.includes("Codex fixture title with a concise request") &&
-        !serialized.includes("SENSITIVE_PERMISSIONS_SECRET") &&
-        !serialized.includes("ASSISTANT_OUTPUT_SECRET") &&
-        !serialized.includes("BASE_INSTRUCTIONS_SECRET") &&
-        !serialized.includes(fx.base) &&
-        sessions.every((s) => !("content" in s) && !("path" in s)),
+      !serializedWithSubagents.includes("SENSITIVE_PROMPT_CLAUDE") &&
+        !serializedWithSubagents.includes("Codex fixture title with a concise request") &&
+        !serializedWithSubagents.includes("SENSITIVE_PERMISSIONS_SECRET") &&
+        !serializedWithSubagents.includes("ASSISTANT_OUTPUT_SECRET") &&
+        !serializedWithSubagents.includes("BASE_INSTRUCTIONS_SECRET") &&
+        !serializedWithSubagents.includes("SENSITIVE_SIDECHAIN_PROMPT") &&
+        !serializedWithSubagents.includes("SENSITIVE_SIDECHAIN_REPLY") &&
+        !serializedWithSubagents.includes("BASE_INSTRUCTIONS_SUBAGENT_SECRET") &&
+        !serializedWithSubagents.includes("SENSITIVE_CODEX_SUBAGENT_PROMPT") &&
+        !serializedWithSubagents.includes("SENSITIVE_CODEX_SUBAGENT_REPLY") &&
+        !serializedWithSubagents.includes(fx.base) &&
+        withSubagents.every((s) => typeof s.is_subagent === "boolean" && !("content" in s) && !("path" in s)),
     );
 
     const freshSessions = fixtureEnumerator(fx).list({}).sessions;
@@ -2726,6 +2799,7 @@ async function scenarioAP(): Promise<void> {
       "AP6 v2 daemon replies over the wire with enumerated sessions",
       ap6.response?.request_id === "session-list-e2e" &&
         ap6Sessions.length === 2 &&
+        ap6Sessions.every((s) => s.is_subagent === false) &&
         byEngine(ap6Sessions, "claude")?.cwd === "repo-claude" &&
         byEngine(ap6Sessions, "codex")?.cwd === "repo-codex",
     );
