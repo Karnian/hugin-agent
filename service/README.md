@@ -65,6 +65,17 @@ npm run hugind:stop
 # Optional: remove the lifecycle state dir if you no longer need hugind.pid or hugind.log.
 ```
 
+### Known limits of the lifecycle CLI (use a service manager for production)
+
+The `hugind start/stop/status` CLI supervises the daemon through a **pidfile**, which has inherent, narrow race/verification edges that cannot be fully closed without OS-level process tracking or file locking:
+
+- **claim→record window**: if the `start` process itself is killed in the sub-second window *after* it spawned the detached daemon but *before* it published the pid record, a concurrent `start` can treat the abandoned claim as stale and spawn a second daemon.
+- **pidfile removal is not atomic**: `stop` removes the pidfile only if it still holds the pid it acted on, but a concurrent `start` writing a new record between that check and the unlink can still be clobbered.
+- **PID reuse**: ownership is verified best-effort by the recorded command line (`ps` on macOS/Linux; alive-only on Windows / when `ps` is unavailable). A recorded PID that the OS later reuses for an unrelated process can be mis-reported (and a legacy bare-number pidfile requires `--force` to stop).
+- **readiness is log-based**: `start` waits for the `hugind starting` marker plus a short stability window (capped via `HUGIND_READY_STABLE_MS`, max 30s), so a daemon that logs the marker and then crashes *after* that window is still reported started. True readiness would require a daemon-side handshake.
+
+These are the theoretical floor of pidfile supervision and are unlikely to be hit in normal single-operator use. **For production/boot/crash robustness, use the launchd or systemd unit below** — those track the process directly (launchd `KeepAlive`, systemd cgroup + `Restart=always`) and do not have these races. Once the daemon process is resident, it auto-reconnects within ~10s of a C2 restart regardless of how it is supervised.
+
 ## macOS launchd
 
 Edit `service/com.contextualai.hugind.plist` before installing:

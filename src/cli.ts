@@ -40,6 +40,8 @@ export type StopDecision = "kill" | "refuse-unverified" | "stale" | "not-running
 const ACTIVE_CLAIM_GRACE_MS = 2000;
 const DEFAULT_READY_TIMEOUT_MS = 4000;
 const DEFAULT_READY_STABLE_MS = 500;
+/** Hard cap on the readiness windows so a large HUGIND_READY_* value can't hang `start`. */
+const MAX_READY_MS = 30_000;
 const READY_POLL_MS = 150;
 const DEFAULT_READY_MARKER = "hugind starting";
 
@@ -402,11 +404,15 @@ function logContainsMarkerSince(logfile: string, marker: string, offset: number)
   }
 }
 
-function envMs(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+export function envMs(env: NodeJS.ProcessEnv, name: string, fallback: number, max = Number.POSITIVE_INFINITY): number {
   const raw = env[name]?.trim();
-  if (!raw) return fallback;
+  if (!raw) return Math.min(fallback, max);
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  if (!(Number.isFinite(parsed) && parsed >= 0)) return Math.min(fallback, max);
+  // Cap the readiness windows so a large/hostile env value can never make
+  // `start` hang; the residual "marker-then-crash after the window" edge is an
+  // inherent limit of log-based readiness (see service/README.md).
+  return Math.min(parsed, max);
 }
 
 interface ChildState {
@@ -442,8 +448,8 @@ async function waitForDaemonReadiness(
   logOffset: number,
 ): Promise<LifecycleResult> {
   const marker = env.HUGIND_READY_MARKER ?? DEFAULT_READY_MARKER;
-  const timeoutMs = envMs(env, "HUGIND_READY_TIMEOUT_MS", DEFAULT_READY_TIMEOUT_MS);
-  const stableMs = envMs(env, "HUGIND_READY_STABLE_MS", DEFAULT_READY_STABLE_MS);
+  const timeoutMs = envMs(env, "HUGIND_READY_TIMEOUT_MS", DEFAULT_READY_TIMEOUT_MS, MAX_READY_MS);
+  const stableMs = envMs(env, "HUGIND_READY_STABLE_MS", DEFAULT_READY_STABLE_MS, MAX_READY_MS);
   const deadline = Date.now() + timeoutMs;
 
   while (true) {
