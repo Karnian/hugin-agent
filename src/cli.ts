@@ -1,7 +1,7 @@
-import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { closeSync, ftruncateSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export interface RuntimePaths {
@@ -15,10 +15,21 @@ export interface DaemonCommand {
   args: string[];
 }
 
+export interface PidRecord {
+  pid: number;
+  startedAt: number;
+  cmd: string;
+}
+
 interface LifecycleResult {
   code: number;
   message: string;
 }
+
+type ProcessMatch = "yes" | "no" | "unknown";
+
+const START_GRACE_MS = 500;
+const ACTIVE_CLAIM_GRACE_MS = 2000;
 
 function ensureDir(dir: string): string {
   mkdirSync(dir, { recursive: true });
@@ -78,16 +89,43 @@ export function daemonCommand(env: NodeJS.ProcessEnv = process.env): DaemonComma
   return { command: process.execPath, args: ["--import", "tsx", daemonEntryPath()] };
 }
 
-export function readPid(pidfile: string): number | null {
+function daemonCommandLine(cmd: DaemonCommand): string {
+  return [cmd.command, ...cmd.args].join(" ");
+}
+
+function isPidRecord(value: unknown): value is PidRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Partial<PidRecord>;
+  return (
+    Number.isInteger(record.pid) &&
+    (record.pid ?? 0) > 0 &&
+    typeof record.startedAt === "number" &&
+    Number.isFinite(record.startedAt) &&
+    typeof record.cmd === "string"
+  );
+}
+
+export function readRecord(pidfile: string): PidRecord | null {
   try {
     const raw = readFileSync(pidfile, "utf8").trim();
     if (!raw) return null;
-    const pid = Number(raw);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+
+    const legacyPid = Number(raw);
+    if (Number.isInteger(legacyPid) && legacyPid > 0) {
+      return { pid: legacyPid, startedAt: 0, cmd: "" };
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    return isPidRecord(parsed) ? parsed : null;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (e instanceof SyntaxError) return null;
     throw e;
   }
+}
+
+export function readPid(pidfile: string): number | null {
+  return readRecord(pidfile)?.pid ?? null;
 }
 
 export function removePidfile(pidfile: string): void {
@@ -104,37 +142,167 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
-function cleanStalePidfile(paths: RuntimePaths): void {
-  const pid = readPid(paths.pidfile);
-  if (pid !== null && !isPidAlive(pid)) removePidfile(paths.pidfile);
-  if (pid === null && existsSync(paths.pidfile)) removePidfile(paths.pidfile);
+function distinctiveTokens(cmd: string): string[] {
+  const common = new Set(["node", "node.exe", "tsx", "--import", "-e", "env"]);
+  const tokens = new Set<string>();
+  for (const part of cmd.split(/\s+/)) {
+    const cleaned = part.trim().replace(/^["']|["']$/g, "");
+    if (!cleaned) continue;
+    const base = basename(cleaned);
+    const candidates = common.has(base.toLowerCase()) ? [base] : [cleaned, base];
+    for (const candidate of candidates) {
+      if (
+        candidate.length >= 4 &&
+        !candidate.startsWith("-") &&
+        !common.has(candidate.toLowerCase()) &&
+        !/^\d+$/.test(candidate)
+      ) {
+        tokens.add(candidate);
+      }
+    }
+  }
+  return [...tokens];
 }
 
-export function startDaemon(env: NodeJS.ProcessEnv = process.env, paths = runtimePaths(env)): LifecycleResult {
-  const existingPid = readPid(paths.pidfile);
-  if (existingPid !== null && isPidAlive(existingPid)) {
-    return { code: 1, message: `already running (pid ${existingPid})` };
-  }
-  cleanStalePidfile(paths);
+export function processMatches(pid: number, cmd: string): ProcessMatch {
+  if (process.platform === "win32" || cmd.trim() === "") return "unknown";
 
-  const logfd = openSync(paths.logfile, "a");
+  let actual: string;
   try {
+    actual = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }).trim();
+  } catch {
+    return "unknown";
+  }
+
+  if (!actual) return "unknown";
+
+  const tokens = distinctiveTokens(cmd);
+  if (tokens.length === 0) return "unknown";
+  return tokens.some((token) => actual.includes(token)) ? "yes" : "no";
+}
+
+export function isOurDaemonRunning(record: PidRecord | null): boolean {
+  return record !== null && isPidAlive(record.pid) && processMatches(record.pid, record.cmd) !== "no";
+}
+
+function writeRecordFd(fd: number, record: PidRecord): void {
+  ftruncateSync(fd, 0);
+  writeFileSync(fd, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+function pidfileHoldsPid(pidfile: string, pid: number): boolean {
+  return readRecord(pidfile)?.pid === pid;
+}
+
+function isFreshPidfileClaim(pidfile: string): boolean {
+  try {
+    return Date.now() - statSync(pidfile).mtimeMs < ACTIVE_CLAIM_GRACE_MS;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+}
+
+function readLogTail(logfile: string, maxLines = 8): string {
+  try {
+    const raw = readFileSync(logfile, "utf8").trim();
+    if (!raw) return "";
+    return raw.split(/\r?\n/).slice(-maxLines).join("\n");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw e;
+  }
+}
+
+function startFailureMessage(paths: RuntimePaths, detail: string): string {
+  const tail = readLogTail(paths.logfile);
+  return tail ? `${detail}; logs: ${paths.logfile}\n${tail}` : `${detail}; logs: ${paths.logfile}`;
+}
+
+function claimPidfile(paths: RuntimePaths): { fd: number } | { result: LifecycleResult } {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return { fd: openSync(paths.pidfile, "wx") };
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code !== "EEXIST") throw e;
+
+      const existing = readRecord(paths.pidfile);
+      if (existing !== null && isOurDaemonRunning(existing)) {
+        return { result: { code: 1, message: `already running (pid ${existing.pid})` } };
+      }
+
+      if (attempt === 0 && (existing !== null || !isFreshPidfileClaim(paths.pidfile))) {
+        removePidfile(paths.pidfile);
+        continue;
+      }
+
+      return { result: { code: 1, message: "already running / try again" } };
+    }
+  }
+
+  return { result: { code: 1, message: "already running / try again" } };
+}
+
+export async function startDaemon(env: NodeJS.ProcessEnv = process.env, paths = runtimePaths(env)): Promise<LifecycleResult> {
+  const claim = claimPidfile(paths);
+  if ("result" in claim) return claim.result;
+
+  let pidfd: number | null = claim.fd;
+  let logfd: number | null = null;
+  try {
+    logfd = openSync(paths.logfile, "a");
     const cmd = daemonCommand(env);
+    const cmdLine = daemonCommandLine(cmd);
+    const childState: {
+      spawnError?: Error;
+      exit?: { code: number | null; signal: NodeJS.Signals | null };
+    } = {};
     const child = spawn(cmd.command, cmd.args, {
       detached: true,
       stdio: ["ignore", logfd, logfd],
       env,
       windowsHide: true,
     });
-    child.on("error", () => {});
+    child.on("error", (e) => {
+      childState.spawnError = e;
+    });
+    child.on("exit", (code, signal) => {
+      childState.exit = { code, signal };
+    });
     if (child.pid === undefined) {
-      return { code: 1, message: `failed to start hugind; logs: ${paths.logfile}` };
+      closeSync(pidfd);
+      pidfd = null;
+      removePidfile(paths.pidfile);
+      await sleep(50);
+      const reason = childState.spawnError ? `failed to start hugind: ${childState.spawnError.message}` : "failed to start hugind";
+      return { code: 1, message: startFailureMessage(paths, reason) };
     }
+
     child.unref();
-    writeFileSync(paths.pidfile, `${child.pid}\n`);
+    writeRecordFd(pidfd, { pid: child.pid, startedAt: Date.now(), cmd: cmdLine });
+    closeSync(pidfd);
+    pidfd = null;
+
+    await sleep(START_GRACE_MS);
+    const stillOwnsPidfile = pidfileHoldsPid(paths.pidfile, child.pid);
+    const childExit = childState.exit;
+    if (childExit !== undefined || !isPidAlive(child.pid) || !stillOwnsPidfile) {
+      if (stillOwnsPidfile) removePidfile(paths.pidfile);
+      const exitDetail =
+        childExit !== undefined
+          ? `failed to start hugind; child exited immediately (code ${childExit.code ?? "null"}, signal ${childExit.signal ?? "null"})`
+          : "failed to start hugind; child did not remain alive";
+      return { code: 1, message: startFailureMessage(paths, exitDetail) };
+    }
+
     return { code: 0, message: `hugind started (pid ${child.pid}) — logs: ${paths.logfile}` };
   } finally {
-    closeSync(logfd);
+    if (pidfd !== null) {
+      closeSync(pidfd);
+      removePidfile(paths.pidfile);
+    }
+    if (logfd !== null) closeSync(logfd);
   }
 }
 
@@ -156,12 +324,18 @@ export async function stopDaemon(
   paths = runtimePaths(env),
   opts: { force?: boolean; timeoutMs?: number } = {},
 ): Promise<LifecycleResult> {
-  const pid = readPid(paths.pidfile);
-  if (pid === null || !isPidAlive(pid)) {
+  const record = readRecord(paths.pidfile);
+  if (record === null || !isPidAlive(record.pid)) {
     removePidfile(paths.pidfile);
     return { code: 1, message: "not running" };
   }
 
+  if (processMatches(record.pid, record.cmd) === "no") {
+    removePidfile(paths.pidfile);
+    return { code: 1, message: "not running (stale pidfile removed)" };
+  }
+
+  const pid = record.pid;
   try {
     process.kill(pid);
   } catch (e) {
@@ -189,9 +363,9 @@ export async function stopDaemon(
 }
 
 export function statusDaemon(env: NodeJS.ProcessEnv = process.env, paths = runtimePaths(env)): LifecycleResult {
-  const pid = readPid(paths.pidfile);
-  if (pid !== null && isPidAlive(pid)) {
-    return { code: 0, message: `running (pid ${pid}, logs: ${paths.logfile})` };
+  const record = readRecord(paths.pidfile);
+  if (record !== null && isOurDaemonRunning(record)) {
+    return { code: 0, message: `running (pid ${record.pid}, logs: ${paths.logfile})` };
   }
   removePidfile(paths.pidfile);
   return { code: 1, message: "stopped" };
@@ -217,7 +391,7 @@ export async function runCli(argv = process.argv.slice(2), env: NodeJS.ProcessEn
   let result: LifecycleResult;
 
   if (command === "start") {
-    result = startDaemon(env, paths);
+    result = await startDaemon(env, paths);
   } else if (command === "stop") {
     result = await stopDaemon(env, paths, { force: args.includes("--force") });
   } else if (command === "status") {
@@ -225,8 +399,8 @@ export async function runCli(argv = process.argv.slice(2), env: NodeJS.ProcessEn
   } else if (command === "restart") {
     const stopped = await stopDaemon(env, paths, { force: args.includes("--force") });
     console.log(stopped.message);
-    if (stopped.code !== 0 && stopped.message !== "not running") return stopped.code;
-    result = startDaemon(env, paths);
+    if (stopped.code !== 0 && !stopped.message.startsWith("not running")) return stopped.code;
+    result = await startDaemon(env, paths);
   } else {
     result = usage();
   }
