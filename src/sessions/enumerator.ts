@@ -275,6 +275,9 @@ export class SessionEnumerator {
     const scoped = this.scopeCwd(cwd, allowed);
     if (!scoped) return null;
 
+    // Historical wire field: `is_subagent` now marks any non-primary session,
+    // either a nested subagent or a non-interactive/programmatic run.
+    const isNonPrimarySession = isSubagent || isProgrammaticClaude(head);
     const updatedAt = new Date(file.mtimeMs).toISOString();
     const createdAt = isoFromUnknown(head[0]?.timestamp) ?? updatedAt;
     const title = findClaudeTitle(head) ?? genericSessionTitle("claude", scoped.redacted, scoped.abs);
@@ -298,7 +301,7 @@ export class SessionEnumerator {
         created_at: createdAt,
         updated_at: updatedAt,
         active: this.now() - file.mtimeMs <= ACTIVE_WINDOW_MS,
-        is_subagent: isSubagent,
+        is_subagent: isNonPrimarySession,
         msg_count: lines.length,
       },
       sessionId,
@@ -316,8 +319,12 @@ export class SessionEnumerator {
     const first = head[0];
     const payload = objectField(first, "payload");
     if (first?.type !== "session_meta" || !payload) return null;
-    const source = objectField(payload, "source");
-    const isSubagent = source !== null && Object.prototype.hasOwnProperty.call(source, "subagent");
+    const sourceObj = objectField(payload, "source");
+    const sourceStr = stringField(payload, "source");
+    const originator = stringField(payload, "originator");
+    const isSubagentObj = sourceObj !== null && Object.prototype.hasOwnProperty.call(sourceObj, "subagent");
+    const isExec = sourceStr === "exec" || originator === "codex_exec";
+    const isSubagent = isSubagentObj || isExec;
 
     const cwd = stringField(payload, "cwd");
     if (!cwd) return null;
@@ -473,6 +480,14 @@ function findClaudeTitle(head: readonly Record<string, unknown>[]): string | nul
     }
   }
   return null;
+}
+
+function isProgrammaticClaude(head: readonly Record<string, unknown>[]): boolean {
+  for (const rec of head) {
+    const entrypoint = stringField(rec, "entrypoint");
+    if (entrypoint !== null) return entrypoint.startsWith("sdk");
+  }
+  return false;
 }
 
 function contentToText(value: unknown): string | null {
