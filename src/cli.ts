@@ -33,11 +33,13 @@ interface LifecycleResult {
   message: string;
 }
 
-type ProcessMatch = "yes" | "no" | "unknown";
+export type ProcessMatch = "yes" | "no" | "unknown";
 export type PidfileState = "running" | "starting" | "stale" | "none";
+export type StopDecision = "kill" | "refuse-unverified" | "stale" | "not-running" | "starting";
 
 const ACTIVE_CLAIM_GRACE_MS = 2000;
 const DEFAULT_READY_TIMEOUT_MS = 4000;
+const DEFAULT_READY_STABLE_MS = 500;
 const READY_POLL_MS = 150;
 const DEFAULT_READY_MARKER = "hugind starting";
 
@@ -155,6 +157,11 @@ function isFreshFingerprint(fingerprint: PidfileFingerprint): boolean {
   return Date.now() - fingerprint.mtimeMs < ACTIVE_CLAIM_GRACE_MS;
 }
 
+function isActiveClaim(claim: ClaimRecord, fingerprint: PidfileFingerprint): boolean {
+  if (claim.ownerPid !== undefined) return isPidAlive(claim.ownerPid);
+  return isFreshFingerprint(fingerprint);
+}
+
 function readPidfileSnapshot(pidfile: string): PidfileSnapshot {
   let fingerprint: PidfileFingerprint;
   try {
@@ -241,6 +248,12 @@ function distinctiveTokens(cmd: string): string[] {
 }
 
 export function processMatches(pid: number, cmd: string): ProcessMatch {
+  // Test-only deterministic override (mirrors HUGIND_DAEMON_CMD): forcing the
+  // ownership result is more reliable than trying to make `ps` fail via PATH,
+  // since macOS falls back to /bin/ps even with an empty PATH.
+  const forced = process.env.HUGIND_FORCE_MATCH;
+  if (forced === "yes" || forced === "no" || forced === "unknown") return forced;
+
   if (process.platform === "win32" || cmd.trim() === "") return "unknown";
 
   let actual: string;
@@ -269,7 +282,7 @@ function inspectPidfile(paths: RuntimePaths): PidfileInspection {
   const snapshot = readPidfileSnapshot(paths.pidfile);
   if (snapshot.kind === "none") return { state: "none", snapshot, legacy: false };
   if (snapshot.kind === "claim") {
-    return { state: isFreshFingerprint(snapshot.fingerprint) ? "starting" : "stale", snapshot, legacy: false };
+    return { state: isActiveClaim(snapshot.claim, snapshot.fingerprint) ? "starting" : "stale", snapshot, legacy: false };
   }
   if (snapshot.kind === "invalid") {
     return { state: isFreshFingerprint(snapshot.fingerprint) ? "starting" : "stale", snapshot, legacy: false };
@@ -287,12 +300,40 @@ export function pidfileState(paths: RuntimePaths): PidfileState {
   return inspectPidfile(paths).state;
 }
 
+export function stopDecision(
+  inspection: { state: PidfileState; record?: PidRecord; match?: ProcessMatch; legacy?: boolean },
+  force = false,
+): StopDecision {
+  if (inspection.state === "none") return "not-running";
+  if (inspection.state === "starting") return "starting";
+  if (inspection.state === "stale" || inspection.record === undefined || inspection.match === "no") return "stale";
+
+  const ownershipUnverified = inspection.legacy === true || inspection.match !== "yes";
+  if (ownershipUnverified && !force) return "refuse-unverified";
+  return "kill";
+}
+
 function sameFingerprint(a: PidfileFingerprint, b: PidfileFingerprint): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size;
 }
 
 function removePidfileIfUnchanged(pidfile: string, snapshot: PidfileSnapshot): boolean {
   if (snapshot.kind === "none") return false;
+  let current: PidfileFingerprint;
+  try {
+    current = fingerprintFromStat(statSync(pidfile));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+  if (!sameFingerprint(current, snapshot.fingerprint)) return false;
+  removePidfile(pidfile);
+  return true;
+}
+
+export function removePidfileIfHoldsPid(pidfile: string, pid: number): boolean {
+  const snapshot = readPidfileSnapshot(pidfile);
+  if (snapshot.kind !== "record" || snapshot.record.pid !== pid) return false;
   let current: PidfileFingerprint;
   try {
     current = fingerprintFromStat(statSync(pidfile));
@@ -380,6 +421,10 @@ function childExitDetail(childState: ChildState): string {
     : "failed to start hugind; child did not remain alive";
 }
 
+function cleanupStartedPidfile(paths: RuntimePaths, pid: number): void {
+  removePidfileIfHoldsPid(paths.pidfile, pid);
+}
+
 function killStartedChild(pid: number): void {
   if (!isPidAlive(pid)) return;
   try {
@@ -398,17 +443,35 @@ async function waitForDaemonReadiness(
 ): Promise<LifecycleResult> {
   const marker = env.HUGIND_READY_MARKER ?? DEFAULT_READY_MARKER;
   const timeoutMs = envMs(env, "HUGIND_READY_TIMEOUT_MS", DEFAULT_READY_TIMEOUT_MS);
+  const stableMs = envMs(env, "HUGIND_READY_STABLE_MS", DEFAULT_READY_STABLE_MS);
   const deadline = Date.now() + timeoutMs;
 
   while (true) {
     const stillOwnsPidfile = pidfileHoldsPid(paths.pidfile, pid);
     if (childState.exit !== undefined || !isPidAlive(pid) || !stillOwnsPidfile) {
-      if (stillOwnsPidfile) removePidfile(paths.pidfile);
+      if (stillOwnsPidfile) cleanupStartedPidfile(paths, pid);
       killStartedChild(pid);
       return { code: 1, message: startFailureMessage(paths, childExitDetail(childState)) };
     }
 
     if (logContainsMarkerSince(paths.logfile, marker, logOffset)) {
+      const stableDeadline = Date.now() + stableMs;
+      while (Date.now() < stableDeadline) {
+        const ownsDuringStability = pidfileHoldsPid(paths.pidfile, pid);
+        if (childState.exit !== undefined || !isPidAlive(pid) || !ownsDuringStability) {
+          if (ownsDuringStability) cleanupStartedPidfile(paths, pid);
+          killStartedChild(pid);
+          return { code: 1, message: startFailureMessage(paths, childExitDetail(childState)) };
+        }
+        await sleep(Math.min(READY_POLL_MS, stableDeadline - Date.now()));
+      }
+
+      const ownsAfterStability = pidfileHoldsPid(paths.pidfile, pid);
+      if (childState.exit !== undefined || !isPidAlive(pid) || !ownsAfterStability) {
+        if (ownsAfterStability) cleanupStartedPidfile(paths, pid);
+        killStartedChild(pid);
+        return { code: 1, message: startFailureMessage(paths, childExitDetail(childState)) };
+      }
       return { code: 0, message: `hugind started (pid ${pid}) — logs: ${paths.logfile}` };
     }
 
@@ -419,7 +482,7 @@ async function waitForDaemonReadiness(
 
   const stillOwnsPidfile = pidfileHoldsPid(paths.pidfile, pid);
   if (childState.exit !== undefined || !isPidAlive(pid) || !stillOwnsPidfile) {
-    if (stillOwnsPidfile) removePidfile(paths.pidfile);
+    if (stillOwnsPidfile) cleanupStartedPidfile(paths, pid);
     killStartedChild(pid);
     return { code: 1, message: startFailureMessage(paths, childExitDetail(childState)) };
   }
@@ -539,23 +602,28 @@ export async function stopDaemon(
   opts: { force?: boolean; timeoutMs?: number } = {},
 ): Promise<LifecycleResult> {
   const inspection = inspectPidfile(paths);
-  if (inspection.state === "none") {
+  const decision = stopDecision(inspection, opts.force === true);
+  if (decision === "not-running") {
     return { code: 1, message: "not running" };
   }
 
-  if (inspection.state === "starting") {
+  if (decision === "starting") {
     return { code: 1, message: "a start is in progress; retry" };
   }
 
-  if (inspection.state === "stale" || inspection.record === undefined) {
-    removePidfileIfUnchanged(paths.pidfile, inspection.snapshot);
+  if (decision === "stale" || inspection.record === undefined) {
+    if (inspection.record !== undefined) {
+      removePidfileIfHoldsPid(paths.pidfile, inspection.record.pid);
+    } else {
+      removePidfileIfUnchanged(paths.pidfile, inspection.snapshot);
+    }
     return { code: 1, message: "not running (stale pidfile removed)" };
   }
 
   const record = inspection.record;
   const pid = record.pid;
   const ownershipUnverified = inspection.legacy || inspection.match === "unknown";
-  if (inspection.legacy && !opts.force) {
+  if (decision === "refuse-unverified") {
     return {
       code: 1,
       message: `cannot verify this pidfile belongs to hugind; rerun with --force to terminate pid ${pid}, or remove the stale pidfile`,
@@ -569,7 +637,7 @@ export async function stopDaemon(
   }
 
   if (await waitForExit(pid, opts.timeoutMs ?? 5000)) {
-    removePidfile(paths.pidfile);
+    removePidfileIfHoldsPid(paths.pidfile, pid);
     const suffix = ownershipUnverified ? "; ownership could not be re-verified" : "";
     return { code: 0, message: `stopped (pid ${pid}${suffix})` };
   }
@@ -581,7 +649,7 @@ export async function stopDaemon(
       if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
     }
     if (await waitForExit(pid, 2000)) {
-      removePidfile(paths.pidfile);
+      removePidfileIfHoldsPid(paths.pidfile, pid);
       const suffix = ownershipUnverified ? "; ownership could not be re-verified" : "";
       return { code: 0, message: `stopped (pid ${pid}${suffix})` };
     }
