@@ -1,13 +1,21 @@
 {
   "name": "@contextualai/hugin-agent",
   "version": "0.0.0",
-  "private": true,
   "description": "Hugin Agent — outbound-only local bridge daemon that runs headless Claude Code / Codex CLI for a cloud orchestrator, without opening inbound ports.",
   "type": "module",
+  "bin": {
+    "hugind": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "service"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
+    "build": "tsup",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "protocol:check": "tsx protocol/v1/selftest.ts",
     "pairing:check": "tsx protocol/v1/pairing-selftest.ts",
@@ -36,6 +44,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.0.0",
     "@types/ws": "^8.18.1",
+    "tsup": "8.5.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }
