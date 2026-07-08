@@ -11,6 +11,7 @@ export interface SessionEnumeratorOpts {
   claudeProjectsDir: string;
   codexSessionsDir: string;
   allowlist: readonly string[];
+  maxSubagentFiles?: number;
   now?: () => number;
 }
 
@@ -43,6 +44,17 @@ interface ReadSessionFile {
   mtimeMs: number;
 }
 
+interface ClaudeScanResult {
+  candidates: SessionCandidate[];
+  subagentCapReached: boolean;
+}
+
+interface SubagentScanState {
+  files: number;
+  maxFiles: number;
+  capReached: boolean;
+}
+
 const HEAD_RECORD_LIMIT = 80;
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;
 const MAX_RESPONSE_SESSIONS = 256;
@@ -72,7 +84,12 @@ export class SessionEnumerator {
     if (allowed.length === 0) return { sessions: [], next_cursor: null, truncated: false };
 
     const candidates: SessionCandidate[] = [];
-    if (req.filter?.engine !== "codex") candidates.push(...this.scanClaude(allowed, req.filter?.include_subagents === true));
+    let subagentCapReached = false;
+    if (req.filter?.engine !== "codex") {
+      const claude = this.scanClaude(allowed, req.filter?.include_subagents === true);
+      candidates.push(...claude.candidates);
+      subagentCapReached = claude.subagentCapReached;
+    }
     if (req.filter?.engine !== "claude") candidates.push(...this.scanCodex(allowed));
 
     const updatedAfter = req.filter?.updated_after ? Date.parse(req.filter.updated_after) : null;
@@ -93,12 +110,13 @@ export class SessionEnumerator {
     const requestedLimit = req.page?.limit ?? MAX_RESPONSE_SESSIONS;
     const limit = Math.max(1, Math.min(requestedLimit, MAX_RESPONSE_SESSIONS));
     const page = afterCursor.slice(0, limit);
-    const truncated = afterCursor.length > limit;
+    const pageTruncated = afterCursor.length > limit;
+    const truncated = pageTruncated || subagentCapReached;
     const last = page[page.length - 1];
 
     return {
       sessions: page.map((c) => c.info),
-      next_cursor: truncated && last ? encodeCursor(last) : null,
+      next_cursor: pageTruncated && last ? encodeCursor(last) : null,
       truncated,
     };
   }
@@ -140,7 +158,8 @@ export class SessionEnumerator {
     if (!file) return { ok: false, code: "file_unreadable" };
 
     try {
-      const result = readSessionHistory(target.engine, file.content, target.session_id, opts);
+      const cursorScope = `${target.engine}\0${target.session_id}\0${target.path}`;
+      const result = readSessionHistory(target.engine, file.content, target.session_id, opts, cursorScope);
       return { ok: true, ...result };
     } catch (e) {
       if (e instanceof HistoryCursorError) return { ok: false, code: "cursor_invalid" };
@@ -152,9 +171,9 @@ export class SessionEnumerator {
     return this.handleFor(target);
   }
 
-  private scanClaude(allowed: readonly string[], includeSubagents: boolean): SessionCandidate[] {
+  private scanClaude(allowed: readonly string[], includeSubagents: boolean): ClaudeScanResult {
     const out: SessionCandidate[] = [];
-    const subagentScan = { files: 0 };
+    const subagentScan: SubagentScanState = { files: 0, maxFiles: this.maxSubagentFiles(), capReached: false };
     for (const project of safeReadDir(this.opts.claudeProjectsDir)) {
       if (!project.isDirectory()) continue;
       const projectDir = join(this.opts.claudeProjectsDir, project.name);
@@ -174,25 +193,29 @@ export class SessionEnumerator {
         this.scanClaudeSubagentDir(join(path, "subagents"), allowed, out, subagentScan, 0);
       }
     }
-    return out;
+    return { candidates: out, subagentCapReached: subagentScan.capReached };
   }
 
   private scanClaudeSubagentDir(
     dir: string,
     allowed: readonly string[],
     out: SessionCandidate[],
-    state: { files: number },
+    state: SubagentScanState,
     depth: number,
   ): void {
-    if (depth > 12 || state.files >= MAX_SUBAGENT_FILES) return;
+    if (depth > 12 || state.capReached) return;
     for (const entry of safeReadDir(dir)) {
-      if (state.files >= MAX_SUBAGENT_FILES) return;
+      if (state.capReached) return;
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
         this.scanClaudeSubagentDir(path, allowed, out, state, depth + 1);
         continue;
       }
       if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      if (state.files >= state.maxFiles) {
+        state.capReached = true;
+        return;
+      }
       state.files++;
       const sessionId = basename(entry.name, ".jsonl");
       if (!sessionId) continue;
@@ -201,6 +224,12 @@ export class SessionEnumerator {
       const candidate = this.parseClaudeFile(file, sessionId, allowed, true);
       if (candidate) out.push(candidate);
     }
+  }
+
+  private maxSubagentFiles(): number {
+    const configured = this.opts.maxSubagentFiles;
+    if (configured === undefined || !Number.isFinite(configured)) return MAX_SUBAGENT_FILES;
+    return Math.max(0, Math.trunc(configured));
   }
 
   private scanCodex(allowed: readonly string[]): SessionCandidate[] {

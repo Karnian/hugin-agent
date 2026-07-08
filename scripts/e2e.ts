@@ -46,7 +46,7 @@ import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
 import { validateWorkspace } from "../src/workspace/worktree";
-import { SessionEnumerator, type SessionInfo } from "../src/sessions/enumerator";
+import { SessionEnumerator, type SessionEnumeratorOpts, type SessionInfo } from "../src/sessions/enumerator";
 import {
   HISTORY_CONTENT_CAP,
   HISTORY_ENTRY_BYTE_MAX,
@@ -2970,12 +2970,17 @@ function createSessionFixtureStore(): SessionFixtureStore {
   return { base, allowRoot, claudeProjectsDir, codexSessionsDir, nowMs };
 }
 
-function fixtureEnumerator(fx: SessionFixtureStore, allowlist: readonly string[] = [fx.allowRoot]): SessionEnumerator {
+function fixtureEnumerator(
+  fx: SessionFixtureStore,
+  allowlist: readonly string[] = [fx.allowRoot],
+  overrides: Partial<Pick<SessionEnumeratorOpts, "maxSubagentFiles">> = {},
+): SessionEnumerator {
   return new SessionEnumerator({
     claudeProjectsDir: fx.claudeProjectsDir,
     codexSessionsDir: fx.codexSessionsDir,
     allowlist,
     now: () => fx.nowMs,
+    ...overrides,
   });
 }
 
@@ -3173,6 +3178,67 @@ async function scenarioAP(): Promise<void> {
         ap6Sessions.every((s) => s.is_subagent === false) &&
         byEngine(ap6Sessions, "claude")?.cwd === "repo-claude" &&
         byEngine(ap6Sessions, "codex")?.cwd === "repo-codex",
+    );
+
+    const capSubagentDir = join(
+      fx.claudeProjectsDir,
+      "encoded-claude",
+      "11111111-1111-4111-8111-111111111111",
+      "subagents",
+    );
+    for (const i of [1, 2]) {
+      writeJsonlFixture(
+        join(capSubagentDir, `agent-cap-extra-${i}.jsonl`),
+        [
+          {
+            parentUuid: "11111111-1111-4111-8111-111111111111",
+            isSidechain: true,
+            agentId: `agent-cap-extra-${i}`,
+            type: "system",
+            cwd: join(fx.allowRoot, "repo-claude"),
+            sessionId: "11111111-1111-4111-8111-111111111111",
+            timestamp: `2026-07-05T10:06:0${i}.000Z`,
+            gitBranch: "nested",
+            version: "1.2.5",
+          },
+          {
+            parentUuid: "11111111-1111-4111-8111-111111111111",
+            isSidechain: true,
+            agentId: `agent-cap-extra-${i}`,
+            type: "ai-title",
+            cwd: join(fx.allowRoot, "repo-claude"),
+            sessionId: "11111111-1111-4111-8111-111111111111",
+            timestamp: `2026-07-05T10:06:1${i}.000Z`,
+            title: `Claude capped subagent fixture ${i}`,
+          },
+          {
+            parentUuid: "11111111-1111-4111-8111-111111111111",
+            isSidechain: true,
+            agentId: `agent-cap-extra-${i}`,
+            type: "user",
+            cwd: join(fx.allowRoot, "repo-claude"),
+            sessionId: "11111111-1111-4111-8111-111111111111",
+            timestamp: `2026-07-05T10:06:2${i}.000Z`,
+            message: { role: "user", content: `SENSITIVE_CLAUDE_CAPPED_SUBAGENT_${i}` },
+          },
+        ],
+        fx.nowMs - (70 + i) * 1000,
+      );
+    }
+    const uncappedSubagents = fixtureEnumerator(fx).list({ filter: { include_subagents: true }, page: { limit: 256 } });
+    const cappedSubagents = fixtureEnumerator(fx, [fx.allowRoot], { maxSubagentFiles: 2 }).list({
+      filter: { include_subagents: true },
+      page: { limit: 256 },
+    });
+    const uncappedClaudeSubagentCount = uncappedSubagents.sessions.filter((s) => s.engine === "claude" && s.is_subagent).length;
+    const cappedClaudeSubagentCount = cappedSubagents.sessions.filter((s) => s.engine === "claude" && s.is_subagent).length;
+    check(
+      "AP7 claude subagent scan cap reports truncation without changing pagination cursor semantics",
+      uncappedSubagents.truncated === false &&
+        uncappedClaudeSubagentCount === 3 &&
+        cappedSubagents.truncated === true &&
+        cappedSubagents.next_cursor === null &&
+        cappedClaudeSubagentCount < uncappedClaudeSubagentCount,
     );
   } finally {
     rmSync(fx.base, { recursive: true, force: true });
@@ -3813,13 +3879,71 @@ function scenarioAV(): void {
   } catch (e) {
     crossSessionCursorRejected = e instanceof HistoryCursorError && e.code === "cursor_invalid";
   }
+  const sameRawBase = mkdtempSync(join(tmpdir(), "hugind-e2e-cursor-scope-"));
+  let scopedSameFileCursorAccepted = false;
+  let scopedCrossFileCursorRejected = false;
+  try {
+    const allowRoot = join(sameRawBase, "allowed");
+    const cwdA = join(allowRoot, "cursor-file-a");
+    const cwdB = join(allowRoot, "cursor-file-b");
+    const claudeProjectsDir = join(sameRawBase, "claude", "projects");
+    const codexSessionsDir = join(sameRawBase, "codex", "sessions");
+    mkdirSync(cwdA, { recursive: true });
+    mkdirSync(cwdB, { recursive: true });
+    const rawSessionId = "99999999-9999-4999-8999-999999999999";
+    const scopedRecords = (cwd: string, title: string, prefix: string): unknown[] => [
+      { type: "system", timestamp: "2026-07-06T03:04:00.000Z", cwd, gitBranch: "main", version: "scope-test" },
+      { type: "ai-title", timestamp: "2026-07-06T03:04:01.000Z", title },
+      ...Array.from({ length: 4 }, (_, i) => ({
+        type: "user",
+        timestamp: `2026-07-06T03:04:0${i + 2}.000Z`,
+        message: { role: "user", content: `${prefix} ${i}` },
+      })),
+    ];
+    writeJsonlFixture(
+      join(claudeProjectsDir, "encoded-cursor-a", `${rawSessionId}.jsonl`),
+      scopedRecords(cwdA, "Cursor scoped file A", "file A"),
+      Date.parse("2026-07-06T03:05:00.000Z"),
+    );
+    writeJsonlFixture(
+      join(claudeProjectsDir, "encoded-cursor-b", `${rawSessionId}.jsonl`),
+      scopedRecords(cwdB, "Cursor scoped file B", "file B"),
+      Date.parse("2026-07-06T03:06:00.000Z"),
+    );
+    const scopedEnumerator = new SessionEnumerator({
+      claudeProjectsDir,
+      codexSessionsDir,
+      allowlist: [allowRoot],
+      now: () => Date.parse("2026-07-06T03:10:00.000Z"),
+    });
+    const scopedSessions = scopedEnumerator.list({ filter: { engine: "claude" }, page: { limit: 10 } }).sessions;
+    const scopedA = scopedSessions.find((s) => s.title === "Cursor scoped file A");
+    const scopedB = scopedSessions.find((s) => s.title === "Cursor scoped file B");
+    if (scopedA && scopedB && scopedA.session_id === scopedB.session_id) {
+      const scopedPageA1 = scopedEnumerator.readHistory(scopedA.handle, { limit: 2 });
+      if (scopedPageA1.ok && typeof scopedPageA1.next_cursor === "string") {
+        const scopedPageA2 = scopedEnumerator.readHistory(scopedA.handle, { limit: 2, cursor: scopedPageA1.next_cursor });
+        const scopedReplayOnB = scopedEnumerator.readHistory(scopedB.handle, { limit: 2, cursor: scopedPageA1.next_cursor });
+        scopedSameFileCursorAccepted =
+          scopedPageA2.ok &&
+          scopedPageA2.entries.length === 2 &&
+          scopedPageA2.entries[0]?.content === "file A 0" &&
+          scopedPageA2.next_cursor === null;
+        scopedCrossFileCursorRejected = !scopedReplayOnB.ok && scopedReplayOnB.code === "cursor_invalid";
+      }
+    }
+  } finally {
+    rmSync(sameRawBase, { recursive: true, force: true });
+  }
   check(
-    "AV13 history cursors are bound to the session id",
+    "AV13 history cursors are bound to the session id and exact session file scope",
     typeof cursorA1.next_cursor === "string" &&
       cursorA2.entries.length === 2 &&
       cursorA2.entries[0]?.content === "cursor A 0" &&
       cursorA2.next_cursor === null &&
-      crossSessionCursorRejected,
+      crossSessionCursorRejected &&
+      scopedSameFileCursorAccepted &&
+      scopedCrossFileCursorRejected,
   );
 }
 
