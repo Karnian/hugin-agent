@@ -42,6 +42,7 @@ import { detectEngineCapabilities, type EngineCapabilities } from "../src/engine
 import { ApprovalBridge, permissionServerLaunch } from "../src/engine/permission";
 import { buildIsolation, selfCheckGate } from "../src/engine/isolate";
 import type { ApprovalRequest, Engine } from "../src/engine/types";
+import { processMatches } from "../src/cli";
 import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
@@ -105,6 +106,8 @@ interface LifecyclePidRecord {
   startedAt: number;
   cmd: string;
 }
+
+const LIFECYCLE_READY_STUB = "console.log('hugind starting');setInterval(()=>{},1e9)";
 
 function readLifecycleRecord(pidfile: string): LifecyclePidRecord | null {
   try {
@@ -983,12 +986,13 @@ function lifecycleStateDir(): string {
   return mkdtempSync(join(tmpdir(), "hugind-lifecycle-"));
 }
 
-function lifecycleEnv(stateDir: string, args: string[]): NodeJS.ProcessEnv {
+function lifecycleEnv(stateDir: string, args: string[], extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
     HUGIND_STATE_DIR: stateDir,
     HUGIND_DAEMON_CMD: process.execPath,
     HUGIND_DAEMON_ARGS: JSON.stringify(args),
+    ...extra,
   };
 }
 
@@ -1000,6 +1004,15 @@ function deadPid(): number {
 
 function writeLifecycleRecord(pidfile: string, record: LifecyclePidRecord): void {
   writeFileSync(pidfile, `${JSON.stringify(record)}\n`);
+}
+
+function writeFreshClaim(pidfile: string): void {
+  writeFileSync(pidfile, `${JSON.stringify({ claiming: true, startedAt: Date.now(), ownerPid: process.pid })}\n`);
+}
+
+function agePidfile(pidfile: string): void {
+  const old = new Date(Date.now() - 10_000);
+  utimesSync(pidfile, old, old);
 }
 
 function startedPid(result: LifecycleCliResult): number | null {
@@ -1041,10 +1054,25 @@ async function terminatePid(pid: number): Promise<void> {
   await waitUntil(() => !pidAlive(pid), 2000);
 }
 
+async function waitForSpawnedChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.off("close", onClose);
+      resolve(false);
+    }, timeoutMs);
+    const onClose = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    child.once("close", onClose);
+  });
+}
+
 async function scenarioAX(): Promise<void> {
   const stateDir = lifecycleStateDir();
   const pidfile = join(stateDir, "hugind.pid");
-  const env = lifecycleEnv(stateDir, ["-e", "setInterval(()=>{},1e9)"]);
+  const env = lifecycleEnv(stateDir, ["-e", LIFECYCLE_READY_STUB]);
 
   try {
     const start1 = runLifecycleCli(["start"], env);
@@ -1058,13 +1086,13 @@ async function scenarioAX(): Promise<void> {
     const start2 = runLifecycleCli(["start"], env);
     check(
       "AX2 lifecycle start refuses an already-running pid",
-      pid1 !== null && start2.status !== 0 && start2.stdout.includes(`already running (pid ${pid1})`),
+      pid1 !== null && start2.status !== 0 && start2.stdout.includes(`already running (pid ${pid1}`),
     );
 
     const statusRunning = runLifecycleCli(["status"], env);
     check(
       "AX3 lifecycle status reports running with the pid",
-      pid1 !== null && statusRunning.status === 0 && statusRunning.stdout.includes(`running (pid ${pid1}, logs:`),
+      pid1 !== null && statusRunning.status === 0 && statusRunning.stdout.includes(`running (pid ${pid1}`) && statusRunning.stdout.includes("logs:"),
     );
 
     const stop = runLifecycleCli(["stop"], env);
@@ -1116,7 +1144,7 @@ async function scenarioAX(): Promise<void> {
 
   const foreignStateDir = lifecycleStateDir();
   const foreignPidfile = join(foreignStateDir, "hugind.pid");
-  const foreignEnv = lifecycleEnv(foreignStateDir, ["-e", "setInterval(()=>{},1e9)"]);
+  const foreignEnv = lifecycleEnv(foreignStateDir, ["-e", LIFECYCLE_READY_STUB]);
   let foreignPid: number | undefined;
   try {
     if (!canInspectProcessCommands()) {
@@ -1149,7 +1177,7 @@ async function scenarioAX(): Promise<void> {
 
   const raceStateDir = lifecycleStateDir();
   const racePidfile = join(raceStateDir, "hugind.pid");
-  const raceEnv = lifecycleEnv(raceStateDir, ["-e", "setInterval(()=>{},1e9)"]);
+  const raceEnv = lifecycleEnv(raceStateDir, ["-e", LIFECYCLE_READY_STUB]);
   const raceStartedPids: number[] = [];
   try {
     const results = await Promise.all([runLifecycleCliAsync(["start"], raceEnv), runLifecycleCliAsync(["start"], raceEnv)]);
@@ -1172,7 +1200,7 @@ async function scenarioAX(): Promise<void> {
 
   const legacyStateDir = lifecycleStateDir();
   const legacyPidfile = join(legacyStateDir, "hugind.pid");
-  const legacyEnv = lifecycleEnv(legacyStateDir, ["-e", "setInterval(()=>{},1e9)"]);
+  const legacyEnv = lifecycleEnv(legacyStateDir, ["-e", LIFECYCLE_READY_STUB]);
   try {
     writeFileSync(legacyPidfile, `${deadPid()}\n`);
     const legacyStatus = runLifecycleCli(["status"], legacyEnv);
@@ -1183,6 +1211,179 @@ async function scenarioAX(): Promise<void> {
   } finally {
     await reapLifecycleStub(legacyPidfile, legacyEnv);
     rmSync(legacyStateDir, { recursive: true, force: true });
+  }
+
+  const claimStateDir = lifecycleStateDir();
+  const claimPidfile = join(claimStateDir, "hugind.pid");
+  const claimEnv = lifecycleEnv(claimStateDir, ["-e", LIFECYCLE_READY_STUB]);
+  try {
+    writeFreshClaim(claimPidfile);
+    const statusClaim = runLifecycleCli(["status"], claimEnv);
+    const stopClaim = runLifecycleCli(["stop"], claimEnv);
+    check(
+      "AX12 lifecycle status/stop preserve a fresh claiming pidfile",
+      statusClaim.status !== 0 &&
+        statusClaim.stdout.includes("starting (in progress)") &&
+        stopClaim.status !== 0 &&
+        stopClaim.stdout.includes("start is in progress") &&
+        existsSync(claimPidfile),
+    );
+
+    rmSync(claimPidfile, { force: true });
+    writeFileSync(claimPidfile, "");
+    const statusEmptyClaim = runLifecycleCli(["status"], claimEnv);
+    const stopEmptyClaim = runLifecycleCli(["stop"], claimEnv);
+    check(
+      "AX13 lifecycle status/stop preserve a fresh empty claim",
+      statusEmptyClaim.status !== 0 &&
+        statusEmptyClaim.stdout.includes("starting (in progress)") &&
+        stopEmptyClaim.status !== 0 &&
+        stopEmptyClaim.stdout.includes("start is in progress") &&
+        existsSync(claimPidfile),
+    );
+  } finally {
+    await reapLifecycleStub(claimPidfile, claimEnv);
+    rmSync(claimStateDir, { recursive: true, force: true });
+  }
+
+  const oldClaimStateDir = lifecycleStateDir();
+  const oldClaimPidfile = join(oldClaimStateDir, "hugind.pid");
+  const oldClaimEnv = lifecycleEnv(oldClaimStateDir, ["-e", LIFECYCLE_READY_STUB]);
+  try {
+    writeFileSync(oldClaimPidfile, "");
+    agePidfile(oldClaimPidfile);
+    const startAfterOldClaim = runLifecycleCli(["start"], oldClaimEnv);
+    const oldClaimPid = readLifecyclePid(oldClaimPidfile);
+    check(
+      "AX14 lifecycle start reclaims a non-fresh empty claim",
+      startAfterOldClaim.status === 0 && oldClaimPid !== null && pidAlive(oldClaimPid),
+    );
+  } finally {
+    await reapLifecycleStub(oldClaimPidfile, oldClaimEnv);
+    rmSync(oldClaimStateDir, { recursive: true, force: true });
+  }
+
+  const legacyLiveStateDir = lifecycleStateDir();
+  const legacyLivePidfile = join(legacyLiveStateDir, "hugind.pid");
+  const legacyLiveEnv = lifecycleEnv(legacyLiveStateDir, ["-e", LIFECYCLE_READY_STUB]);
+  const targetStateDir = lifecycleStateDir();
+  const targetPidfile = join(targetStateDir, "hugind.pid");
+  const targetEnv = lifecycleEnv(targetStateDir, ["-e", LIFECYCLE_READY_STUB]);
+  try {
+    const targetStart = runLifecycleCli(["start"], targetEnv);
+    const targetPid = readLifecyclePid(targetPidfile);
+    const targetLive = targetPid !== null && targetStart.status === 0 && pidAlive(targetPid);
+    if (targetPid !== null) writeFileSync(legacyLivePidfile, `${targetPid}\n`);
+    const legacyStop = runLifecycleCli(["stop"], legacyLiveEnv);
+    const legacyStatus = runLifecycleCli(["status"], legacyLiveEnv);
+    const stillLive = targetPid !== null && pidAlive(targetPid);
+    const legacyForce = runLifecycleCli(["stop", "--force"], legacyLiveEnv);
+    const forceStopped = targetPid !== null && (await waitUntil(() => !pidAlive(targetPid), 3000));
+    check(
+      "AX15 lifecycle stop refuses live legacy pidfiles unless --force is used",
+      targetLive &&
+        targetPid !== null &&
+        legacyStop.status !== 0 &&
+        legacyStop.stdout.includes("cannot verify this pidfile belongs to hugind") &&
+        legacyStatus.status === 0 &&
+        legacyStatus.stdout.includes(`running (pid ${targetPid}, ownership unverified`) &&
+        stillLive &&
+        legacyForce.status === 0 &&
+        forceStopped &&
+        !existsSync(legacyLivePidfile),
+    );
+  } finally {
+    await reapLifecycleStub(legacyLivePidfile, legacyLiveEnv);
+    await reapLifecycleStub(targetPidfile, targetEnv);
+    rmSync(legacyLiveStateDir, { recursive: true, force: true });
+    rmSync(targetStateDir, { recursive: true, force: true });
+  }
+
+  let tokenPid: number | undefined;
+  let tokenChild: ReturnType<typeof spawn> | undefined;
+  try {
+    if (!canInspectProcessCommands()) {
+      check("AX16 lifecycle process matching requires absolute daemon token (skipped without ps)", true);
+    } else {
+      tokenChild = spawn(process.execPath, ["-e", "setInterval(()=>{},1e9); // index.ts"], { stdio: "ignore" });
+      const pid = tokenChild.pid;
+      tokenPid = pid;
+      const live = pid !== undefined && (await waitUntil(() => pidAlive(pid), 1000));
+      const recordedCmd = `${process.execPath} --import tsx ${join(REPO_ROOT, "src", "index.ts")}`;
+      const match = pid === undefined ? "unknown" : processMatches(pid, recordedCmd);
+      check("AX16 lifecycle process matching requires absolute daemon token", live && match === "no");
+    }
+  } finally {
+    if (tokenPid !== undefined) {
+      try {
+        process.kill(tokenPid);
+      } catch {
+        // Best-effort cleanup; SIGKILL below handles stubborn processes.
+      }
+      if (tokenChild !== undefined) await waitForSpawnedChildExit(tokenChild, 1000);
+      if (pidAlive(tokenPid)) {
+        try {
+          process.kill(tokenPid, "SIGKILL");
+        } catch {
+          // Best-effort cleanup only.
+        }
+        if (tokenChild !== undefined) await waitForSpawnedChildExit(tokenChild, 2000);
+      }
+    }
+  }
+
+  const lateCrashStateDir = lifecycleStateDir();
+  const lateCrashPidfile = join(lateCrashStateDir, "hugind.pid");
+  const lateCrashEnv = lifecycleEnv(lateCrashStateDir, [
+    "-e",
+    "setTimeout(()=>{console.error('late crash');process.exit(7)},600);setInterval(()=>{},1e9)",
+  ]);
+  try {
+    const lateCrash = runLifecycleCli(["start"], lateCrashEnv);
+    check(
+      "AX17 lifecycle start fails when the child exits after the old grace window",
+      lateCrash.status !== 0 && lateCrash.stdout.includes("child exited") && !existsSync(lateCrashPidfile),
+    );
+  } finally {
+    await reapLifecycleStub(lateCrashPidfile, lateCrashEnv);
+    rmSync(lateCrashStateDir, { recursive: true, force: true });
+  }
+
+  const readyStateDir = lifecycleStateDir();
+  const readyPidfile = join(readyStateDir, "hugind.pid");
+  const readyEnv = lifecycleEnv(readyStateDir, ["-e", LIFECYCLE_READY_STUB]);
+  try {
+    const readyStart = runLifecycleCli(["start"], readyEnv);
+    const readyPid = readLifecyclePid(readyPidfile);
+    check(
+      "AX18 lifecycle start succeeds after observing the readiness marker",
+      readyStart.status === 0 &&
+        readyStart.stdout.includes("hugind started") &&
+        !readyStart.stdout.includes("not yet confirmed") &&
+        readyPid !== null &&
+        pidAlive(readyPid),
+    );
+  } finally {
+    await reapLifecycleStub(readyPidfile, readyEnv);
+    rmSync(readyStateDir, { recursive: true, force: true });
+  }
+
+  const quietStateDir = lifecycleStateDir();
+  const quietPidfile = join(quietStateDir, "hugind.pid");
+  const quietEnv = lifecycleEnv(quietStateDir, ["-e", "setInterval(()=>{},1e9)"], { HUGIND_READY_TIMEOUT_MS: "300" });
+  try {
+    const quietStart = runLifecycleCli(["start"], quietEnv);
+    const quietPid = readLifecyclePid(quietPidfile);
+    check(
+      "AX19 lifecycle start succeeds unconfirmed when a live child emits no marker",
+      quietStart.status === 0 &&
+        quietStart.stdout.includes("not yet confirmed healthy") &&
+        quietPid !== null &&
+        pidAlive(quietPid),
+    );
+  } finally {
+    await reapLifecycleStub(quietPidfile, quietEnv);
+    rmSync(quietStateDir, { recursive: true, force: true });
   }
 }
 
