@@ -43,6 +43,7 @@ export type SessionNegativeReason =
   | "non-positive-int"
   | "null-on-non-nullable"
   | "strict-unknown-field"
+  | "bad-field-type"
   | "bad-event-kind"
   | "bad-session-history-role"
   | "bad-session-history-omitted-kind"
@@ -103,6 +104,7 @@ const sessionInfoFull = {
   created_at: TS,
   updated_at: TS_LATER,
   active: true,
+  is_subagent: false,
   msg_count: 3,
 } as const;
 
@@ -117,6 +119,7 @@ const sessionInfoNulls = {
   created_at: TS,
   updated_at: TS_LATER,
   active: false,
+  is_subagent: true,
   msg_count: 1,
 } as const;
 
@@ -247,6 +250,15 @@ function buildNegatives(): SessionNegativeVector[] {
     type: "session.list.request",
     request_id: "req-list-neg",
   };
+  const listResponse = {
+    ...base("m-session-neg-list-response"),
+    type: "session.list.response",
+    request_id: "req-list-neg",
+    sessions: [sessionInfoFull],
+    truncated: false,
+  };
+  const sessionInfoMissingIsSubagent: Record<string, unknown> = { ...sessionInfoFull };
+  delete sessionInfoMissingIsSubagent.is_subagent;
   const resumeRequest = {
     ...base("m-session-neg-resume"),
     type: "session.resume.request",
@@ -308,6 +320,14 @@ function buildNegatives(): SessionNegativeVector[] {
     negative("session.list.request-filter-engine-null", "null-on-non-nullable", {
       ...listRequest,
       filter: { engine: null },
+    }),
+    negative("session.list.request-filter-include-subagents-string", "bad-field-type", {
+      ...listRequest,
+      filter: { include_subagents: "yes" },
+    }),
+    negative("session.list.response-session-missing-is-subagent", "missing-required-field", {
+      ...listResponse,
+      sessions: [sessionInfoMissingIsSubagent],
     }),
     negative("session.resume.request-options-model-null", "null-on-non-nullable", {
       ...resumeRequest,
@@ -382,6 +402,12 @@ export function buildSessionVectors(): SessionVectorsFile {
       request_id: "req-list-2",
       filter: { engine: "codex", cwd_prefix: "/work", active_only: true, updated_after: TS },
       page: { cursor: "cursor-1", limit: 2 },
+    }),
+    positive("session.list.request-include-subagents", {
+      ...base("m-session-list-req-3"),
+      type: "session.list.request",
+      request_id: "req-list-3",
+      filter: { include_subagents: true },
     }),
     positive("session.list.response-empty-next-cursor-string", {
       ...base("m-session-list-resp-1"),

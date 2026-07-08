@@ -76,6 +76,7 @@ export class SessionEnumerator {
     const updatedAfter = req.filter?.updated_after ? Date.parse(req.filter.updated_after) : null;
     const filtered = candidates
       .filter((c) => (req.filter?.active_only ? c.info.active : true))
+      .filter((c) => (req.filter?.include_subagents ? true : !c.info.is_subagent))
       .filter((c) => (updatedAfter !== null && Number.isFinite(updatedAfter) ? c.updatedMs > updatedAfter : true))
       .filter((c) => (req.filter?.cwd_prefix ? cwdMatchesPrefix(c.info.cwd, req.filter.cwd_prefix) : true))
       .sort((a, b) => b.updatedMs - a.updatedMs || a.cursorKey.localeCompare(b.cursorKey));
@@ -197,6 +198,7 @@ export class SessionEnumerator {
     const lines = jsonlLines(file.content);
     if (lines.length === 0) return null;
     const head = parseHead(lines);
+    const isSubagent = claudeIsSubagent(lines);
 
     let cwd: string | null = null;
     let gitBranch: string | null = null;
@@ -234,6 +236,7 @@ export class SessionEnumerator {
         created_at: createdAt,
         updated_at: updatedAt,
         active: this.now() - file.mtimeMs <= ACTIVE_WINDOW_MS,
+        is_subagent: isSubagent,
         msg_count: lines.length,
       },
       sessionId,
@@ -251,6 +254,8 @@ export class SessionEnumerator {
     const first = head[0];
     const payload = objectField(first, "payload");
     if (first?.type !== "session_meta" || !payload) return null;
+    const source = objectField(payload, "source");
+    const isSubagent = source !== null && Object.prototype.hasOwnProperty.call(source, "subagent");
 
     const cwd = stringField(payload, "cwd");
     if (!cwd) return null;
@@ -282,6 +287,7 @@ export class SessionEnumerator {
         created_at: createdAt,
         updated_at: updatedAt,
         active: this.now() - file.mtimeMs <= ACTIVE_WINDOW_MS,
+        is_subagent: isSubagent,
         msg_count: lines.length,
       },
       sessionId,
@@ -388,6 +394,20 @@ function stringField(obj: Record<string, unknown> | undefined, key: string): str
 function objectField(obj: Record<string, unknown> | undefined, key: string): Record<string, unknown> | null {
   const value = obj?.[key];
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function claudeIsSubagent(lines: readonly string[]): boolean {
+  for (const line of lines) {
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const rec = parsed as Record<string, unknown>;
+      if (rec.type === "user" || rec.type === "assistant") return rec.isSidechain === true;
+    } catch {
+      /* malformed JSONL lines are ignored */
+    }
+  }
+  return false;
 }
 
 function isoFromUnknown(value: unknown): string | null {

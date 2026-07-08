@@ -307,6 +307,7 @@ const sessionNegativeReasons = new Set<SessionNegativeReason>([
   "non-positive-int",
   "null-on-non-nullable",
   "strict-unknown-field",
+  "bad-field-type",
   "bad-event-kind",
   "bad-session-history-role",
   "bad-session-history-omitted-kind",
