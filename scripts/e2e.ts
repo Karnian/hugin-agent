@@ -90,14 +90,43 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function readLifecyclePid(pidfile: string): number | null {
+function canInspectProcessCommands(): boolean {
+  if (process.platform === "win32") return false;
   try {
-    const pid = Number(readFileSync(pidfile, "utf8").trim());
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    const output = execFileSync("ps", ["-p", String(process.pid), "-o", "command="], { encoding: "utf8" }).trim();
+    return output.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+interface LifecyclePidRecord {
+  pid: number;
+  startedAt: number;
+  cmd: string;
+}
+
+function readLifecycleRecord(pidfile: string): LifecyclePidRecord | null {
+  try {
+    const raw = readFileSync(pidfile, "utf8").trim();
+    if (!raw) return null;
+    const legacyPid = Number(raw);
+    if (Number.isInteger(legacyPid) && legacyPid > 0) return { pid: legacyPid, startedAt: 0, cmd: "" };
+    const parsed = JSON.parse(raw) as Partial<LifecyclePidRecord>;
+    const { pid, startedAt, cmd } = parsed;
+    if (!Number.isInteger(pid) || typeof pid !== "number" || pid <= 0 || typeof startedAt !== "number" || typeof cmd !== "string") {
+      return null;
+    }
+    return { pid, startedAt, cmd };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (e instanceof SyntaxError) return null;
     throw e;
   }
+}
+
+function readLifecyclePid(pidfile: string): number | null {
+  return readLifecycleRecord(pidfile)?.pid ?? null;
 }
 
 async function scenarioA(): Promise<void> {
@@ -928,10 +957,56 @@ function runLifecycleCli(args: string[], env: NodeJS.ProcessEnv): LifecycleCliRe
   };
 }
 
+function runLifecycleCliAsync(args: string[], env: NodeJS.ProcessEnv): Promise<LifecycleCliResult> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--import", "tsx", join(REPO_ROOT, "src", "cli.ts"), ...args], {
+      cwd: REPO_ROOT,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("close", (code) => resolve({ status: code ?? 1, stdout, stderr }));
+    child.on("error", (e) => resolve({ status: 1, stdout, stderr: `${stderr}${String(e)}` }));
+  });
+}
+
+function lifecycleStateDir(): string {
+  return mkdtempSync(join(tmpdir(), "hugind-lifecycle-"));
+}
+
+function lifecycleEnv(stateDir: string, args: string[]): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    HUGIND_STATE_DIR: stateDir,
+    HUGIND_DAEMON_CMD: process.execPath,
+    HUGIND_DAEMON_ARGS: JSON.stringify(args),
+  };
+}
+
 function deadPid(): number {
   let pid = 999_999_999;
   while (pidAlive(pid)) pid++;
   return pid;
+}
+
+function writeLifecycleRecord(pidfile: string, record: LifecyclePidRecord): void {
+  writeFileSync(pidfile, `${JSON.stringify(record)}\n`);
+}
+
+function startedPid(result: LifecycleCliResult): number | null {
+  const match = /hugind started \(pid (\d+)\)/.exec(result.stdout);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
 async function reapLifecycleStub(pidfile: string, env: NodeJS.ProcessEnv): Promise<void> {
@@ -949,15 +1024,27 @@ async function reapLifecycleStub(pidfile: string, env: NodeJS.ProcessEnv): Promi
   }
 }
 
+async function terminatePid(pid: number): Promise<void> {
+  if (!pidAlive(pid)) return;
+  try {
+    process.kill(pid);
+  } catch {
+    // Best-effort cleanup; SIGKILL below handles stubborn processes.
+  }
+  await waitUntil(() => !pidAlive(pid), 1000);
+  if (!pidAlive(pid)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Best-effort cleanup only.
+  }
+  await waitUntil(() => !pidAlive(pid), 2000);
+}
+
 async function scenarioAX(): Promise<void> {
-  const stateDir = mkdtempSync(join(tmpdir(), "hugind-lifecycle-"));
+  const stateDir = lifecycleStateDir();
   const pidfile = join(stateDir, "hugind.pid");
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    HUGIND_STATE_DIR: stateDir,
-    HUGIND_DAEMON_CMD: process.execPath,
-    HUGIND_DAEMON_ARGS: JSON.stringify(["-e", "setInterval(()=>{},1e9)"]),
-  };
+  const env = lifecycleEnv(stateDir, ["-e", "setInterval(()=>{},1e9)"]);
 
   try {
     const start1 = runLifecycleCli(["start"], env);
@@ -1011,6 +1098,91 @@ async function scenarioAX(): Promise<void> {
   } finally {
     await reapLifecycleStub(pidfile, env);
     rmSync(stateDir, { recursive: true, force: true });
+  }
+
+  const failStateDir = lifecycleStateDir();
+  const failPidfile = join(failStateDir, "hugind.pid");
+  const failEnv = lifecycleEnv(failStateDir, ["-e", "console.error('boot failed');process.exit(1)"]);
+  try {
+    const failedStart = runLifecycleCli(["start"], failEnv);
+    check(
+      "AX8 lifecycle start fails and removes pidfile when child exits immediately",
+      failedStart.status !== 0 && failedStart.stdout.includes("child exited immediately") && !existsSync(failPidfile),
+    );
+  } finally {
+    await reapLifecycleStub(failPidfile, failEnv);
+    rmSync(failStateDir, { recursive: true, force: true });
+  }
+
+  const foreignStateDir = lifecycleStateDir();
+  const foreignPidfile = join(foreignStateDir, "hugind.pid");
+  const foreignEnv = lifecycleEnv(foreignStateDir, ["-e", "setInterval(()=>{},1e9)"]);
+  let foreignPid: number | undefined;
+  try {
+    if (!canInspectProcessCommands()) {
+      check("AX9 lifecycle foreign-pid no-kill check skipped when process command inspection is unavailable", true);
+    } else {
+      const foreign = spawn(process.execPath, ["-e", "setInterval(()=>{},1e9)"], { stdio: "ignore" });
+      const pid = foreign.pid;
+      foreignPid = pid;
+      const live = pid !== undefined && (await waitUntil(() => pidAlive(pid), 1000));
+      if (pid !== undefined) {
+        writeLifecycleRecord(foreignPidfile, { pid, startedAt: Date.now(), cmd: "totally-unrelated-cmd" });
+      }
+      const stopForeign = runLifecycleCli(["stop"], foreignEnv);
+      const statusForeign = runLifecycleCli(["status"], foreignEnv);
+      check(
+        "AX9 lifecycle stop treats a live non-matching pidfile as stale and does not kill it",
+        live &&
+          pid !== undefined &&
+          pidAlive(pid) &&
+          stopForeign.status !== 0 &&
+          stopForeign.stdout.includes("stale pidfile removed") &&
+          statusForeign.status !== 0 &&
+          statusForeign.stdout.trim() === "stopped",
+      );
+    }
+  } finally {
+    if (foreignPid !== undefined) await terminatePid(foreignPid);
+    rmSync(foreignStateDir, { recursive: true, force: true });
+  }
+
+  const raceStateDir = lifecycleStateDir();
+  const racePidfile = join(raceStateDir, "hugind.pid");
+  const raceEnv = lifecycleEnv(raceStateDir, ["-e", "setInterval(()=>{},1e9)"]);
+  const raceStartedPids: number[] = [];
+  try {
+    const results = await Promise.all([runLifecycleCliAsync(["start"], raceEnv), runLifecycleCliAsync(["start"], raceEnv)]);
+    for (const result of results) {
+      const pid = startedPid(result);
+      if (pid !== null) raceStartedPids.push(pid);
+    }
+    const successCount = results.filter((result) => result.status === 0 && result.stdout.includes("hugind started")).length;
+    const refusedCount = results.filter((result) => result.status !== 0 && result.stdout.includes("already running")).length;
+    const racePid = readLifecyclePid(racePidfile);
+    check(
+      "AX10 lifecycle concurrent double-start is serialized by the pidfile claim",
+      successCount === 1 && refusedCount === 1 && racePid !== null && pidAlive(racePid),
+    );
+  } finally {
+    await reapLifecycleStub(racePidfile, raceEnv);
+    for (const pid of raceStartedPids) await terminatePid(pid);
+    rmSync(raceStateDir, { recursive: true, force: true });
+  }
+
+  const legacyStateDir = lifecycleStateDir();
+  const legacyPidfile = join(legacyStateDir, "hugind.pid");
+  const legacyEnv = lifecycleEnv(legacyStateDir, ["-e", "setInterval(()=>{},1e9)"]);
+  try {
+    writeFileSync(legacyPidfile, `${deadPid()}\n`);
+    const legacyStatus = runLifecycleCli(["status"], legacyEnv);
+    check(
+      "AX11 lifecycle status tolerates a legacy bare-number pidfile",
+      legacyStatus.status !== 0 && legacyStatus.stdout.trim() === "stopped" && !existsSync(legacyPidfile),
+    );
+  } finally {
+    await reapLifecycleStub(legacyPidfile, legacyEnv);
+    rmSync(legacyStateDir, { recursive: true, force: true });
   }
 }
 

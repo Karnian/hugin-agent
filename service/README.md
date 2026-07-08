@@ -54,6 +54,8 @@ The CLI writes `hugind.pid` and `hugind.log` under `HUGIND_STATE_DIR` when set. 
 | Linux | `${XDG_STATE_HOME:-~/.local/state}/hugin-agent` |
 | Windows | `%LOCALAPPDATA%\hugin-agent` or `~/AppData/Local/hugin-agent` |
 
+For pidfile safety, the lifecycle CLI records the daemon command line and verifies live PIDs against it before reporting or stopping a process. This ownership check is best-effort on macOS/Linux; on Windows it currently degrades to alive-only PID checks.
+
 Uninstall/cleanup for the lifecycle CLI:
 
 ```bash
