@@ -1,19 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- launchd agent for hugind (macOS). Template — fill REPLACE_ME + paths, then:
+<!-- launchd agent for hugind (macOS). Template — fill REPLACE_ME + absolute paths, then:
        cp service/com.contextualai.hugind.plist ~/Library/LaunchAgents/
        launchctl load ~/Library/LaunchAgents/com.contextualai.hugind.plist
      A LaunchAgent (not Daemon) so it runs in your login session — the macOS
-     keychain Claude login is per-user and needs that session. -->
+     keychain Claude login is per-user and needs that session.
+     ProgramArguments must use absolute paths for node and src/index.ts. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.contextualai.hugind</string>
+  <key>WorkingDirectory</key>
+  <string>/opt/hugin-agent</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>cd /opt/hugin-agent &amp;&amp; exec npx tsx src/index.ts</string>
+    <string>/usr/local/bin/node</string>
+    <string>--import</string>
+    <string>tsx</string>
+    <string>/opt/hugin-agent/src/index.ts</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -23,6 +27,7 @@
     <key>HUGIND_AGENT_VERSION</key><string>0.0.0</string>
     <key>HUGIND_PROJECT_ROOTS</key><string>/Users/you/code</string>
     <key>HUGIND_STATE_DIR</key><string>/Users/you/Library/Application Support/hugind</string>
+    <!-- Dev-only: set HUGIN_SIMPLE_PAIRING=1 only when using a raw-IP ws:// relay. -->
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

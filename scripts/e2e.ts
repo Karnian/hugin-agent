@@ -12,11 +12,11 @@
  * daemon's epoch gate is strictly monotonic.
  */
 
-import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -63,6 +63,7 @@ import { MockPairingServer } from "../mock-relay/pairing-server";
 
 const SCRATCH = join(tmpdir(), "hugind-e2e-worktree");
 const TEST_ENGINE_CAPABILITIES: EngineCapabilities = { claude: { installed: true }, codex: { installed: false } };
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 let failures = 0;
 function check(label: string, cond: boolean): void {
@@ -77,6 +78,26 @@ async function waitUntil(pred: () => boolean, timeoutMs: number, stepMs = 50): P
     await sleep(stepMs);
   }
   return pred();
+}
+
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function readLifecyclePid(pidfile: string): number | null {
+  try {
+    const pid = Number(readFileSync(pidfile, "utf8").trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw e;
+  }
 }
 
 async function scenarioA(): Promise<void> {
@@ -885,6 +906,112 @@ async function scenarioZ(): Promise<void> {
   await relay.stop();
   await sleep(50);
   check("Z1 graceful stop() sends agent.draining before disconnect", sawDrain);
+}
+
+interface LifecycleCliResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
+
+function runLifecycleCli(args: string[], env: NodeJS.ProcessEnv): LifecycleCliResult {
+  const result = spawnSync(process.execPath, ["--import", "tsx", join(REPO_ROOT, "src", "cli.ts"), ...args], {
+    cwd: REPO_ROOT,
+    env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
+function deadPid(): number {
+  let pid = 999_999_999;
+  while (pidAlive(pid)) pid++;
+  return pid;
+}
+
+async function reapLifecycleStub(pidfile: string, env: NodeJS.ProcessEnv): Promise<void> {
+  const pid = readLifecyclePid(pidfile);
+  if (pid === null || !pidAlive(pid)) return;
+  runLifecycleCli(["stop", "--force"], env);
+  await waitUntil(() => !pidAlive(pid), 3000);
+  if (pidAlive(pid)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Best-effort cleanup; the check below records failure if it remains live.
+    }
+    await waitUntil(() => !pidAlive(pid), 2000);
+  }
+}
+
+async function scenarioAX(): Promise<void> {
+  const stateDir = mkdtempSync(join(tmpdir(), "hugind-lifecycle-"));
+  const pidfile = join(stateDir, "hugind.pid");
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HUGIND_STATE_DIR: stateDir,
+    HUGIND_DAEMON_CMD: process.execPath,
+    HUGIND_DAEMON_ARGS: JSON.stringify(["-e", "setInterval(()=>{},1e9)"]),
+  };
+
+  try {
+    const start1 = runLifecycleCli(["start"], env);
+    const pid1 = readLifecyclePid(pidfile);
+    const startedAlive = pid1 !== null && (await waitUntil(() => pidAlive(pid1), 1000));
+    check(
+      "AX1 lifecycle start writes a pidfile and the stub pid is alive",
+      start1.status === 0 && start1.stdout.includes("hugind started") && pid1 !== null && startedAlive,
+    );
+
+    const start2 = runLifecycleCli(["start"], env);
+    check(
+      "AX2 lifecycle start refuses an already-running pid",
+      pid1 !== null && start2.status !== 0 && start2.stdout.includes(`already running (pid ${pid1})`),
+    );
+
+    const statusRunning = runLifecycleCli(["status"], env);
+    check(
+      "AX3 lifecycle status reports running with the pid",
+      pid1 !== null && statusRunning.status === 0 && statusRunning.stdout.includes(`running (pid ${pid1}, logs:`),
+    );
+
+    const stop = runLifecycleCli(["stop"], env);
+    const stopped = pid1 !== null && (await waitUntil(() => !pidAlive(pid1), 3000));
+    check(
+      "AX4 lifecycle stop terminates the process and removes the pidfile",
+      stop.status === 0 && stopped && !existsSync(pidfile),
+    );
+
+    const statusStopped = runLifecycleCli(["status"], env);
+    check(
+      "AX5 lifecycle status reports stopped with a non-zero exit after stop",
+      statusStopped.status !== 0 && statusStopped.stdout.trim() === "stopped",
+    );
+
+    writeFileSync(pidfile, `${deadPid()}\n`);
+    const statusStale = runLifecycleCli(["status"], env);
+    check(
+      "AX6 lifecycle status cleans a stale pidfile",
+      statusStale.status !== 0 && statusStale.stdout.trim() === "stopped" && !existsSync(pidfile),
+    );
+
+    writeFileSync(pidfile, `${deadPid()}\n`);
+    const startAfterStale = runLifecycleCli(["start"], env);
+    const pid2 = readLifecyclePid(pidfile);
+    const restartedAlive = pid2 !== null && (await waitUntil(() => pidAlive(pid2), 1000));
+    check(
+      "AX7 lifecycle start proceeds after a stale pidfile",
+      startAfterStale.status === 0 && pid2 !== null && restartedAlive,
+    );
+  } finally {
+    await reapLifecycleStub(pidfile, env);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4585,6 +4712,8 @@ async function main(): Promise<void> {
   await scenarioY();
   console.log("\n[scenario Z: graceful drain on stop]");
   await scenarioZ();
+  console.log("\n[scenario AX: lifecycle CLI detached resident process]");
+  await scenarioAX();
   console.log("\n[scenario AA: Track A live positive — verifying relay accepts real signer]");
   await scenarioAA();
   console.log("\n[scenario AB: Track A live negative — tampered transcript → bad_signature]");
