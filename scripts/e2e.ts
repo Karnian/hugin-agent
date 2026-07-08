@@ -42,7 +42,7 @@ import { detectEngineCapabilities, type EngineCapabilities } from "../src/engine
 import { ApprovalBridge, permissionServerLaunch } from "../src/engine/permission";
 import { buildIsolation, selfCheckGate } from "../src/engine/isolate";
 import type { ApprovalRequest, Engine } from "../src/engine/types";
-import { processMatches } from "../src/cli";
+import { processMatches, removePidfileIfHoldsPid, stopDecision } from "../src/cli";
 import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
@@ -108,6 +108,8 @@ interface LifecyclePidRecord {
 }
 
 const LIFECYCLE_READY_STUB = "console.log('hugind starting');setInterval(()=>{},1e9)";
+const LIFECYCLE_MARKER_CRASH_STUB =
+  "console.log('hugind starting');setTimeout(()=>{console.error('marker crash');process.exit(7)},600);setInterval(()=>{},1e9)";
 
 function readLifecycleRecord(pidfile: string): LifecyclePidRecord | null {
   try {
@@ -992,6 +994,7 @@ function lifecycleEnv(stateDir: string, args: string[], extra: NodeJS.ProcessEnv
     HUGIND_STATE_DIR: stateDir,
     HUGIND_DAEMON_CMD: process.execPath,
     HUGIND_DAEMON_ARGS: JSON.stringify(args),
+    HUGIND_READY_STABLE_MS: "50",
     ...extra,
   };
 }
@@ -1007,7 +1010,12 @@ function writeLifecycleRecord(pidfile: string, record: LifecyclePidRecord): void
 }
 
 function writeFreshClaim(pidfile: string): void {
-  writeFileSync(pidfile, `${JSON.stringify({ claiming: true, startedAt: Date.now(), ownerPid: process.pid })}\n`);
+  writeLifecycleClaim(pidfile, process.pid);
+}
+
+function writeLifecycleClaim(pidfile: string, ownerPid?: number): void {
+  const claim = ownerPid === undefined ? { claiming: true, startedAt: Date.now() } : { claiming: true, startedAt: Date.now(), ownerPid };
+  writeFileSync(pidfile, `${JSON.stringify(claim)}\n`);
 }
 
 function agePidfile(pidfile: string): void {
@@ -1263,6 +1271,73 @@ async function scenarioAX(): Promise<void> {
     rmSync(oldClaimStateDir, { recursive: true, force: true });
   }
 
+  const deadOwnerClaimStateDir = lifecycleStateDir();
+  const deadOwnerClaimPidfile = join(deadOwnerClaimStateDir, "hugind.pid");
+  const deadOwnerClaimEnv = lifecycleEnv(deadOwnerClaimStateDir, ["-e", LIFECYCLE_READY_STUB]);
+  try {
+    writeLifecycleClaim(deadOwnerClaimPidfile, deadPid());
+    const startAfterDeadOwnerClaim = runLifecycleCli(["start"], deadOwnerClaimEnv);
+    const deadOwnerClaimPid = readLifecyclePid(deadOwnerClaimPidfile);
+    check(
+      "AX20 lifecycle start reclaims a fresh claim whose ownerPid is dead",
+      startAfterDeadOwnerClaim.status === 0 && deadOwnerClaimPid !== null && pidAlive(deadOwnerClaimPid),
+    );
+  } finally {
+    await reapLifecycleStub(deadOwnerClaimPidfile, deadOwnerClaimEnv);
+    rmSync(deadOwnerClaimStateDir, { recursive: true, force: true });
+  }
+
+  const liveOwnerClaimStateDir = lifecycleStateDir();
+  const liveOwnerClaimPidfile = join(liveOwnerClaimStateDir, "hugind.pid");
+  const liveOwnerClaimEnv = lifecycleEnv(liveOwnerClaimStateDir, ["-e", LIFECYCLE_READY_STUB]);
+  let liveOwnerPid: number | undefined;
+  try {
+    const liveOwner = spawn(process.execPath, ["-e", "setInterval(()=>{},1e9)"], { stdio: "ignore" });
+    liveOwnerPid = liveOwner.pid;
+    const ownerLive = liveOwnerPid !== undefined && (await waitUntil(() => pidAlive(liveOwnerPid as number), 1000));
+    if (liveOwnerPid !== undefined) {
+      writeLifecycleClaim(liveOwnerClaimPidfile, liveOwnerPid);
+      agePidfile(liveOwnerClaimPidfile);
+    }
+    const statusLiveOwnerClaim = runLifecycleCli(["status"], liveOwnerClaimEnv);
+    const stopLiveOwnerClaim = runLifecycleCli(["stop"], liveOwnerClaimEnv);
+    const startLiveOwnerClaim = runLifecycleCli(["start"], liveOwnerClaimEnv);
+    check(
+      "AX21 lifecycle preserves an old claim while ownerPid is alive",
+      ownerLive &&
+        statusLiveOwnerClaim.status !== 0 &&
+        statusLiveOwnerClaim.stdout.includes("starting (in progress)") &&
+        stopLiveOwnerClaim.status !== 0 &&
+        stopLiveOwnerClaim.stdout.includes("start is in progress") &&
+        startLiveOwnerClaim.status !== 0 &&
+        startLiveOwnerClaim.stdout.includes("start in progress") &&
+        existsSync(liveOwnerClaimPidfile),
+    );
+  } finally {
+    if (liveOwnerPid !== undefined) await terminatePid(liveOwnerPid);
+    await reapLifecycleStub(liveOwnerClaimPidfile, liveOwnerClaimEnv);
+    rmSync(liveOwnerClaimStateDir, { recursive: true, force: true });
+  }
+
+  const removeIfPidStateDir = lifecycleStateDir();
+  const removeIfPidPidfile = join(removeIfPidStateDir, "hugind.pid");
+  try {
+    const firstPid = deadPid();
+    const secondPid = firstPid + 1;
+    writeLifecycleRecord(removeIfPidPidfile, { pid: firstPid, startedAt: Date.now(), cmd: "/tmp/hugind-one" });
+    const removedMatching = removePidfileIfHoldsPid(removeIfPidPidfile, firstPid);
+    const removedMatchingGone = !existsSync(removeIfPidPidfile);
+    writeLifecycleRecord(removeIfPidPidfile, { pid: secondPid, startedAt: Date.now(), cmd: "/tmp/hugind-two" });
+    const removedDifferent = removePidfileIfHoldsPid(removeIfPidPidfile, firstPid);
+    const current = readLifecycleRecord(removeIfPidPidfile);
+    check(
+      "AX22 lifecycle removePidfileIfHoldsPid only removes matching pid records",
+      removedMatching && removedMatchingGone && !removedDifferent && current?.pid === secondPid,
+    );
+  } finally {
+    rmSync(removeIfPidStateDir, { recursive: true, force: true });
+  }
+
   const legacyLiveStateDir = lifecycleStateDir();
   const legacyLivePidfile = join(legacyLiveStateDir, "hugind.pid");
   const legacyLiveEnv = lifecycleEnv(legacyLiveStateDir, ["-e", LIFECYCLE_READY_STUB]);
@@ -1297,6 +1372,50 @@ async function scenarioAX(): Promise<void> {
     await reapLifecycleStub(targetPidfile, targetEnv);
     rmSync(legacyLiveStateDir, { recursive: true, force: true });
     rmSync(targetStateDir, { recursive: true, force: true });
+  }
+
+  const unknownDecisionRecord = { pid: deadPid(), startedAt: Date.now(), cmd: "/tmp/hugind" };
+  check(
+    "AX23 lifecycle stopDecision refuses unknown ownership unless forced",
+    stopDecision({ state: "running", record: unknownDecisionRecord, legacy: false, match: "unknown" }, false) === "refuse-unverified" &&
+      stopDecision({ state: "running", record: unknownDecisionRecord, legacy: false, match: "unknown" }, true) === "kill",
+  );
+
+  const unknownStateDir = lifecycleStateDir();
+  const unknownPidfile = join(unknownStateDir, "hugind.pid");
+  const unknownEnv = lifecycleEnv(unknownStateDir, ["-e", LIFECYCLE_READY_STUB], { HUGIND_FORCE_MATCH: "unknown" });
+  let unknownPid: number | undefined;
+  try {
+    const unknownTarget = spawn(process.execPath, ["-e", "setInterval(()=>{},1e9)"], { stdio: "ignore" });
+    unknownPid = unknownTarget.pid;
+    const unknownLive = unknownPid !== undefined && (await waitUntil(() => pidAlive(unknownPid as number), 1000));
+    if (unknownPid !== undefined) {
+      writeLifecycleRecord(unknownPidfile, {
+        pid: unknownPid,
+        startedAt: Date.now(),
+        cmd: `${process.execPath} -e setInterval(()=>{},1e9)`,
+      });
+    }
+    const stopUnknown = await runLifecycleCliAsync(["stop"], unknownEnv);
+    const statusUnknown = await runLifecycleCliAsync(["status"], unknownEnv);
+    const aliveAfterRefuse = unknownPid !== undefined && pidAlive(unknownPid);
+    const forceUnknown = await runLifecycleCliAsync(["stop", "--force"], unknownEnv);
+    const forceStopped = unknownPid !== undefined && (await waitUntil(() => !pidAlive(unknownPid as number), 3000));
+    check(
+      "AX24 lifecycle stop refuses full records with unknown ownership unless forced",
+      unknownLive &&
+        stopUnknown.status !== 0 &&
+        stopUnknown.stdout.includes("cannot verify this pidfile belongs to hugind") &&
+        statusUnknown.status === 0 &&
+        statusUnknown.stdout.includes(`running (pid ${unknownPid}, ownership unverified`) &&
+        aliveAfterRefuse &&
+        forceUnknown.status === 0 &&
+        forceStopped &&
+        !existsSync(unknownPidfile),
+    );
+  } finally {
+    if (unknownPid !== undefined) await terminatePid(unknownPid);
+    rmSync(unknownStateDir, { recursive: true, force: true });
   }
 
   let tokenPid: number | undefined;
@@ -1349,6 +1468,23 @@ async function scenarioAX(): Promise<void> {
     rmSync(lateCrashStateDir, { recursive: true, force: true });
   }
 
+  const markerCrashStateDir = lifecycleStateDir();
+  const markerCrashPidfile = join(markerCrashStateDir, "hugind.pid");
+  const markerCrashEnv = lifecycleEnv(markerCrashStateDir, ["-e", LIFECYCLE_MARKER_CRASH_STUB], {
+    HUGIND_READY_TIMEOUT_MS: "2000",
+    HUGIND_READY_STABLE_MS: "1000",
+  });
+  try {
+    const markerCrash = runLifecycleCli(["start"], markerCrashEnv);
+    check(
+      "AX25 lifecycle start fails when the child logs readiness then crashes during stability",
+      markerCrash.status !== 0 && markerCrash.stdout.includes("child exited") && markerCrash.stdout.includes("marker crash") && !existsSync(markerCrashPidfile),
+    );
+  } finally {
+    await reapLifecycleStub(markerCrashPidfile, markerCrashEnv);
+    rmSync(markerCrashStateDir, { recursive: true, force: true });
+  }
+
   const readyStateDir = lifecycleStateDir();
   const readyPidfile = join(readyStateDir, "hugind.pid");
   const readyEnv = lifecycleEnv(readyStateDir, ["-e", LIFECYCLE_READY_STUB]);
@@ -1366,6 +1502,28 @@ async function scenarioAX(): Promise<void> {
   } finally {
     await reapLifecycleStub(readyPidfile, readyEnv);
     rmSync(readyStateDir, { recursive: true, force: true });
+  }
+
+  const stableReadyStateDir = lifecycleStateDir();
+  const stableReadyPidfile = join(stableReadyStateDir, "hugind.pid");
+  const stableReadyEnv = lifecycleEnv(stableReadyStateDir, ["-e", LIFECYCLE_READY_STUB], {
+    HUGIND_READY_TIMEOUT_MS: "1000",
+    HUGIND_READY_STABLE_MS: "100",
+  });
+  try {
+    const stableReadyStart = runLifecycleCli(["start"], stableReadyEnv);
+    const stableReadyPid = readLifecyclePid(stableReadyPidfile);
+    check(
+      "AX26 lifecycle start succeeds after the readiness marker remains stable",
+      stableReadyStart.status === 0 &&
+        stableReadyStart.stdout.includes("hugind started") &&
+        !stableReadyStart.stdout.includes("not yet confirmed") &&
+        stableReadyPid !== null &&
+        pidAlive(stableReadyPid),
+    );
+  } finally {
+    await reapLifecycleStub(stableReadyPidfile, stableReadyEnv);
+    rmSync(stableReadyStateDir, { recursive: true, force: true });
   }
 
   const quietStateDir = lifecycleStateDir();
