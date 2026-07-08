@@ -46,10 +46,12 @@ interface ReadSessionFile {
 const HEAD_RECORD_LIMIT = 80;
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;
 const MAX_RESPONSE_SESSIONS = 256;
+const MAX_SUBAGENT_FILES = 2000;
 const ACTIVE_WINDOW_MS = 15 * 60 * 1000;
 const TITLE_MAX = 80;
 const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const CLAUDE_FILE_RE = new RegExp(`^(${UUID_PATTERN})\\.jsonl$`);
+const CLAUDE_SESSION_DIR_RE = new RegExp(`^${UUID_PATTERN}$`);
 const CODEX_FILE_RE = new RegExp(`^rollout-.+-(${UUID_PATTERN})\\.jsonl$`);
 
 function stableSessionId(engine: "claude" | "codex", rawSessionId: string): string {
@@ -70,7 +72,7 @@ export class SessionEnumerator {
     if (allowed.length === 0) return { sessions: [], next_cursor: null, truncated: false };
 
     const candidates: SessionCandidate[] = [];
-    if (req.filter?.engine !== "codex") candidates.push(...this.scanClaude(allowed));
+    if (req.filter?.engine !== "codex") candidates.push(...this.scanClaude(allowed, req.filter?.include_subagents === true));
     if (req.filter?.engine !== "claude") candidates.push(...this.scanCodex(allowed));
 
     const updatedAfter = req.filter?.updated_after ? Date.parse(req.filter.updated_after) : null;
@@ -150,23 +152,55 @@ export class SessionEnumerator {
     return this.handleFor(target);
   }
 
-  private scanClaude(allowed: readonly string[]): SessionCandidate[] {
+  private scanClaude(allowed: readonly string[], includeSubagents: boolean): SessionCandidate[] {
     const out: SessionCandidate[] = [];
+    const subagentScan = { files: 0 };
     for (const project of safeReadDir(this.opts.claudeProjectsDir)) {
       if (!project.isDirectory()) continue;
       const projectDir = join(this.opts.claudeProjectsDir, project.name);
       for (const entry of safeReadDir(projectDir)) {
-        if (!entry.isFile()) continue;
-        const match = CLAUDE_FILE_RE.exec(entry.name);
-        const sessionId = match?.[1];
-        if (!sessionId) continue;
-        const file = this.readSessionFile(join(projectDir, entry.name));
-        if (!file) continue;
-        const candidate = this.parseClaudeFile(file, sessionId, allowed);
-        if (candidate) out.push(candidate);
+        const path = join(projectDir, entry.name);
+        if (entry.isFile()) {
+          const match = CLAUDE_FILE_RE.exec(entry.name);
+          const sessionId = match?.[1];
+          if (!sessionId) continue;
+          const file = this.readSessionFile(path);
+          if (!file) continue;
+          const candidate = this.parseClaudeFile(file, sessionId, allowed, false);
+          if (candidate) out.push(candidate);
+          continue;
+        }
+        if (!includeSubagents || !entry.isDirectory() || !CLAUDE_SESSION_DIR_RE.test(entry.name)) continue;
+        this.scanClaudeSubagentDir(join(path, "subagents"), allowed, out, subagentScan, 0);
       }
     }
     return out;
+  }
+
+  private scanClaudeSubagentDir(
+    dir: string,
+    allowed: readonly string[],
+    out: SessionCandidate[],
+    state: { files: number },
+    depth: number,
+  ): void {
+    if (depth > 12 || state.files >= MAX_SUBAGENT_FILES) return;
+    for (const entry of safeReadDir(dir)) {
+      if (state.files >= MAX_SUBAGENT_FILES) return;
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        this.scanClaudeSubagentDir(path, allowed, out, state, depth + 1);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      state.files++;
+      const sessionId = basename(entry.name, ".jsonl");
+      if (!sessionId) continue;
+      const file = this.readSessionFile(path);
+      if (!file) continue;
+      const candidate = this.parseClaudeFile(file, sessionId, allowed, true);
+      if (candidate) out.push(candidate);
+    }
   }
 
   private scanCodex(allowed: readonly string[]): SessionCandidate[] {
@@ -194,11 +228,10 @@ export class SessionEnumerator {
     }
   }
 
-  private parseClaudeFile(file: ReadSessionFile, sessionId: string, allowed: readonly string[]): SessionCandidate | null {
+  private parseClaudeFile(file: ReadSessionFile, sessionId: string, allowed: readonly string[], isSubagent: boolean): SessionCandidate | null {
     const lines = jsonlLines(file.content);
     if (lines.length === 0) return null;
     const head = parseHead(lines);
-    const isSubagent = claudeIsSubagent(lines);
 
     let cwd: string | null = null;
     let gitBranch: string | null = null;
@@ -394,20 +427,6 @@ function stringField(obj: Record<string, unknown> | undefined, key: string): str
 function objectField(obj: Record<string, unknown> | undefined, key: string): Record<string, unknown> | null {
   const value = obj?.[key];
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-}
-
-function claudeIsSubagent(lines: readonly string[]): boolean {
-  for (const line of lines) {
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-      const rec = parsed as Record<string, unknown>;
-      if (rec.type === "user" || rec.type === "assistant") return rec.isSidechain === true;
-    } catch {
-      /* malformed JSONL lines are ignored */
-    }
-  }
-  return false;
 }
 
 function isoFromUnknown(value: unknown): string | null {
