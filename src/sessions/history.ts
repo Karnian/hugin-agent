@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { MessageV2 } from "../../protocol/v1/index";
+import { LIMITS, type MessageV2 } from "../../protocol/v1/index";
 
 export type SessionHistoryEntry = Extract<MessageV2, { type: "session.history.response" }>["entries"][number];
 type SessionToolCall = NonNullable<SessionHistoryEntry["tool_calls"]>[number];
@@ -12,6 +12,8 @@ export const HISTORY_CONTENT_CAP = 16_384;
 export const HISTORY_TOOL_IO_CAP = 8_192;
 export const HISTORY_PAGE_DEFAULT = 50;
 export const HISTORY_PAGE_MAX = 256;
+export const HISTORY_ENTRY_BYTE_MAX = 512 * 1024;
+export const HISTORY_FRAME_BUDGET = LIMITS.MAX_FRAME_BYTES - 16_384;
 
 export class HistoryCursorError extends Error {
   readonly code = "cursor_invalid" as const;
@@ -28,25 +30,39 @@ export function readSessionHistory(
   sessionId: string,
   opts: { cursor?: string; limit?: number },
 ): { entries: SessionHistoryEntry[]; next_cursor: string | null; truncated: boolean } {
-  return paginateHistory(buildHistoryEntries(engine, content, sessionId), opts);
+  return paginateHistory(buildHistoryEntries(engine, content, sessionId), sessionId, opts);
 }
 
 export function buildHistoryEntries(engine: HistoryEngine, content: string, sessionId: string): SessionHistoryEntry[] {
   const lines = parseJsonlLines(content);
-  return engine === "claude" ? buildClaudeHistoryEntries(lines, sessionId) : buildCodexHistoryEntries(lines, sessionId);
+  const entries = engine === "claude" ? buildClaudeHistoryEntries(lines, sessionId) : buildCodexHistoryEntries(lines, sessionId);
+  return entries.map(boundHistoryEntryBytes);
 }
 
 export function paginateHistory(
   entries: readonly SessionHistoryEntry[],
+  sessionId: string,
   opts: { cursor?: string; limit?: number } = {},
 ): { entries: SessionHistoryEntry[]; next_cursor: string | null; truncated: boolean } {
   const limit = clampLimit(opts.limit);
-  const boundary = opts.cursor === undefined ? entries.length : decodeHistoryCursor(opts.cursor, entries.length).b;
-  const start = Math.max(0, boundary - limit);
+  const sig = sessionSig(sessionId);
+  const boundary = opts.cursor === undefined ? entries.length : decodeHistoryCursor(opts.cursor, entries.length, sig).b;
+  let start = boundary;
+  let count = 0;
+  let bytes = 0;
+  for (let i = boundary - 1; i >= 0 && count < limit; i--) {
+    const entry = entries[i];
+    if (!entry) break;
+    const entryBytes = historyEntryBytes(entry);
+    if (count > 0 && bytes + entryBytes > HISTORY_FRAME_BUDGET) break;
+    start = i;
+    count++;
+    bytes += entryBytes;
+  }
   const page = entries.slice(start, boundary);
   return {
     entries: page,
-    next_cursor: start > 0 ? encodeHistoryCursor(start, entries.length) : null,
+    next_cursor: start > 0 ? encodeHistoryCursor(start, sig) : null,
     truncated: start > 0,
   };
 }
@@ -89,14 +105,14 @@ interface ToolEnrichment {
 const OMITTED_ORDER: readonly OmittedKind[] = ["image", "document", "thinking", "fallback", "other"];
 
 function buildClaudeHistoryEntries(lines: readonly JsonlLine[], sessionId: string): SessionHistoryEntry[] {
-  const resultById = new Map<string, ToolResult>();
+  const resultById = new Map<string, ToolResult[]>();
   for (const line of lines) {
     const message = objectField(line.rec, "message");
     const content = message?.content;
     for (const block of arrayBlocks(content)) {
       if (stringField(block, "type") !== "tool_result") continue;
       const id = stringField(block, "tool_use_id");
-      if (id && !resultById.has(id)) resultById.set(id, claudeToolResult(block));
+      if (id) pushToolResult(resultById, id, claudeToolResult(block));
     }
   }
 
@@ -131,7 +147,7 @@ function buildClaudeHistoryEntries(lines: readonly JsonlLine[], sessionId: strin
 }
 
 function buildCodexHistoryEntries(lines: readonly JsonlLine[], sessionId: string): SessionHistoryEntry[] {
-  const resultById = new Map<string, ToolResult>();
+  const resultById = new Map<string, ToolResult[]>();
   const enrichmentsById = new Map<string, ToolEnrichment[]>();
   const callIds = new Set<string>();
 
@@ -148,7 +164,7 @@ function buildCodexHistoryEntries(lines: readonly JsonlLine[], sessionId: string
 
     if (line.rec.type === "response_item" && (payloadType === "function_call_output" || payloadType === "custom_tool_call_output")) {
       const id = stringField(payload, "call_id");
-      if (id && !resultById.has(id)) resultById.set(id, codexToolResult(payload));
+      if (id) pushToolResult(resultById, id, codexToolResult(payload));
       continue;
     }
 
@@ -257,14 +273,14 @@ function extractCodexMessageText(content: unknown): TextExtraction {
   return { ...capContent(joinTextParts(textParts)), omitted: omittedList(omitted) };
 }
 
-function claudeToolCalls(content: unknown, resultById: ReadonlyMap<string, ToolResult>): SessionToolCall[] {
+function claudeToolCalls(content: unknown, resultById: Map<string, ToolResult[]>): SessionToolCall[] {
   const out: SessionToolCall[] = [];
   for (const block of arrayBlocks(content)) {
     if (stringField(block, "type") !== "tool_use") continue;
     const id = stringField(block, "id");
     const name = stringField(block, "name");
     if (!id || !name) continue;
-    out.push(buildToolCall({ id, name, inputValue: block.input, result: resultById.get(id), enrichments: [] }));
+    out.push(buildToolCall({ id, name, inputValue: block.input, result: consumeToolResult(resultById, id), enrichments: [] }));
   }
   return out;
 }
@@ -278,7 +294,7 @@ function claudeToolResult(block: Record<string, unknown>): ToolResult {
 
 function codexToolCall(
   payload: Record<string, unknown>,
-  resultById: ReadonlyMap<string, ToolResult>,
+  resultById: Map<string, ToolResult[]>,
   enrichmentsById: ReadonlyMap<string, readonly ToolEnrichment[]>,
 ): SessionToolCall | null {
   const id = stringField(payload, "call_id");
@@ -289,7 +305,7 @@ function codexToolCall(
     id,
     name,
     inputValue,
-    result: resultById.get(id),
+    result: consumeToolResult(resultById, id),
     enrichments: enrichmentsById.get(id) ?? [],
   });
 }
@@ -405,15 +421,109 @@ function capString(value: string, cap: number): { value: string; truncated: bool
   return value.length > cap ? { value: value.slice(0, cap), truncated: true } : { value, truncated: false };
 }
 
+function pushToolResult(resultsById: Map<string, ToolResult[]>, id: string, result: ToolResult): void {
+  const existing = resultsById.get(id);
+  if (existing) {
+    existing.push(result);
+    return;
+  }
+  resultsById.set(id, [result]);
+}
+
+function consumeToolResult(resultsById: Map<string, ToolResult[]>, id: string): ToolResult | undefined {
+  const results = resultsById.get(id);
+  if (!results || results.length === 0) return undefined;
+  const result = results.shift();
+  if (results.length === 0) resultsById.delete(id);
+  return result;
+}
+
+function boundHistoryEntryBytes(entry: SessionHistoryEntry): SessionHistoryEntry {
+  if (historyEntryBytes(entry) <= HISTORY_ENTRY_BYTE_MAX) return entry;
+
+  let bounded = cloneHistoryEntry(entry);
+  let droppedToolCalls = 0;
+  let recordedDroppedToolCalls = false;
+  while ((bounded.tool_calls?.length ?? 0) > 0) {
+    const candidate = droppedToolCalls > 0 ? incrementOmittedOther(bounded, droppedToolCalls) : bounded;
+    if (historyEntryBytes(candidate) <= HISTORY_ENTRY_BYTE_MAX) {
+      bounded = candidate;
+      recordedDroppedToolCalls = droppedToolCalls > 0;
+      break;
+    }
+
+    const nextToolCalls = bounded.tool_calls?.slice(0, -1) ?? [];
+    bounded = { ...bounded };
+    if (nextToolCalls.length > 0) bounded.tool_calls = nextToolCalls;
+    else delete bounded.tool_calls;
+    droppedToolCalls++;
+  }
+
+  if (droppedToolCalls > 0 && !recordedDroppedToolCalls) {
+    bounded = incrementOmittedOther(bounded, droppedToolCalls);
+  }
+
+  return historyEntryBytes(bounded) <= HISTORY_ENTRY_BYTE_MAX ? bounded : truncateEntryContentToByteLimit(bounded);
+}
+
+function cloneHistoryEntry(entry: SessionHistoryEntry): SessionHistoryEntry {
+  return {
+    ...entry,
+    tool_calls: entry.tool_calls ? [...entry.tool_calls] : undefined,
+    omitted: entry.omitted ? [...entry.omitted] : undefined,
+  };
+}
+
+function incrementOmittedOther(entry: SessionHistoryEntry, count: number): SessionHistoryEntry {
+  if (count <= 0) return entry;
+  const omitted = [...(entry.omitted ?? [])];
+  const existingIndex = omitted.findIndex((item) => item.kind === "other");
+  if (existingIndex >= 0) {
+    const existing = omitted[existingIndex];
+    if (existing) omitted[existingIndex] = { kind: "other", count: existing.count + count };
+  } else {
+    omitted.push({ kind: "other", count });
+  }
+  omitted.sort((a, b) => OMITTED_ORDER.indexOf(a.kind) - OMITTED_ORDER.indexOf(b.kind));
+  return { ...entry, omitted };
+}
+
+function truncateEntryContentToByteLimit(entry: SessionHistoryEntry): SessionHistoryEntry {
+  let best: SessionHistoryEntry = { ...entry, content: "", content_truncated: true };
+  let lo = 0;
+  let hi = entry.content.length;
+
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const candidate: SessionHistoryEntry = { ...entry, content: entry.content.slice(0, mid), content_truncated: true };
+    if (historyEntryBytes(candidate) <= HISTORY_ENTRY_BYTE_MAX) {
+      best = candidate;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  return best;
+}
+
+function historyEntryBytes(entry: SessionHistoryEntry): number {
+  return Buffer.byteLength(JSON.stringify(entry), "utf8");
+}
+
 function entryId(engine: HistoryEngine, sessionId: string, startLineIndex: number): string {
   return `e_${createHash("sha256").update(`${engine}\0${sessionId}\0${startLineIndex}`).digest("hex").slice(0, 24)}`;
+}
+
+function sessionSig(sessionId: string): number {
+  return parseInt(createHash("sha256").update(sessionId).digest("hex").slice(0, 8), 16) & 0x7fffffff;
 }
 
 function encodeHistoryCursor(boundary: number, sig: number): string {
   return Buffer.from(JSON.stringify({ b: boundary, sig }), "utf8").toString("base64url");
 }
 
-function decodeHistoryCursor(cursor: string, entryCount: number): { b: number; sig: number } {
+function decodeHistoryCursor(cursor: string, entryCount: number, expectedSig: number): { b: number; sig: number } {
   if (!/^[A-Za-z0-9_-]+$/.test(cursor)) throw new HistoryCursorError();
   let parsed: unknown;
   try {
@@ -427,6 +537,7 @@ function decodeHistoryCursor(cursor: string, entryCount: number): { b: number; s
   const b = obj.b as number;
   const sig = obj.sig as number;
   if (b < 0 || b > entryCount || sig < 0) throw new HistoryCursorError();
+  if (sig !== expectedSig) throw new HistoryCursorError();
   return { b, sig };
 }
 
