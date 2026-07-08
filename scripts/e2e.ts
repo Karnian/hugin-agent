@@ -42,7 +42,7 @@ import { detectEngineCapabilities, type EngineCapabilities } from "../src/engine
 import { ApprovalBridge, permissionServerLaunch } from "../src/engine/permission";
 import { buildIsolation, selfCheckGate } from "../src/engine/isolate";
 import type { ApprovalRequest, Engine } from "../src/engine/types";
-import { processMatches, removePidfileIfHoldsPid, stopDecision } from "../src/cli";
+import { envMs, processMatches, removePidfileIfHoldsPid, stopDecision } from "../src/cli";
 import { JobManager } from "../src/jobs/manager";
 import { JobRegistry } from "../src/jobs/registry";
 import { EventLog } from "../src/store/eventlog";
@@ -1379,6 +1379,14 @@ async function scenarioAX(): Promise<void> {
     "AX23 lifecycle stopDecision refuses unknown ownership unless forced",
     stopDecision({ state: "running", record: unknownDecisionRecord, legacy: false, match: "unknown" }, false) === "refuse-unverified" &&
       stopDecision({ state: "running", record: unknownDecisionRecord, legacy: false, match: "unknown" }, true) === "kill",
+  );
+
+  check(
+    "AX27 lifecycle readiness window env is capped so start cannot hang",
+    envMs({ HUGIND_READY_TIMEOUT_MS: "999999999" }, "HUGIND_READY_TIMEOUT_MS", 4000, 30_000) === 30_000 &&
+      envMs({ HUGIND_READY_STABLE_MS: "50" }, "HUGIND_READY_STABLE_MS", 500, 30_000) === 50 &&
+      envMs({}, "HUGIND_READY_STABLE_MS", 500, 30_000) === 500 &&
+      envMs({ HUGIND_READY_STABLE_MS: "-5" }, "HUGIND_READY_STABLE_MS", 500, 30_000) === 500,
   );
 
   const unknownStateDir = lifecycleStateDir();
