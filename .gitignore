@@ -10,3 +10,4 @@ spikes/**/out/
 .hugind/
 __pycache__/
 *.pyc
+*.tgz
