@@ -7,6 +7,7 @@
  */
 
 import { connect, connectSimple } from "./auth/connect";
+import { invokedAsMain } from "./entrypoint";
 import { log } from "./log";
 import { canonicalizeDevOrigin, simplePairingGateEnabled } from "./simple-pairing-dev";
 
@@ -193,15 +194,15 @@ async function resolveSimpleRelayUrl(argUrl: string | undefined): Promise<string
   return promptForRelayUrl();
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+export async function runConnect(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<number> {
+  const args = parseArgs(argv);
   if (args.help || !args.valid) {
     console.log(USAGE);
-    process.exit(args.help ? 0 : 1);
+    return args.help ? 0 : 1;
   }
 
   try {
-    const simpleMode = simplePairingGateEnabled(process.env.HUGIN_SIMPLE_PAIRING);
+    const simpleMode = simplePairingGateEnabled(env.HUGIN_SIMPLE_PAIRING);
     if (args.url !== undefined && !simpleMode) {
       throw new Error(SIMPLE_PAIRING_DISABLED_ERROR);
     }
@@ -227,13 +228,19 @@ async function main(): Promise<void> {
         `  config: ${res.configPath} (non-secret)\n` +
         `  device private key stored in the OS keychain — start the daemon with: npm run hugind`,
     );
+    return 0;
   } catch (e) {
     log.error("pairing failed", { err: e instanceof Error ? e.message : "unknown error" });
-    process.exit(1);
+    return 1;
   }
 }
 
-main().catch((e) => {
-  log.error("fatal", { err: String(e) });
-  process.exit(1);
-});
+if (invokedAsMain(import.meta.url, "connect")) {
+  runConnect().then(
+    (code) => process.exit(code),
+    (e) => {
+      log.error("fatal", { err: String(e) });
+      process.exit(1);
+    },
+  );
+}

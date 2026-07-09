@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { runConnect } from "./connect";
+import { invokedAsMain } from "./entrypoint";
+import { runDaemon } from "./index";
 
 export interface RuntimePaths {
   dir: string;
@@ -689,7 +692,15 @@ function usage(): LifecycleResult {
   return {
     code: 1,
     message: [
-      "usage: hugind <start|stop|status|restart> [--force]",
+      "usage: hugind <connect|run|start|stop|status|restart> [--force]",
+      "",
+      "Commands:",
+      "  connect   pair this device with the relay (first run only)",
+      "  run       run the daemon in the foreground for launchd/systemd",
+      "  start     start the daemon detached",
+      "  stop      stop the detached daemon",
+      "  status    show detached daemon status",
+      "  restart   restart the detached daemon",
       "",
       "Environment:",
       "  HUGIND_STATE_DIR      override runtime dir for hugind.pid and hugind.log",
@@ -701,6 +712,16 @@ function usage(): LifecycleResult {
 
 export async function runCli(argv = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<number> {
   const [command, ...args] = argv;
+
+  if (command === "connect") {
+    return await runConnect(args, env);
+  }
+
+  if (command === "run") {
+    await runDaemon();
+    return 0;
+  }
+
   const paths = runtimePaths(env);
   let result: LifecycleResult;
 
@@ -723,21 +744,7 @@ export async function runCli(argv = process.argv.slice(2), env: NodeJS.ProcessEn
   return result.code;
 }
 
-/** True when this module is the process entrypoint. Compares REAL paths so an
- *  npm `bin` symlink (dist/cli.js reached via a symlinked `hugind`) still counts
- *  as main — `process.argv[1]` is the symlink while `import.meta.url` is the
- *  resolved file, so a plain URL compare would miss it and the CLI would no-op. */
-function invokedAsMain(): boolean {
-  const argv1 = process.argv[1];
-  if (!argv1) return false;
-  try {
-    return realpathSync(argv1) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return import.meta.url === pathToFileURL(argv1).href;
-  }
-}
-
-if (invokedAsMain()) {
+if (invokedAsMain(import.meta.url, "cli")) {
   runCli().then(
     (code) => process.exit(code),
     (e) => {

@@ -13,7 +13,6 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { type Config, loadConfig } from "./config";
 import { Daemon } from "./daemon";
 import type { Signer } from "./conn/handshake";
@@ -23,6 +22,7 @@ import { configFilePath } from "./auth/paths";
 import { ClaudeEngine } from "./engine/claude";
 import { buildIsolation, selfCheckGate, selfCheckLogin } from "./engine/isolate";
 import { detectEngineCapabilities } from "./engine/detect";
+import { invokedAsMain } from "./entrypoint";
 import { log } from "./log";
 import { simplePairingGateEnabled } from "./simple-pairing-dev";
 import { SessionEnumerator } from "./sessions/enumerator";
@@ -62,7 +62,7 @@ function loadConfigOrExit(): Config {
   }
 }
 
-async function main(): Promise<void> {
+export async function runDaemon(): Promise<void> {
   const config = loadConfigOrExit();
   const engineCapabilities = await detectEngineCapabilities({ claudeCommand: config.engineCommand });
 
@@ -140,8 +140,8 @@ async function main(): Promise<void> {
   await daemon.start();
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((e) => {
+if (invokedAsMain(import.meta.url, "index")) {
+  runDaemon().catch((e) => {
     log.error("fatal", { err: String(e) });
     process.exit(1);
   });
