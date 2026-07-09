@@ -71,7 +71,22 @@ mock-relay/    e2e용 스크립트 가능 relay (클라우드 불필요)
 attempt 범위 메시지에 리스 펜싱 · digest-ack 완료 · persist-before-send 내구성 ·
 게이트 없는 write/exec에 대해 fail-closed.
 
-## 실행(Run)
+## 설치(npm package)
+
+```bash
+npm i -g ./hugin-agent-0.0.0.tgz     # C2에 첨부된 tarball 또는 이 repo에서 `npm pack`
+hugind connect      # 이 기기 페어링 — 프롬프트에 브라우저의 hpk1 토큰 붙여넣기(최초 1회)
+hugind start        # 데몬 시작(detached; 셸 종료 후에도 유지)
+hugind status
+hugind stop
+```
+
+Node >= 20이 필요하며, `claude`/`codex` CLI가 설치되고 로그인되어 있어야 합니다. OS
+키체인과 SQLite 이벤트 로그용 native dependency는 package 설치 시 자동으로
+설치됩니다. launchd/systemd에서 foreground로 감독하려면 `hugind run`을 사용하세요.
+자세한 내용은 [`service/`](service/README.md)를 참고하세요.
+
+## 실행(Run, source / contributor)
 
 ```bash
 npm install

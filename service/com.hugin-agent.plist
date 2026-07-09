@@ -5,19 +5,23 @@
        launchctl load ~/Library/LaunchAgents/com.hugin-agent.plist
      A LaunchAgent (not Daemon) so it runs in your login session — the macOS
      keychain Claude login is per-user and needs that session.
-     ProgramArguments must use absolute paths for node and src/index.ts. -->
+     ProgramArguments must use the absolute path to the packaged hugind bin.
+     From source, use: node --import tsx /absolute/path/to/hugin-agent/src/index.ts -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.hugin-agent</string>
   <key>WorkingDirectory</key>
-  <string>/opt/hugin-agent</string>
+  <string>/Users/you</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/node</string>
-    <string>--import</string>
-    <string>tsx</string>
-    <string>/opt/hugin-agent/src/index.ts</string>
+    <string>/usr/local/bin/hugind</string>
+    <string>run</string>
+    <!-- From source alternative:
+         <string>/usr/local/bin/node</string>
+         <string>--import</string>
+         <string>tsx</string>
+         <string>/opt/hugin-agent/src/index.ts</string> -->
   </array>
   <key>EnvironmentVariables</key>
   <dict>

@@ -10,8 +10,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/hugin-agent
-ExecStart=/usr/bin/env node --import tsx /opt/hugin-agent/src/index.ts
+WorkingDirectory=%h
+ExecStart=/usr/local/bin/hugind run
+# From source alternative:
+# WorkingDirectory=/opt/hugin-agent
+# ExecStart=/usr/bin/env node --import tsx /opt/hugin-agent/src/index.ts
 Restart=always
 RestartSec=5
 # Config (see src/config.ts). serverUrl + agentId are required.

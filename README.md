@@ -72,7 +72,22 @@ Principles: outbound-only · at-least-once + idempotent (`seq`/`event_id` dedupe
 lease fencing on every attempt-scoped message · digest-acked completion ·
 persist-before-send durability · fail-closed on ungated write/exec.
 
-## Run
+## Install (npm package)
+
+```bash
+npm i -g ./hugin-agent-0.0.0.tgz     # the tarball attached to C2, or `npm pack` in this repo
+hugind connect      # pair this device — paste the browser-minted hpk1 token when prompted (first run only)
+hugind start        # start the daemon (detached; survives shell exit)
+hugind status
+hugind stop
+```
+
+Requires Node >= 20 and the `claude`/`codex` CLI installed and logged in. Native
+dependencies for the OS keychain and SQLite event log install automatically with
+the package. For launchd/systemd foreground supervision, use `hugind run`; see
+[`service/`](service/README.md).
+
+## Run (from source / contributors)
 
 ```bash
 npm install

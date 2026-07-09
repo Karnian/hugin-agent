@@ -1,6 +1,7 @@
 # Keeping `hugind` resident
 
-`src/index.ts` is the foreground daemon entry. Keep it alive in one of two ways:
+`hugind run` is the packaged foreground daemon entry; `src/index.ts` is the
+from-source foreground entry. Keep it alive in one of two ways:
 
 1. `hugind start/stop/status/restart` lifecycle CLI: lightweight and useful for local development. It detaches the foreground daemon so it survives shell exit, but it does not auto-restart after a crash unless another service manager supervises it.
 2. launchd/systemd service: preferred for daily use. The OS service manager runs the foreground daemon and restarts it after crashes, logout/login, or clean exits.
@@ -26,13 +27,34 @@ Both service templates run as your user, not root. The daemon spawns local Claud
 
 ## Lifecycle CLI
 
-Install dependencies once from the repo:
+Packaged install:
+
+```bash
+npm i -g ./hugin-agent-0.0.0.tgz
+hugind connect      # paste the browser-minted hpk1 token when prompted (first run only)
+```
+
+> `--url` is a dev-only simple-pairing flag (needs `HUGIN_SIMPLE_PAIRING=1`); production pairing uses the browser hpk1 token via `hugind connect`.
+
+Start, inspect, stop, and restart with the global `hugind` bin:
+
+```bash
+HUGIND_PROJECT_ROOTS="$HOME/code" \
+hugind start
+
+hugind status
+hugind stop
+hugind restart
+```
+
+From-source install for contributors:
 
 ```bash
 npm install
+npm run connect
 ```
 
-Start, inspect, stop, and restart:
+Start, inspect, stop, and restart from source:
 
 ```bash
 HUGIND_SERVER_URL=wss://relay.example.com \
@@ -80,9 +102,10 @@ These are the theoretical floor of pidfile supervision and are unlikely to be hi
 
 Edit `service/com.hugin-agent.plist` before installing:
 
-- Replace `/usr/local/bin/node` with the absolute path from `which node`.
-- Replace `/opt/hugin-agent` and `/opt/hugin-agent/src/index.ts` with this repo's absolute path.
-- Fill `REPLACE_ME` values and user-specific paths.
+- Install the package globally, then replace `/usr/local/bin/hugind` with the absolute path from `which hugind` (or `$(npm prefix -g)/bin/hugind`).
+- Replace `/Users/you` paths with existing user-specific paths.
+- If you already ran `hugind connect`, you may remove the identity environment variables and use the paired config. Otherwise fill `REPLACE_ME` values.
+- From-source alternative: set `WorkingDirectory` to this repo and replace `ProgramArguments` with `node --import tsx /absolute/path/to/hugin-agent/src/index.ts`.
 - Add `HUGIN_SIMPLE_PAIRING=1` only for a raw-IP `ws://` dev relay.
 
 Install/start:
@@ -112,9 +135,10 @@ rm -f ~/Library/LaunchAgents/com.hugin-agent.plist
 
 Edit `service/hugind.service` before installing:
 
-- Replace `/opt/hugin-agent` and `/opt/hugin-agent/src/index.ts` with this repo's absolute path.
-- Ensure `node` is available to `/usr/bin/env` in the user service environment, or replace `/usr/bin/env node` with an absolute node path.
-- Fill `REPLACE_ME` values and user-specific paths.
+- Install the package globally, then replace `/usr/local/bin/hugind` with the absolute path from `command -v hugind` (or `$(npm prefix -g)/bin/hugind`).
+- Keep `WorkingDirectory=%h` or replace it with another existing user directory.
+- If you already ran `hugind connect`, you may remove the identity environment variables and use the paired config. Otherwise fill `REPLACE_ME` values.
+- From-source alternative: set `WorkingDirectory=/opt/hugin-agent` and use `ExecStart=/usr/bin/env node --import tsx /opt/hugin-agent/src/index.ts`.
 - Add `Environment=HUGIN_SIMPLE_PAIRING=1` only for a raw-IP `ws://` dev relay.
 
 Install/start:
@@ -146,6 +170,12 @@ systemctl --user daemon-reload
 Planned / not yet shipped: a first-class Windows Service template.
 
 The `hugind start/stop/status/restart` lifecycle CLI already works on Windows and uses `%LOCALAPPDATA%\hugin-agent` for its default pid/log state. For boot/crash auto-start on Windows, wrap the foreground daemon command with a Windows service manager:
+
+```powershell
+hugind run
+```
+
+From source, use:
 
 ```powershell
 node --import tsx C:\absolute\path\to\hugin-agent\src\index.ts
